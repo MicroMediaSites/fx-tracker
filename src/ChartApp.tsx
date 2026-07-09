@@ -337,6 +337,15 @@ export const ChartApp = () => {
     return toBusinessTimeUtil(actualTime, timeMapStateRef.current.timeMap);
   };
 
+  // Recenter the view: re-enable price auto-scaling (the escape hatch from a
+  // manually-scaled price axis that left candles pinned off-screen) and scroll
+  // the time scale back to the latest candle, preserving the zoom level.
+  const recenterView = useCallback(() => {
+    if (!chartRef.current) return;
+    chartRef.current.priceScale('right').applyOptions({ autoScale: true });
+    chartRef.current.timeScale().scrollToRealTime();
+  }, []);
+
   // Request ID ref for cancelling stale loadCandles responses (Bug #2)
   const loadCandlesRequestIdRef = useRef(0);
 
@@ -514,6 +523,22 @@ export const ChartApp = () => {
       },
       crosshair: { mode: 0 },  // Normal mode - follows mouse directly
       rightPriceScale: { borderColor: '#2d333b' },
+      // Canvas control: grab-drag pans, wheel/pinch zooms the time scale,
+      // dragging an axis scales it, and double-clicking an axis resets it
+      // (the recovery path when a manual price scale leaves candles pinned
+      // off-screen). Double-clicking the chart itself recenters everything.
+      handleScroll: {
+        mouseWheel: true,
+        pressedMouseMove: true,
+        horzTouchDrag: true,
+        vertTouchDrag: true,
+      },
+      handleScale: {
+        mouseWheel: true,
+        pinch: true,
+        axisPressedMouseMove: true,
+        axisDoubleClickReset: true,
+      },
       timeScale: {
         borderColor: '#2d333b',
         timeVisible: true,
@@ -645,6 +670,22 @@ export const ChartApp = () => {
       chart.remove();
     };
   }, []);
+
+  // Double-click on the chart pane recenters the view. Disabled while drawing
+  // S/R zones so a double-click can't both place boundaries and yank the view.
+  useEffect(() => {
+    if (!chartRef.current || srZones.srEditingMode) return;
+    const chart = chartRef.current;
+    const handler = () => recenterView();
+    chart.subscribeDblClick(handler);
+    return () => {
+      try {
+        chart.unsubscribeDblClick(handler);
+      } catch {
+        // Chart already disposed during window teardown
+      }
+    };
+  }, [srZones.srEditingMode, recenterView]);
 
   // Update price precision and window title when instrument changes
   useEffect(() => {
@@ -1229,6 +1270,7 @@ export const ChartApp = () => {
           }}
           signalDirection={signalDirection}
           strategyId={strategyId}
+          onRecenter={recenterView}
           />
         }
       />

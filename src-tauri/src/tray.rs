@@ -136,7 +136,6 @@ fn create_watcher_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Erro
         .title("wickd - Live Monitor")
         .inner_size(900.0, 700.0)
         .resizable(true)
-        .zoom_hotkeys_enabled(true)
         .initialization_script(crate::commands::window::DISABLE_ZOOM_SCRIPT)
         .background_color(Color(0x0e, 0x11, 0x17, 0xff))
         .build()?;

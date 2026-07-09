@@ -54,6 +54,9 @@ interface ChartHeaderProps {
   // Signal context (badge only — execution moved to the wickd CLI, AGT-652)
   signalDirection: 'long' | 'short' | null;
   strategyId: string | null;
+
+  // Recenter the chart view (re-enable price auto-scale, scroll to latest)
+  onRecenter: () => void;
 }
 
 export const ChartHeader = ({
@@ -92,6 +95,7 @@ export const ChartHeader = ({
   onRemoveIndicator,
   signalDirection,
   strategyId,
+  onRecenter,
 }: ChartHeaderProps) => {
   const { mySymbols } = useSettingsStore();
 
@@ -147,6 +151,19 @@ export const ChartHeader = ({
 
       {/* Right: S/R Tools + Indicators + Execute */}
       <div className="flex items-center gap-3">
+        {/* Recenter view (also: double-click the chart) */}
+        <button
+          onClick={onRecenter}
+          className="p-1.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)] transition-colors"
+          title="Recenter chart (double-click chart)"
+          aria-label="Recenter chart"
+        >
+          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <circle cx="12" cy="12" r="3" />
+            <path strokeLinecap="round" d="M12 2v4m0 12v4M2 12h4m12 0h4" />
+          </svg>
+        </button>
+
         {/* S/R Tools - only on main chart */}
         {isMainChart && (
           <div className="relative">
