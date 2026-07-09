@@ -1,0 +1,6 @@
+# GitHub is a read-only mirror of the stamp-server origin; stamp pushes
+# main here after signed merges. Do not push GitHub directly.
+github:
+  repo: MicroMediaSites/fx-tracker
+  branches:
+    - main

@@ -1,0 +1,19 @@
+# Trusted-keys manifest for MicroMediaSites/fx-tracker.
+#
+# Minimal stamp setup to enable PEER-AGENTIC REVIEWS. Each reviewer's listener
+# verifies that a PR author is an `operator` here — at the PR's base_sha, read
+# from the listener's own local clone (client-side trust; the stamp-server is a
+# GitHub-blind pub/sub broker and reads nothing here).
+#
+# This is NOT full Attested-PRs: there is no `review_server` and no server-
+# attested merge gating (that would require the stamp server to be a review
+# server with a review-signing key). Add that later if desired.
+keys:
+  pardini-home:
+    # Matt Pardini's home-machine stamp operator key.
+    fingerprint: sha256:a8a632084232af24a664fc679a800cf74b919493faccf3836259d5321d5b9890
+    capabilities: [admin, operator]
+  pardini-work:
+    # Matt Pardini's work-machine stamp operator key.
+    fingerprint: sha256:8bb53d53841c0d61ed693b40a282d3458f30ead7d9f538fd7193bc8590d0ba61
+    capabilities: [admin, operator]

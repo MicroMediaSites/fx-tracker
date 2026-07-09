@@ -1,0 +1,165 @@
+name: Verify Auto-Update
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to verify (e.g., v0.2.24)'
+        required: true
+
+# AGT-658 AC4: least-privilege — this job only reads release assets via gh.
+# (No third-party actions to pin: the job uses only the gh CLI and github.token.)
+permissions:
+  contents: read
+
+jobs:
+  verify-update-endpoint:
+    name: Verify Update Endpoint
+    runs-on: [self-hosted, Linux, ARM64]
+    steps:
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Wait for release assets
+        run: |
+          echo "Waiting 30 seconds for release assets to be available..."
+          sleep 30
+
+      - name: Fetch latest.json
+        id: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The repo is private, so the public /releases/latest/download URL
+          # returns 404 without auth. Fetch through the authenticated API -
+          # the same way the GitHub latest-release feed (the endpoint the
+          # app actually hits) resolves it.
+          TAG="${{ steps.tag.outputs.tag }}"
+          echo "Fetching latest.json from release $TAG"
+
+          gh release download "$TAG" \
+            --repo MicroMediaSites/fx-tracker \
+            --pattern latest.json \
+            --output latest.json \
+            --clobber
+
+          echo "Successfully fetched latest.json"
+          cat latest.json
+
+      - name: Validate latest.json structure
+        run: |
+          echo "Validating latest.json structure..."
+
+          # Check version field exists
+          VERSION=$(jq -r '.version' latest.json)
+          if [ "$VERSION" = "null" ] || [ -z "$VERSION" ]; then
+            echo "ERROR: version field missing or empty"
+            exit 1
+          fi
+          echo "Version: $VERSION"
+
+          # Check platforms. The release pipeline is macOS-only (AGT-641:
+          # release.yml builds `--bundles app,updater` on the macOS runner),
+          # so darwin-aarch64 is mandatory and windows-x86_64 is informational.
+          echo ""
+          echo "Checking platforms..."
+
+          # darwin-aarch64 (Apple Silicon) - REQUIRED
+          if jq -e '.platforms["darwin-aarch64"]' latest.json > /dev/null 2>&1; then
+            DARWIN_ARM_URL=$(jq -r '.platforms["darwin-aarch64"].url' latest.json)
+            DARWIN_ARM_SIG=$(jq -r '.platforms["darwin-aarch64"].signature' latest.json)
+            echo "✓ darwin-aarch64: $DARWIN_ARM_URL"
+            if [ "$DARWIN_ARM_SIG" = "null" ] || [ -z "$DARWIN_ARM_SIG" ]; then
+              echo "ERROR: darwin-aarch64 signature missing"
+              exit 1
+            fi
+            echo "✓ darwin-aarch64 signature present"
+            # Artifact identity check (AGT-643): the updater archive must
+            # carry the wickd product name, not the retired candlesight brand.
+            case "$DARWIN_ARM_URL" in
+              *[Cc]andle[Ss]ight*)
+                echo "ERROR: darwin-aarch64 url still carries the candlesight identity: $DARWIN_ARM_URL"
+                exit 1
+                ;;
+              *wickd*.app.tar.gz)
+                echo "✓ darwin-aarch64 artifact carries the wickd identity"
+                ;;
+              *)
+                echo "ERROR: darwin-aarch64 url is not a wickd .app.tar.gz: $DARWIN_ARM_URL"
+                exit 1
+                ;;
+            esac
+          else
+            echo "ERROR: darwin-aarch64 not found (macOS Apple Silicon)"
+            exit 1
+          fi
+
+          # windows-x86_64 - informational only (Windows builds are disabled)
+          if jq -e '.platforms["windows-x86_64"]' latest.json > /dev/null 2>&1; then
+            WINDOWS_URL=$(jq -r '.platforms["windows-x86_64"].url' latest.json)
+            echo "✓ windows-x86_64: $WINDOWS_URL"
+          else
+            echo "⚠ windows-x86_64 not found (expected - Windows builds are disabled)"
+          fi
+
+          echo ""
+          echo "✓ latest.json validation passed"
+
+      - name: Verify macOS updater artifact exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Private repo: the browser download URL in latest.json is not
+          # anonymously fetchable. The real update path is the GitHub
+          # proxy, which resolves assets BY FILENAME via the GitHub API - so
+          # verifying the filename exists on the release verifies exactly what
+          # the updater will be served.
+          TAG="${{ steps.tag.outputs.tag }}"
+          DARWIN_URL=$(jq -r '.platforms["darwin-aarch64"].url' latest.json)
+          FILENAME=$(basename "$DARWIN_URL")
+
+          echo "Verifying asset '$FILENAME' exists on release $TAG..."
+          if gh release view "$TAG" --repo MicroMediaSites/fx-tracker --json assets --jq '.assets[].name' | grep -Fxq "$FILENAME"; then
+            echo "✓ macOS updater artifact present on release"
+          else
+            echo "ERROR: asset '$FILENAME' not found on release $TAG"
+            exit 1
+          fi
+
+      - name: Verify Windows installer exists (if present)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if jq -e '.platforms["windows-x86_64"]' latest.json > /dev/null 2>&1; then
+            TAG="${{ steps.tag.outputs.tag }}"
+            WINDOWS_URL=$(jq -r '.platforms["windows-x86_64"].url' latest.json)
+            FILENAME=$(basename "$WINDOWS_URL")
+
+            echo "Verifying asset '$FILENAME' exists on release $TAG..."
+            if gh release view "$TAG" --repo MicroMediaSites/fx-tracker --json assets --jq '.assets[].name' | grep -Fxq "$FILENAME"; then
+              echo "✓ Windows installer present on release"
+            else
+              echo "WARNING: asset '$FILENAME' not found on release $TAG"
+            fi
+          else
+            echo "Windows installer not in release, skipping"
+          fi
+
+      - name: Summary
+        run: |
+          echo ""
+          echo "========================================"
+          echo "Auto-Update Verification Complete"
+          echo "========================================"
+          echo "Tag: ${{ steps.tag.outputs.tag }}"
+          echo "Version: $(jq -r '.version' latest.json)"
+          echo ""
+          echo "The auto-updater should now be able to detect and install this release."

@@ -1,0 +1,18 @@
+# Workspace root for the wickd headless CLI + shared trading core.
+#
+# NOTE: `src-tauri` (the desktop app) and `mcp-server-rs` are intentionally
+# EXCLUDED from this workspace so their builds — and the desktop UI bundling —
+# are unaffected. They continue to build to their own target/ directories
+# exactly as before. They gain a *path dependency* on wickd-core later,
+# which is allowed across the workspace boundary.
+[workspace]
+resolver = "2"
+members = [
+    "crates/wickd-core",
+    "crates/wickd",
+    "shared",
+]
+exclude = [
+    "src-tauri",
+    "mcp-server-rs",
+]

@@ -1,0 +1,48 @@
+name: Test Windows Build
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+# AGT-658 AC4: least-privilege — this manual smoke build only needs read access.
+permissions:
+  contents: read
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable (pinned; Dependabot bumps)
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fix native dependencies (npm bug workaround)
+        shell: pwsh
+        run: |
+          # npm has a bug where optional dependencies for other platforms aren't installed correctly
+          # https://github.com/npm/cli/issues/4828
+          # Explicitly install Windows-specific native bindings
+          npm install @rollup/rollup-win32-x64-msvc @tailwindcss/oxide-win32-x64-msvc @tauri-apps/cli-win32-x64-msvc --save-optional --ignore-scripts
+          npm rebuild
+
+      - name: Build frontend
+        shell: pwsh
+        run: |
+          npm run build
+          Write-Host "=== Frontend build succeeded ==="
+
+      - name: Test Tauri CLI works
+        shell: pwsh
+        run: |
+          npm run tauri -- --version
+          Write-Host "=== Tauri CLI works ==="

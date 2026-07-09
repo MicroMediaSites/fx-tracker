@@ -1,0 +1,114 @@
+version: 1
+
+domains:
+  ai-analysis:
+    description: "AI-powered features: Claude integration, chat, analysis, prompts"
+    paths:
+      - "src-tauri/src/ai/**"
+      - "src/components/analysis/**"
+
+  auth-security:
+    description: "Authentication, credential management, OAuth, keychain, encryption"
+    paths:
+      - "src-tauri/src/auth/**"
+      - "src-tauri/src/crypto/**"
+
+  backtest-core:
+    description: "Backtesting simulation engine, walk-forward, optimizer, rules engine"
+    paths:
+      - "src-tauri/src/backtest/engine.rs"
+      - "src-tauri/src/backtest/walk_forward.rs"
+      - "src-tauri/src/backtest/optimizer.rs"
+      - "src-tauri/src/backtest/rules_*.rs"
+      - "src-tauri/src/backtest/strategy.rs"
+      - "src-tauri/src/backtest/strategies.rs"
+      - "src-tauri/src/backtest/mod.rs"
+      - "src-tauri/src/commands/backtest.rs"
+
+  charting:
+    description: "Candlestick charting, real-time price streaming, indicator overlays, S/R zones"
+    paths:
+      - "src/ChartApp.tsx"
+      - "src/components/charts/**"
+
+  data-infrastructure:
+    description: "Local app store: SQLite schema/migrations, DAL, local_* commands"
+    paths:
+      - "src-tauri/src/local_store/**"
+      - "src-tauri/src/commands/local_store.rs"
+      - "src/lib/localStore.ts"
+
+  desktop-shell:
+    description: "Tauri app shell, window management, menu bar, lifecycle, deep links"
+    paths:
+      - "src-tauri/src/main.rs"
+      - "src-tauri/src/config.rs"
+      - "src-tauri/src/lib.rs"
+      - "src-tauri/src/error.rs"
+      - "src-tauri/src/tray.rs"
+      - "src-tauri/src/notifications.rs"
+      - "src-tauri/src/commands/window.rs"
+      - "src-tauri/src/commands/mod.rs"
+
+  indicators:
+    description: "Technical indicator calculations, indicator engine, regime detection, pivots"
+    paths:
+      - "src-tauri/src/backtest/indicators.rs"
+      - "src-tauri/src/backtest/indicator_engine.rs"
+      - "src-tauri/src/backtest/regime_detector.rs"
+      - "src-tauri/src/backtest/pivots.rs"
+
+  mcp-server:
+    description: "MCP server for external AI tool integration (Claude Desktop, Claude Code)"
+    paths:
+      - "mcp-server-rs/**"
+
+  oanda-trading:
+    description: "OANDA broker integration, REST API, price streaming, trade sync"
+    paths:
+      - "src-tauri/src/oanda/**"
+      - "src-tauri/src/models/**"
+
+  strategy-monitor:
+    description: "Live strategy monitoring, candle watchers, pattern match detection"
+    paths:
+      - "src-tauri/src/strategy/**"
+      - "src/StrategyWatcherApp.tsx"
+
+knowledge:
+  paths:
+    - ".agent/**/*.md"
+    - "docs/engineering-principles.md"
+    - "docs/pr-review-guidelines.md"
+    - "docs/architecture.md"
+    - "docs/compliance-guide.md"
+    - "docs/tauri-guide.md"
+    - "docs/local-store.md"
+    - "docs/patterns/*.md"
+    - "docs/audits/developer-security-guidelines.md"
+    - "CLAUDE.md"
+
+rules: |
+  You are reviewing code for CandleSight, a forex trading platform.
+  Follow the PR review guidelines in docs/pr-review-guidelines.md strictly.
+  Be critical, not congratulatory. Focus on problems, not summaries.
+
+  Key invariants:
+  - Never use f64 for financial values — use rust_decimal::Decimal
+  - Local schema migrations ONLY in src-tauri/src/local_store/migrations.rs (append-only)
+  - No secrets in code, use environment variables
+  - Destructive UI actions require confirmation modals
+
+  IMPORTANT - LABEL CHECK (BLOCKING):
+  Before approving ANY PR, you MUST check the PR labels and flag missing ones as a blocking issue.
+  If labels are missing, you MUST request changes — do NOT approve.
+
+  Label rules based on files changed:
+  - If PR changes ANY file in src-tauri/ or src/ (desktop app code): REQUIRE labels build:staging AND bump:patch (for fixes) or bump:minor (for features). Flag as BLOCKING if missing.
+  - mcp-server-rs/ has NO deploy label: wickd-mcp is a local stdio binary since AGT-649 (no Railway service). Do not require any label for mcp-server-rs/ changes.
+  - If PR ONLY changes e2e/ or docs/ files: No labels needed.
+
+  Any PR with build:staging or build:production MUST also have a bump:patch, bump:minor, or bump:major label.
+
+  When labels are missing, include in Blocking Issues: "Missing labels: build:staging + bump:patch (PR changes src/ files)"
+  Do NOT approve a PR that is missing required labels.

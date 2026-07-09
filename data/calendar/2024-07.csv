@@ -1,0 +1,393 @@
+date,time,currency,event,impact,actual,forecast,previous
+2024-07-01,00:30,JPY,Final Manufacturing PMI,low,50.0,50.1,50.1
+2024-07-01,01:00,AUD,MI Inflation Gauge m/m,low,0.3%,,0.3%
+2024-07-01,01:30,AUD,ANZ Job Advertisements m/m,low,-2.2%,,-2.1%
+2024-07-01,01:45,CNY,RatingDog Manufacturing PMI,low,51.8,51.5,51.7
+2024-07-01,05:00,JPY,Consumer Confidence,low,36.4,36.4,36.2
+2024-07-01,06:25,GBP,Nationwide HPI m/m,low,0.2%,0.0%,0.4%
+2024-07-01,06:29,EUR,German Prelim CPI m/m,high,0.1%,0.2%,0.1%
+2024-07-01,06:30,AUD,Commodity Prices y/y,low,-4.1%,,-4.2%
+2024-07-01,06:30,CHF,Retail Sales y/y,low,0.4%,2.5%,2.7%
+2024-07-01,07:15,EUR,Spanish Manufacturing PMI,low,52.3,53.1,54.0
+2024-07-01,07:30,CHF,Manufacturing PMI,low,43.9,45.2,46.4
+2024-07-01,07:45,EUR,Italian Manufacturing PMI,low,45.7,44.3,45.6
+2024-07-01,07:50,EUR,French Final Manufacturing PMI,low,45.4,45.3,45.3
+2024-07-01,07:55,EUR,German Final Manufacturing PMI,low,43.5,43.4,43.4
+2024-07-01,08:00,EUR,Final Manufacturing PMI,low,45.8,45.6,45.6
+2024-07-01,08:30,GBP,Final Manufacturing PMI,low,50.9,51.4,51.4
+2024-07-01,08:30,GBP,M4 Money Supply m/m,low,-0.1%,0.2%,0.1%
+2024-07-01,08:30,GBP,Mortgage Approvals,low,60K,60K,61K
+2024-07-01,08:30,GBP,Net Lending to Individuals m/m,low,2.7B,3.3B,3.1B
+2024-07-01,12:00,CAD,Bank Holiday,holiday,,,
+2024-07-01,12:15,EUR,German Buba President Nagel Speaks,low,,,
+2024-07-01,13:45,USD,Final Manufacturing PMI,medium,51.6,51.7,51.7
+2024-07-01,14:00,USD,ISM Manufacturing PMI,high,48.5,49.2,48.7
+2024-07-01,14:00,USD,ISM Manufacturing Prices,medium,52.1,55.8,57.0
+2024-07-01,14:00,USD,Construction Spending m/m,low,-0.1%,0.3%,-0.1%
+2024-07-01,19:00,EUR,ECB President Lagarde Speaks,medium,,,
+2024-07-01,22:00,NZD,NZIER Business Confidence,low,-44,,-25
+2024-07-01,22:45,NZD,Building Consents m/m,low,-1.7%,,-1.9%
+2024-07-01,23:01,GBP,BRC Shop Price Index y/y,low,0.2%,,0.6%
+2024-07-01,23:50,JPY,Monetary Base y/y,low,0.6%,1.0%,0.9%
+2024-07-02,01:30,AUD,Monetary Policy Meeting Minutes,medium,,,
+2024-07-02,03:35,JPY,10-y Bond Auction,low,1.093.2,,1.053.7
+2024-07-02,07:00,EUR,Spanish Unemployment Change,low,-46.8K,-50.9K,-58.7K
+2024-07-02,08:00,EUR,Italian Monthly Unemployment Rate,low,6.8%,6.9%,6.9%
+2024-07-02,09:00,EUR,Core CPI Flash Estimate y/y,high,2.9%,2.8%,2.9%
+2024-07-02,09:00,EUR,CPI Flash Estimate y/y,high,2.5%,2.5%,2.6%
+2024-07-02,09:00,EUR,Unemployment Rate,low,6.4%,6.4%,6.4%
+2024-07-02,13:30,CAD,Manufacturing PMI,low,49.3,,49.3
+2024-07-02,13:30,EUR,ECB President Lagarde Speaks,medium,,,
+2024-07-02,13:30,USD,FOMC Member Powell Speaks,high,,,
+2024-07-02,14:00,USD,JOLTS Job Openings,high,8.14M,7.96M,8.06M
+2024-07-02,14:15,USD,Omdia Total Vehicle Sales,low,15.3M,15.8M,15.9M
+2024-07-02,14:40,USD,RCM/TIPP Economic Optimism,low,44.2,41.2,40.5
+2024-07-02,14:48,NZD,GDT Price Index,low,-6.9%,,-0.5%
+2024-07-02,20:30,USD,API Weekly Statistical Bulletin,low,,,
+2024-07-03,01:00,NZD,ANZ Commodity Prices m/m,low,1.5%,,1.1%
+2024-07-03,01:30,AUD,Retail Sales m/m,medium,0.6%,0.3%,0.1%
+2024-07-03,01:30,AUD,Building Approvals m/m,low,5.5%,1.5%,-0.3%
+2024-07-03,01:45,CNY,RatingDog Services PMI,low,51.2,53.4,54.0
+2024-07-03,06:45,EUR,French Gov Budget Balance,low,-113.5B,,-91.6B
+2024-07-03,07:15,EUR,Spanish Services PMI,low,56.8,56.5,56.9
+2024-07-03,07:45,EUR,Italian Services PMI,low,53.7,53.9,54.2
+2024-07-03,07:50,EUR,French Final Services PMI,low,49.6,48.8,48.8
+2024-07-03,07:55,EUR,German Final Services PMI,low,53.1,53.5,53.5
+2024-07-03,08:00,EUR,Final Services PMI,low,52.8,52.6,52.6
+2024-07-03,08:30,GBP,Final Services PMI,low,52.1,51.2,51.2
+2024-07-03,09:00,EUR,PPI m/m,low,-0.2%,-0.1%,-1.0%
+2024-07-03,09:39,EUR,German 10-y Bond Auction,low,2.631.9,,2.602.0
+2024-07-03,10:30,USD,FOMC Member Williams Speaks,low,,,
+2024-07-03,11:30,CHF,Gov Board Member Martin Speaks,low,,,
+2024-07-03,11:30,USD,Challenger Job Cuts y/y,low,19.8%,,-20.3%
+2024-07-03,12:15,USD,ADP Non-Farm Employment Change,high,150K,163K,152K
+2024-07-03,12:30,CAD,Trade Balance,low,-1.9B,-1.3B,-1.0B
+2024-07-03,12:30,USD,Unemployment Claims,high,238K,234K,233K
+2024-07-03,12:30,USD,Trade Balance,low,-75.1B,-76.3B,-74.6B
+2024-07-03,13:45,USD,Final Services PMI,medium,55.3,55.0,55.1
+2024-07-03,14:00,USD,ISM Services PMI,high,48.8,52.6,53.8
+2024-07-03,14:00,USD,Factory Orders m/m,low,-0.5%,0.2%,0.7%
+2024-07-03,14:15,EUR,ECB President Lagarde Speaks,medium,,,
+2024-07-03,14:30,USD,Crude Oil Inventories,low,-12.2M,-0.4M,3.6M
+2024-07-03,16:00,USD,Natural Gas Storage,low,32B,31B,52B
+2024-07-03,18:00,USD,FOMC Meeting Minutes,high,,,
+2024-07-04,01:30,AUD,Goods Trade Balance,low,5.77B,6.20B,6.55B
+2024-07-04,03:35,JPY,30-y Bond Auction,low,2.193.0,,2.163.6
+2024-07-04,05:45,CHF,Unemployment Rate,low,2.4%,2.4%,2.4%
+2024-07-04,06:00,EUR,German Factory Orders m/m,low,-1.6%,0.5%,-0.2%
+2024-07-04,06:30,CHF,CPI m/m,high,0.0%,0.1%,0.3%
+2024-07-04,07:30,GBP,Parliamentary Elections,high,,,
+2024-07-04,08:30,GBP,Construction PMI,medium,52.2,54.0,54.7
+2024-07-04,08:41,EUR,Spanish 10-y Bond Auction,low,3.422.2,,3.351.7
+2024-07-04,09:01,EUR,French 10-y Bond Auction,low,3.232.4,,3.052.0
+2024-07-04,11:30,EUR,ECB Monetary Policy Meeting Accounts,low,,,
+2024-07-04,12:00,USD,Bank Holiday,holiday,,,
+2024-07-04,23:30,JPY,Household Spending y/y,low,-1.8%,0.2%,0.5%
+2024-07-05,01:30,AUD,Household Spending m/m,low,0.0%,,0.8%
+2024-07-05,05:00,JPY,Leading Indicators,low,111.1%,111.1%,111.6%
+2024-07-05,06:00,EUR,German Industrial Production m/m,low,-2.5%,0.2%,-0.1%
+2024-07-05,06:00,GBP,Halifax HPI m/m,low,-0.2%,0.2%,-0.1%
+2024-07-05,06:45,EUR,French Industrial Production m/m,low,-2.1%,-0.6%,0.5%
+2024-07-05,06:45,EUR,French Trade Balance,low,-8.0B,-7.2B,-7.6B
+2024-07-05,07:00,CHF,Foreign Currency Reserves,low,711B,,718B
+2024-07-05,07:00,CHF,SECO Consumer Climate,low,-37,-35,-38
+2024-07-05,07:00,EUR,German Buba President Nagel Speaks,low,,,
+2024-07-05,08:00,EUR,Italian Retail Sales m/m,low,0.4%,0.2%,-0.1%
+2024-07-05,08:30,GBP,Housing Equity Withdrawal q/q,low,-23.9B,-20.3B,-25.1B
+2024-07-05,09:00,EUR,Retail Sales m/m,low,0.1%,0.2%,-0.5%
+2024-07-05,09:40,USD,FOMC Member Williams Speaks,low,,,
+2024-07-05,12:30,CAD,Employment Change,high,-1.4K,27.3K,26.7K
+2024-07-05,12:30,CAD,Unemployment Rate,high,6.4%,6.3%,6.2%
+2024-07-05,12:30,USD,Average Hourly Earnings m/m,high,0.3%,0.3%,0.4%
+2024-07-05,12:30,USD,Non-Farm Employment Change,high,206K,191K,272K
+2024-07-05,12:30,USD,Unemployment Rate,high,4.1%,4.0%,4.0%
+2024-07-05,14:00,CAD,Ivey PMI,medium,62.5,53.0,52.0
+2024-07-05,15:00,USD,Fed Monetary Policy Report,low,,,
+2024-07-05,17:15,EUR,ECB President Lagarde Speaks,medium,,,
+2024-07-07,08:30,EUR,French Parliamentary Elections,high,,,
+2024-07-07,23:30,JPY,Average Cash Earnings y/y,low,1.9%,2.1%,2.1%
+2024-07-07,23:50,JPY,Bank Lending y/y,low,3.2%,3.1%,3.0%
+2024-07-07,23:50,JPY,Current Account,low,2.41T,2.07T,2.52T
+2024-07-08,05:00,JPY,Economy Watchers Sentiment,low,47.0,46.1,45.7
+2024-07-08,06:00,EUR,German Trade Balance,low,24.9B,19.9B,22.1B
+2024-07-08,08:30,EUR,Sentix Investor Confidence,low,-7.3,-0.6,0.3
+2024-07-08,11:00,GBP,MPC Member Haskel Speaks,low,,,
+2024-07-08,19:00,USD,Consumer Credit m/m,low,11.4B,9.7B,6.4B
+2024-07-08,23:01,GBP,BRC Retail Sales Monitor y/y,low,-0.5%,0.9%,0.4%
+2024-07-08,23:50,JPY,M2 Money Stock y/y,low,1.5%,2.0%,1.9%
+2024-07-09,00:30,AUD,Westpac Consumer Sentiment,low,-1.1%,,1.7%
+2024-07-09,01:30,AUD,NAB Business Confidence,low,4,,-3
+2024-07-09,05:58,JPY,Prelim Machine Tool Orders y/y,low,9.7%,,4.2%
+2024-07-09,10:00,USD,NFIB Small Business Index,low,91.5,90.3,90.5
+2024-07-09,13:15,USD,FOMC Member Barr Speaks,low,,,
+2024-07-09,14:00,USD,Fed Chairman Powell Testifies,high,,,
+2024-07-09,14:00,USD,Treasury Sec Yellen Speaks,medium,,,
+2024-07-09,17:30,USD,FOMC Member Bowman Speaks,low,,,
+2024-07-09,20:30,USD,API Weekly Statistical Bulletin,low,,,
+2024-07-09,22:45,NZD,Visitor Arrivals m/m,low,4.0%,,-9.4%
+2024-07-09,23:50,JPY,PPI y/y,low,2.9%,2.9%,2.4%
+2024-07-10,01:30,CNY,CPI y/y,medium,0.2%,0.4%,0.3%
+2024-07-10,01:30,CNY,PPI y/y,medium,-0.8%,-0.8%,-1.4%
+2024-07-10,02:00,NZD,Official Cash Rate,high,5.50%,5.50%,5.50%
+2024-07-10,02:00,NZD,RBNZ Rate Statement,high,,,
+2024-07-10,08:00,EUR,German Buba President Nagel Speaks,low,,,
+2024-07-10,08:00,EUR,Italian Industrial Production m/m,low,0.5%,0.0%,-1.0%
+2024-07-10,13:30,GBP,MPC Member Pill Speaks,low,,,
+2024-07-10,14:00,EUR,German Buba President Nagel Speaks,low,,,
+2024-07-10,14:00,USD,Fed Chairman Powell Testifies,high,,,
+2024-07-10,14:00,USD,Final Wholesale Inventories m/m,low,0.6%,0.6%,0.6%
+2024-07-10,14:30,USD,Crude Oil Inventories,low,-3.4M,0.7M,-12.2M
+2024-07-10,15:30,GBP,MPC Member Mann Speaks,low,,,
+2024-07-10,17:01,USD,10-y Bond Auction,medium,4.282.6,,4.442.7
+2024-07-10,18:30,USD,FOMC Member Bowman Speaks,low,,,
+2024-07-10,18:30,USD,FOMC Member Goolsbee Speaks,low,,,
+2024-07-10,22:45,NZD,FPI m/m,low,1.0%,,-0.2%
+2024-07-10,23:01,GBP,RICS House Price Balance,low,-17%,-14%,-17%
+2024-07-10,23:30,USD,FOMC Member Cook Speaks,low,,,
+2024-07-10,23:50,JPY,Core Machinery Orders m/m,low,-3.2%,0.9%,-2.9%
+2024-07-11,01:00,AUD,MI Inflation Expectations,low,4.3%,,4.4%
+2024-07-11,06:00,EUR,German Final CPI m/m,low,0.1%,0.1%,0.1%
+2024-07-11,06:00,GBP,GDP m/m,high,0.4%,0.2%,0.0%
+2024-07-11,06:00,GBP,Construction Output m/m,low,1.9%,0.5%,-1.4%
+2024-07-11,06:00,GBP,Goods Trade Balance,low,-17.9B,-15.6B,-19.6B
+2024-07-11,06:00,GBP,Index of Services 3m/3m,low,1.1%,1.0%,0.9%
+2024-07-11,06:00,GBP,Industrial Production m/m,low,0.2%,0.3%,-0.9%
+2024-07-11,06:00,GBP,Manufacturing Production m/m,low,0.4%,0.4%,-1.4%
+2024-07-11,08:30,GBP,BOE Credit Conditions Survey,low,,,
+2024-07-11,10:50,GBP,NIESR GDP Estimate,low,0.6%,,0.7%
+2024-07-11,12:30,USD,Core CPI m/m,high,0.1%,0.2%,0.2%
+2024-07-11,12:30,USD,Core CPI y/y,high,3.3%,3.4%,3.4%
+2024-07-11,12:30,USD,CPI m/m,high,-0.1%,0.1%,0.0%
+2024-07-11,12:30,USD,CPI y/y,high,3.0%,3.1%,3.3%
+2024-07-11,12:30,USD,Unemployment Claims,high,222K,236K,238K
+2024-07-11,13:30,GBP,CB Leading Index m/m,low,-0.3%,,-0.1%
+2024-07-11,14:30,USD,Natural Gas Storage,low,65B,56B,32B
+2024-07-11,15:30,USD,FOMC Member Bostic Speaks,low,,,
+2024-07-11,17:00,USD,FOMC Member Musalem Speaks,low,,,
+2024-07-11,17:01,USD,30-y Bond Auction,medium,4.412.3,,4.402.5
+2024-07-11,18:00,USD,Federal Budget Balance,low,-66.0B,-71.2B,-347.1B
+2024-07-11,22:30,NZD,BusinessNZ Manufacturing Index,low,41.1,,47.2
+2024-07-11,22:30,USD,President Biden Speaks,low,,,
+2024-07-12,03:08,CNY,USD-Denominated Trade Balance,low,99.1B,85.1B,82.6B
+2024-07-12,03:09,CNY,Trade Balance,low,704B,590B,586B
+2024-07-12,04:30,JPY,Revised Industrial Production m/m,low,3.6%,2.8%,2.8%
+2024-07-12,06:00,EUR,German WPI m/m,low,-0.3%,0.2%,0.1%
+2024-07-12,06:45,EUR,French Final CPI m/m,low,0.1%,0.1%,0.1%
+2024-07-12,09:02,CNY,M2 Money Supply y/y,low,6.2%,6.8%,7.0%
+2024-07-12,09:03,CNY,New Loans,medium,2130B,1050B,950B
+2024-07-12,09:08,CNY,Foreign Direct Investment ytd/y,low,-29.1%,,-28.2%
+2024-07-12,12:30,CAD,Building Permits m/m,low,-12.2%,-5.0%,20.5%
+2024-07-12,12:30,USD,Core PPI m/m,high,0.4%,0.2%,0.0%
+2024-07-12,12:30,USD,PPI m/m,high,0.2%,0.1%,-0.2%
+2024-07-12,14:00,USD,Prelim UoM Consumer Sentiment,high,66.0,68.5,65.6
+2024-07-12,14:00,USD,Prelim UoM Inflation Expectations,medium,2.9%,,3.3%
+2024-07-14,22:30,NZD,BusinessNZ Services Index,low,40.2,,43.0
+2024-07-14,23:00,JPY,Bank Holiday,holiday,,,
+2024-07-14,23:01,GBP,Rightmove HPI m/m,low,-0.4%,,0.0%
+2024-07-15,01:30,CNY,New Home Prices m/m,low,-0.67%,,-0.71%
+2024-07-15,02:00,CNY,GDP q/y,medium,4.7%,5.1%,5.3%
+2024-07-15,02:00,CNY,Industrial Production y/y,medium,5.3%,4.9%,5.6%
+2024-07-15,02:00,CNY,NBS Press Conference,low,,,
+2024-07-15,02:02,CNY,Fixed Asset Investment ytd/y,low,3.9%,3.9%,4.0%
+2024-07-15,02:02,CNY,Retail Sales y/y,low,2.0%,3.3%,3.7%
+2024-07-15,02:02,CNY,Unemployment Rate,low,5.0%,5.0%,5.0%
+2024-07-15,06:30,CHF,PPI m/m,low,0.0%,0.1%,-0.3%
+2024-07-15,09:00,EUR,Industrial Production m/m,low,-0.6%,-0.9%,-0.1%
+2024-07-15,09:15,EUR,Eurogroup Meetings,low,,,
+2024-07-15,12:30,CAD,Manufacturing Sales m/m,low,0.4%,0.3%,1.1%
+2024-07-15,12:30,CAD,Wholesale Sales m/m,low,-0.8%,2.0%,2.4%
+2024-07-15,12:30,USD,Empire State Manufacturing Index,high,-6.6,-5.5,-6.0
+2024-07-15,14:30,CAD,BOC Business Outlook Survey,low,,,
+2024-07-15,16:30,USD,FOMC Member Powell Speaks,high,,,
+2024-07-15,20:35,USD,FOMC Member Daly Speaks,low,,,
+2024-07-16,04:30,JPY,Tertiary Industry Activity m/m,low,-0.4%,0.1%,1.9%
+2024-07-16,09:00,EUR,Italian Trade Balance,low,6.43B,3.55B,4.81B
+2024-07-16,09:00,EUR,Trade Balance,low,12.3B,18.0B,19.4B
+2024-07-16,09:00,EUR,ZEW Economic Sentiment,low,43.7,48.1,51.3
+2024-07-16,09:00,EUR,German ZEW Economic Sentiment,low,41.8,41.2,47.5
+2024-07-16,09:15,EUR,ECOFIN Meetings,low,,,
+2024-07-16,12:15,CAD,Housing Starts,low,242K,255K,265K
+2024-07-16,12:30,CAD,CPI m/m,high,-0.1%,0.1%,0.6%
+2024-07-16,12:30,CAD,Median CPI y/y,high,2.6%,2.7%,2.8%
+2024-07-16,12:30,CAD,Trimmed CPI y/y,high,2.9%,2.8%,2.9%
+2024-07-16,12:30,CAD,Common CPI y/y,medium,2.3%,2.4%,2.4%
+2024-07-16,12:30,USD,Core Retail Sales m/m,high,0.4%,0.1%,-0.1%
+2024-07-16,12:30,USD,Retail Sales m/m,high,0.0%,-0.3%,0.1%
+2024-07-16,12:30,USD,Import Prices m/m,low,0.0%,0.2%,-0.4%
+2024-07-16,12:32,CAD,Core CPI m/m,low,-0.1%,,0.6%
+2024-07-16,14:00,USD,Business Inventories m/m,low,0.5%,0.4%,0.3%
+2024-07-16,14:00,USD,NAHB Housing Market Index,low,42,43,43
+2024-07-16,14:57,NZD,GDT Price Index,low,0.4%,,-6.9%
+2024-07-16,18:45,USD,FOMC Member Kugler Speaks,low,,,
+2024-07-16,20:30,USD,API Weekly Statistical Bulletin,low,,,
+2024-07-16,22:45,NZD,CPI q/q,high,0.4%,0.5%,0.6%
+2024-07-17,00:30,AUD,MI Leading Index m/m,low,0.0%,,0.0%
+2024-07-17,06:00,GBP,CPI y/y,high,2.0%,1.9%,2.0%
+2024-07-17,06:00,GBP,Core CPI y/y,low,3.5%,3.4%,3.5%
+2024-07-17,06:00,GBP,PPI Input m/m,low,-0.8%,0.1%,0.0%
+2024-07-17,06:00,GBP,PPI Output m/m,low,-0.3%,0.1%,-0.1%
+2024-07-17,06:00,GBP,RPI y/y,low,2.9%,2.9%,3.0%
+2024-07-17,08:30,GBP,HPI y/y,low,2.2%,1.5%,1.1%
+2024-07-17,09:00,EUR,Final Core CPI y/y,low,2.9%,2.9%,2.9%
+2024-07-17,09:00,EUR,Final CPI y/y,low,2.5%,2.5%,2.5%
+2024-07-17,09:36,EUR,German 30-y Bond Auction,low,2.592.6,,2.541.6
+2024-07-17,12:30,CAD,Foreign Securities Purchases,low,20.89B,21.05B,41.16B
+2024-07-17,12:30,USD,Building Permits,medium,1.45M,1.40M,1.39M
+2024-07-17,12:30,USD,Housing Starts,low,1.35M,1.30M,1.28M
+2024-07-17,13:00,USD,FOMC Member Barkin Speaks,low,,,
+2024-07-17,13:15,USD,Industrial Production m/m,medium,0.6%,0.3%,0.9%
+2024-07-17,13:15,USD,Capacity Utilization Rate,low,78.8%,78.5%,78.7%
+2024-07-17,13:35,USD,FOMC Member Waller Speaks,medium,,,
+2024-07-17,14:30,USD,Crude Oil Inventories,low,-4.9M,-0.9M,-3.4M
+2024-07-17,18:00,USD,Beige Book,low,,,
+2024-07-17,23:50,JPY,Trade Balance,low,-0.82T,-0.82T,-0.62T
+2024-07-18,01:30,AUD,Employment Change,high,50.2K,19.9K,39.7K
+2024-07-18,01:30,AUD,Unemployment Rate,high,4.1%,4.1%,4.0%
+2024-07-18,01:30,AUD,NAB Quarterly Business Confidence,low,-1,,-2
+2024-07-18,01:30,AUD,RBA Bulletin,low,,,
+2024-07-18,06:00,CHF,Trade Balance,low,6.18B,5.05B,5.81B
+2024-07-18,06:00,GBP,Claimant Count Change,high,32.3K,23.4K,50.4K
+2024-07-18,06:00,GBP,Average Earnings Index 3m/y,medium,5.7%,5.7%,5.9%
+2024-07-18,06:00,GBP,Unemployment Rate,low,4.4%,4.4%,4.4%
+2024-07-18,08:42,EUR,Spanish 10-y Bond Auction,low,3.191.4,,3.422.2
+2024-07-18,10:00,EUR,German Buba Monthly Report,low,,,
+2024-07-18,12:15,EUR,Main Refinancing Rate,high,4.25%,4.25%,4.25%
+2024-07-18,12:15,EUR,Monetary Policy Statement,high,,,
+2024-07-18,12:30,USD,Unemployment Claims,high,243K,229K,222K
+2024-07-18,12:30,USD,Philly Fed Manufacturing Index,medium,13.9,2.7,1.3
+2024-07-18,12:45,EUR,ECB Press Conference,high,,,
+2024-07-18,14:00,USD,CB Leading Index m/m,low,-0.2%,-0.3%,-0.5%
+2024-07-18,14:30,USD,Natural Gas Storage,low,10B,27B,65B
+2024-07-18,17:45,USD,FOMC Member Logan Speaks,low,,,
+2024-07-18,20:00,USD,TIC Long-Term Purchases,low,-54.6B,98.4B,123.1B
+2024-07-18,22:05,USD,FOMC Member Daly Speaks,medium,,,
+2024-07-18,23:01,GBP,GfK Consumer Confidence,low,-13,-12,-14
+2024-07-18,23:30,JPY,National Core CPI y/y,low,2.6%,2.7%,2.5%
+2024-07-18,23:45,USD,FOMC Member Bowman Speaks,low,,,
+2024-07-19,03:00,NZD,Credit Card Spending y/y,low,-3.1%,,0.0%
+2024-07-19,06:00,EUR,German PPI m/m,low,0.2%,0.1%,0.0%
+2024-07-19,06:00,GBP,Retail Sales m/m,high,-1.2%,-0.6%,2.9%
+2024-07-19,06:00,GBP,Public Sector Net Borrowing,low,13.6B,10.8B,14.1B
+2024-07-19,08:05,EUR,Current Account,low,36.7B,34.6B,38.6B
+2024-07-19,12:30,CAD,Core Retail Sales m/m,high,-1.3%,-0.5%,1.8%
+2024-07-19,12:30,CAD,Retail Sales m/m,high,-0.8%,-0.5%,0.7%
+2024-07-19,12:30,CAD,IPPI m/m,low,0.0%,0.2%,0.0%
+2024-07-19,12:30,CAD,RMPI m/m,low,-1.4%,-0.7%,-1.0%
+2024-07-19,14:30,AUD,CB Leading Index m/m,low,0.2%,,-0.3%
+2024-07-19,14:40,USD,FOMC Member Williams Speaks,medium,,,
+2024-07-19,17:00,USD,FOMC Member Bostic Speaks,low,,,
+2024-07-21,22:45,NZD,Trade Balance,low,699M,294M,204M
+2024-07-22,01:03,CNY,1-y Loan Prime Rate,medium,3.35%,3.45%,3.45%
+2024-07-22,01:03,CNY,5-y Loan Prime Rate,medium,3.85%,3.95%,3.95%
+2024-07-23,05:00,JPY,BOJ Core CPI y/y,low,2.1%,2.1%,2.1%
+2024-07-23,13:59,USD,Richmond Manufacturing Index,medium,-17,-7,-10
+2024-07-23,14:00,EUR,Consumer Confidence,low,-13,-13,-14
+2024-07-23,14:00,USD,Existing Home Sales,medium,3.89M,3.99M,4.11M
+2024-07-23,20:30,USD,API Weekly Statistical Bulletin,low,,,
+2024-07-23,23:00,AUD,Flash Manufacturing PMI,low,47.4,,47.5
+2024-07-23,23:00,AUD,Flash Services PMI,low,50.8,,51.0
+2024-07-24,00:30,JPY,Flash Manufacturing PMI,low,49.2,50.5,50.1
+2024-07-24,06:00,EUR,German GfK Consumer Climate,low,-18.4,-21.1,-21.8
+2024-07-24,07:15,EUR,French Flash Manufacturing PMI,high,44.1,45.8,45.3
+2024-07-24,07:15,EUR,French Flash Services PMI,high,50.7,49.7,48.8
+2024-07-24,07:30,EUR,German Flash Manufacturing PMI,high,42.6,44.1,43.4
+2024-07-24,07:30,EUR,German Flash Services PMI,high,52.0,53.2,53.5
+2024-07-24,08:00,EUR,Flash Manufacturing PMI,medium,45.6,46.0,45.6
+2024-07-24,08:00,EUR,Flash Services PMI,medium,51.9,52.9,52.6
+2024-07-24,08:30,GBP,Flash Manufacturing PMI,high,51.8,51.1,51.4
+2024-07-24,08:30,GBP,Flash Services PMI,high,52.4,52.5,51.2
+2024-07-24,09:02,GBP,30-y Bond Auction,low,4.643.3,,4.553.3
+2024-07-24,09:32,EUR,German 10-y Bond Auction,low,2.431.8,,2.631.9
+2024-07-24,12:30,CAD,NHPI m/m,low,-0.2%,0.1%,0.2%
+2024-07-24,12:30,USD,Goods Trade Balance,low,-96.8B,-98.8B,-100.6B
+2024-07-24,12:30,USD,Prelim Wholesale Inventories m/m,low,0.2%,0.5%,0.6%
+2024-07-24,13:45,CAD,BOC Monetary Policy Report,high,,,
+2024-07-24,13:45,CAD,BOC Rate Statement,high,,,
+2024-07-24,13:45,CAD,Overnight Rate,high,4.50%,4.50%,4.75%
+2024-07-24,13:45,USD,Flash Manufacturing PMI,high,49.5,51.7,51.7
+2024-07-24,13:45,USD,Flash Services PMI,high,56.0,54.7,55.1
+2024-07-24,14:00,USD,New Home Sales,medium,617K,639K,619K
+2024-07-24,14:30,CAD,BOC Press Conference,high,,,
+2024-07-24,14:30,USD,Crude Oil Inventories,low,-3.7M,-2.6M,-4.9M
+2024-07-24,20:05,USD,FOMC Member Bowman Speaks,low,,,
+2024-07-24,20:05,USD,FOMC Member Logan Speaks,low,,,
+2024-07-24,23:50,JPY,SPPI y/y,low,3.0%,2.6%,2.5%
+2024-07-25,00:00,USD,President Biden Speaks,low,,,
+2024-07-25,08:00,EUR,German ifo Business Climate,medium,87.0,88.9,88.6
+2024-07-25,08:00,EUR,M3 Money Supply y/y,low,2.2%,1.9%,1.6%
+2024-07-25,08:00,EUR,Private Loans y/y,low,0.3%,0.5%,0.3%
+2024-07-25,10:00,GBP,CBI Industrial Order Expectations,low,-32,-19,-18
+2024-07-25,12:30,USD,Advance GDP q/q,high,2.8%,2.0%,1.6%
+2024-07-25,12:30,USD,Unemployment Claims,high,235K,237K,243K
+2024-07-25,12:30,USD,Advance GDP Price Index q/q,medium,2.3%,2.6%,3.1%
+2024-07-25,12:30,USD,Core Durable Goods Orders m/m,medium,0.5%,0.2%,-0.1%
+2024-07-25,12:30,USD,Durable Goods Orders m/m,medium,-6.6%,0.3%,0.1%
+2024-07-25,13:00,CNY,CB Leading Index m/m,low,-0.7%,,-0.5%
+2024-07-25,13:00,EUR,Belgian NBB Business Climate,low,-12.3,-11.0,-11.1
+2024-07-25,14:30,USD,Natural Gas Storage,low,22B,13B,10B
+2024-07-25,15:00,EUR,ECB President Lagarde Speaks,medium,,,
+2024-07-25,15:15,All,G20 Meetings,medium,,,
+2024-07-25,23:30,JPY,Tokyo Core CPI y/y,medium,2.2%,2.2%,2.1%
+2024-07-26,07:00,EUR,Spanish Unemployment Rate,low,11.3%,11.4%,12.3%
+2024-07-26,12:30,USD,Core PCE Price Index m/m,high,0.2%,0.2%,0.1%
+2024-07-26,12:30,USD,Personal Income m/m,low,0.2%,0.4%,0.5%
+2024-07-26,12:30,USD,Personal Spending m/m,low,0.3%,0.3%,0.2%
+2024-07-26,14:00,USD,Revised UoM Consumer Sentiment,medium,66.4,66.3,66.0
+2024-07-26,14:00,USD,Revised UoM Inflation Expectations,low,2.9%,,2.9%
+2024-07-26,15:15,All,G20 Meetings,medium,,,
+2024-07-29,08:30,GBP,M4 Money Supply m/m,low,0.5%,0.2%,-0.1%
+2024-07-29,08:30,GBP,Mortgage Approvals,low,60K,60K,60K
+2024-07-29,08:30,GBP,Net Lending to Individuals m/m,low,3.8B,2.2B,2.7B
+2024-07-29,10:00,GBP,CBI Realized Sales,low,-43,-20,-24
+2024-07-29,23:01,GBP,BRC Shop Price Index y/y,low,0.2%,,0.2%
+2024-07-29,23:30,JPY,Unemployment Rate,low,2.5%,2.6%,2.6%
+2024-07-30,01:30,AUD,Building Approvals m/m,low,-6.5%,-2.1%,5.5%
+2024-07-30,05:30,EUR,French Consumer Spending m/m,low,-0.5%,-0.2%,1.5%
+2024-07-30,05:30,EUR,French Flash GDP q/q,low,0.3%,0.2%,0.2%
+2024-07-30,06:29,EUR,German Prelim CPI m/m,high,0.3%,0.3%,0.1%
+2024-07-30,07:00,CHF,KOF Economic Barometer,low,101.0,102.6,102.7
+2024-07-30,07:00,EUR,Spanish Flash CPI y/y,medium,2.8%,3.0%,3.4%
+2024-07-30,07:00,EUR,Spanish Flash GDP q/q,low,0.8%,0.5%,0.7%
+2024-07-30,08:00,EUR,Italian Prelim GDP q/q,low,0.2%,0.2%,0.3%
+2024-07-30,08:00,EUR,German Prelim GDP q/q,low,-0.1%,0.1%,0.2%
+2024-07-30,09:00,EUR,Prelim Flash GDP q/q,low,0.3%,0.2%,0.3%
+2024-07-30,09:03,GBP,10-y Bond Auction,low,4.082.9,,4.073.5
+2024-07-30,09:18,EUR,Italian 10-y Bond Auction,low,3.761.4,,4.011.4
+2024-07-30,13:00,USD,S&P/CS Composite-20 HPI y/y,medium,6.8%,6.5%,7.2%
+2024-07-30,13:00,USD,HPI m/m,low,0.0%,0.2%,0.2%
+2024-07-30,14:00,USD,CB Consumer Confidence,high,100.3,99.7,100.4
+2024-07-30,14:00,USD,JOLTS Job Openings,high,8.18M,8.02M,8.14M
+2024-07-30,20:30,USD,API Weekly Statistical Bulletin,low,,,
+2024-07-30,22:45,NZD,Building Consents m/m,low,-13.8%,,-1.7%
+2024-07-30,23:50,JPY,Prelim Industrial Production m/m,low,-3.6%,-4.2%,2.8%
+2024-07-30,23:50,JPY,Retail Sales y/y,low,3.7%,3.3%,3.0%
+2024-07-31,01:00,NZD,ANZ Business Confidence,low,27.1,,6.1
+2024-07-31,01:30,AUD,CPI m/m,high,1.0%,1.0%,1.0%
+2024-07-31,01:30,AUD,CPI y/y,high,3.8%,3.8%,4.0%
+2024-07-31,01:30,AUD,Trimmed Mean CPI m/m,high,0.8%,1.0%,1.0%
+2024-07-31,01:30,AUD,Retail Sales m/m,medium,0.5%,0.2%,0.6%
+2024-07-31,01:30,AUD,Private Sector Credit m/m,low,0.6%,0.4%,0.4%
+2024-07-31,01:30,CNY,Manufacturing PMI,high,49.4,49.4,49.5
+2024-07-31,01:30,CNY,Non-Manufacturing PMI,medium,50.2,50.3,50.5
+2024-07-31,03:57,JPY,BOJ Outlook Report,high,,,
+2024-07-31,03:57,JPY,BOJ Policy Rate,high,<0.25%,<0.10%,<0.10%
+2024-07-31,03:57,JPY,Monetary Policy Statement,high,,,
+2024-07-31,04:59,JPY,Consumer Confidence,low,36.7,36.5,36.4
+2024-07-31,05:00,JPY,Housing Starts y/y,low,-6.7%,-2.3%,-5.3%
+2024-07-31,06:00,EUR,German Import Prices m/m,low,0.4%,0.1%,0.0%
+2024-07-31,06:30,JPY,BOJ Press Conference,high,,,
+2024-07-31,06:45,EUR,French Prelim CPI m/m,low,0.1%,0.3%,0.1%
+2024-07-31,07:55,EUR,German Unemployment Change,low,18K,16K,19K
+2024-07-31,08:00,CHF,UBS Economic Expectations,low,9.4,,17.5
+2024-07-31,08:41,EUR,Italian Prelim CPI m/m,low,0.5%,0.3%,0.1%
+2024-07-31,09:00,EUR,Core CPI Flash Estimate y/y,high,2.9%,2.8%,2.9%
+2024-07-31,09:00,EUR,CPI Flash Estimate y/y,high,2.6%,2.5%,2.5%
+2024-07-31,12:15,USD,ADP Non-Farm Employment Change,high,122K,147K,150K
+2024-07-31,12:30,CAD,GDP m/m,high,0.2%,0.1%,0.3%
+2024-07-31,12:30,USD,Employment Cost Index q/q,high,0.9%,1.0%,1.2%
+2024-07-31,13:45,USD,Chicago PMI,medium,45.3,44.8,47.4
+2024-07-31,14:00,USD,Pending Home Sales m/m,high,4.8%,1.4%,-2.1%
+2024-07-31,14:30,USD,Crude Oil Inventories,low,-3.4M,-1.6M,-3.7M
+2024-07-31,18:00,USD,Federal Funds Rate,high,5.50%,5.50%,5.50%
+2024-07-31,18:00,USD,FOMC Statement,high,,,
+2024-07-31,18:30,USD,FOMC Press Conference,high,,,

@@ -1,0 +1,48 @@
+[package]
+name = "mcp-server-rs"
+version = "0.2.0"
+edition = "2021"
+description = "wickd MCP server - local stdio server over the wickd local store (~/.wickd/app.db)"
+
+[[bin]]
+name = "wickd-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# MCP SDK — stdio transport (local, single-user; the Railway HTTP path is retired)
+rmcp = { version = "0.12", features = ["server", "transport-io"] }
+
+# Decimal handling (for shared types)
+rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+rust_decimal_macros = "1.36"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Local store (~/.wickd/app.db). Bundled sqlite, matching src-tauri —
+# the migration source is shared via #[path] include (see src/store.rs).
+rusqlite = { version = "0.32", features = ["bundled"] }
+dirs = "5"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# JSON Schema generation for MCP tool parameters
+schemars = "1"
+
+# HTTP client (Anthropic API for convert_strategy)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Logging (stderr only — stdout is the MCP transport)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUID for generating IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Date/time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"

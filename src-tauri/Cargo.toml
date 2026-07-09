@@ -1,0 +1,139 @@
+# CandleSight Desktop Application
+[package]
+name = "candlesight"
+version = "0.1.0"
+edition = "2021"
+description = "Trading strategy research and analysis platform"
+
+[lib]
+name = "candlesight_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "candlesight"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# NOTE: `devtools` is intentionally NOT enabled here. Tauri auto-enables the
+# webview inspector in debug/dev builds; enabling the feature would also compile
+# it into release builds. Keeping it off makes devtools dev-only (AGT-666).
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-shell = "2"
+# Async runtime - Tokio is the most popular async runtime in Rust
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client - reqwest is the go-to HTTP client for Rust
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Async utilities for streaming
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Serialization - serde is THE serialization framework in Rust
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Environment variables - dotenvy loads .env files
+dotenvy = "0.15"
+
+# Cross-platform directories (home, config, etc.)
+dirs = "5"
+
+# CLI argument parsing - clap with derive macros for declarative CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling - thiserror makes defining custom errors easy
+thiserror = "2"
+
+# Logging - tracing is modern structured logging for Rust
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Date/time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Decimal handling for precise financial calculations
+rust_decimal = { version = "1", features = ["serde"] }
+
+# Local-first app store (~/.wickd/app.db, AGT-642). `bundled` compiles SQLite
+# in-tree so there is no system-sqlite dependency (same pattern as
+# crates/wickd).
+#
+# (AGT-650: sqlx/Postgres was removed with the cloud data path, which also
+# removed the old sqlx↔rusqlite libsqlite3-sys version entanglement. rusqlite
+# is now the only sqlite dependency here; crates/wickd pins its own.)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# UUID generation for IDs
+uuid = { version = "1", features = ["v4"] }
+rust_decimal_macros = "1"
+urlencoding = "2.1.3"
+url = "2"
+async-trait = "0.1.89"
+tauri-plugin-notification = "2.3.3"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+rfd = "0.17.1"
+
+tauri-plugin-window-state = "2"
+tauri-plugin-localhost = "2.3.1"
+
+# OS keychain for secure token storage (v3 + apple-native to match crates/wickd, AGT-666/AGT-667)
+keyring = { version = "3", features = ["apple-native"] }
+
+# Cryptography - credential encryption
+argon2 = "0.5"
+base64 = "0.21"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+secrecy = { version = "0.8", features = ["serde"] }
+zeroize = { version = "1.7", features = ["derive"] }
+subtle = "2.5"
+rand = "0.8"
+zxcvbn = "3"
+sha1 = "0.10"
+
+# Data parallelism for optimization
+rayon = "1.10"
+
+# Embedded scripting engine for user-defined strategies
+rhai = { version = "1.21", features = ["sync", "decimal", "no_float"] }
+
+# Thread-safe lazy initialization for global state
+once_cell = "1.19"
+
+# Shared types for strategy definitions
+shared = { path = "../shared" }
+
+# Tauri-free trading core (backtest, strategy/pattern matching, OANDA, crypto vault).
+# The desktop app re-exports this so existing `crate::oanda` / `crate::backtest`
+# etc. paths keep resolving; event emission is provided via TauriEventSink.
+wickd-core = { path = "../crates/wickd-core" }
+
+# macOS-specific notification with click handling
+[target.'cfg(target_os = "macos")'.dependencies]
+mac-notification-sys = "0.6"
+# Native macOS API access for app activation detection
+objc = "0.2"
+cocoa = "0.26"
+
+# Windows-specific: single instance to route deep links to existing app
+[target.'cfg(target_os = "windows")'.dependencies]
+tauri-plugin-single-instance = "2"
+
+[dev-dependencies]
+# For async tests
+tokio-test = "0.4"
+
+# For test fixtures and mocking
+wiremock = "0.6"
+
+# Macro for creating Decimal literals in tests
+rust_decimal_macros = "1"
+
+# Temporary directories for testing
+tempfile = "3"

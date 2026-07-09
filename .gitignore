@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+build/
+dist/
+.svelte-kit/
+src-tauri/target/
+mcp-server-rs/target/
+web/.next/
+web/out/
+
+# Rust build artifacts (any target dir)
+**/target/
+
+# Environment - NEVER commit credentials
+# Ignore all env files anywhere (.env, .env.e2e, .env.production, .env copy, etc.)
+**/.env*
+# ...but keep example/template env files tracked
+!**/.env.example
+!**/.env*.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Scraper debug/output files
+data/ff-*.html
+data/ff-*.md
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+.claude/worktrees/
+
+# AGT-644 auto-update verification harness artifacts
+verify-update-artifacts/

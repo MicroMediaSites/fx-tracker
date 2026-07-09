@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent that supervises the `wickd stream` socket hub on the always-on
+  host (AGT-629 AC1).
+
+  This is the ONE shared upstream: a single `wickd stream` process holds one
+  OANDA price subscription and fans it out over the Unix-domain socket at
+  ~/.wickd/stream.sock (see `crate::stream_hub`). Every `wickd watch` job
+  (com.openthink.wickd-watch.*) probes that socket at startup and drives its
+  hub-covered instruments off this feed instead of opening a second
+  subscription. If this job is down, watchers degrade safely to their own
+  direct OANDA sources and re-attach here on their next (re)start — so the two
+  jobs have NO hard start-order dependency.
+
+  This is a TEMPLATE. `install.sh stream` copies it to
+  ~/Library/LaunchAgents/com.openthink.wickd-stream.plist and substitutes the
+  __WICKD_BIN__ / __HOME__ / __LOG_DIR__ / __INSTRUMENTS__ / __ENV__ /
+  __ACCOUNT__ placeholders. It is not loadable as-is.
+
+  See README.md in this directory for full install / verify / uninstall steps.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openthink.wickd-stream</string>
+
+    <!--
+      Absolute path to the wickd binary + the stream invocation. The single
+      __INSTRUMENTS__ token is a comma-separated list (clap splits it, so one
+      argv element carries the whole watchlist, e.g. "EUR_USD,GBP_USD"); use
+      "all" for every instrument the account offers. install.sh replaces the
+      placeholders; edit the instrument set here or via ~/.wickd/watchlist.json.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__WICKD_BIN__</string>
+        <string>stream</string>
+        <string>__INSTRUMENTS__</string>
+        <string>--env</string>
+        <string>__ENV__</string>
+        <string>--account</string>
+        <string>__ACCOUNT__</string>
+    </array>
+
+    <!-- Start as soon as the agent is loaded (i.e. at user login on the box). -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      Restart the hub whenever it exits abnormally (crash / non-zero exit / an
+      OANDA reconnect failure that exits), but NOT when it exits cleanly
+      (SIGINT/SIGTERM during an intentional stop). This is the crash-supervision
+      behaviour AGT-629 AC1 requires.
+    -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Don't hammer-restart in a tight crash loop; wait 30s between respawns. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Background service: lower scheduling priority, no UI. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!--
+      Logs (AC1). The log directory must exist before load; install.sh creates
+      ~/Library/Logs/wickd. `wickd stream` emits NDJSON price events on stdout
+      and human/error output (including reconnects) on stderr.
+    -->
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/stream.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/stream.err.log</string>
+
+    <!--
+      Run from the user's home so ~/.wickd/config.json (account id) and
+      ~/.wickd/stream.sock (the hub socket) resolve under the operator's HOME.
+    -->
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <!--
+      No secret here. `wickd stream` reads the OANDA API key from the user's
+      login keychain (written by `wickd login`). Because this LaunchAgent runs
+      in the user's login session, the keychain is unlocked and readable with no
+      password. See README.md "Credentials".
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

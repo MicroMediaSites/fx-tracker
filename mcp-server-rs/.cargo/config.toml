@@ -1,0 +1,3 @@
+# Override git dependency with local path for development
+[patch."https://github.com/MicroMediaSites/fx-tracker.git"]
+shared = { path = "../shared" }

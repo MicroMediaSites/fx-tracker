@@ -1,0 +1,177 @@
+# AGT-650: suppress line-level diff content for the files this ticket
+# DELETES (Zero/Clerk/queries-service teardown). The full 42K-line dead-
+# code deletion exceeds any reviewer context window; file-level deletion
+# visibility is retained (git emits a stub per file) and the content is
+# recoverable via `git show main:<path>`. Every path below ceases to
+# exist after this merge, so these attributes can never mask a future
+# change. Modified files (including package-lock.json) stay fully
+# visible to reviewers.
+Dockerfile -diff
+docker-compose.yml -diff
+docs/zero-sync-guide.md -diff
+e2e/fixtures/zero-data.ts -diff
+e2e/mocks/clerk.ts -diff
+e2e/mocks/zero-react.ts -diff
+e2e/mocks/zero.ts -diff
+entrypoint.sh -diff
+queries-service/.env.example -diff
+queries-service/dist/schema.js -diff
+queries-service/dist/src/app.d.ts -diff
+queries-service/dist/src/app.js -diff
+queries-service/dist/src/app.test.d.ts -diff
+queries-service/dist/src/app.test.js -diff
+queries-service/dist/src/auth.d.ts -diff
+queries-service/dist/src/auth.js -diff
+queries-service/dist/src/auth.test.d.ts -diff
+queries-service/dist/src/auth.test.js -diff
+queries-service/dist/src/index.d.ts -diff
+queries-service/dist/src/index.js -diff
+queries-service/dist/src/migrate.d.ts -diff
+queries-service/dist/src/migrate.js -diff
+queries-service/dist/src/mutators.d.ts -diff
+queries-service/dist/src/mutators.js -diff
+queries-service/dist/src/queries.js -diff
+queries-service/dist/src/rate-limit.d.ts -diff
+queries-service/dist/src/rate-limit.js -diff
+queries-service/dist/src/rate-limit.test.d.ts -diff
+queries-service/dist/src/rate-limit.test.js -diff
+queries-service/dist/src/validation.d.ts -diff
+queries-service/dist/src/validation.js -diff
+queries-service/package-lock.json -diff
+queries-service/package.json -diff
+queries-service/railway.toml -diff
+queries-service/schema.ts -diff
+queries-service/src/anthropic-proxy.test.ts -diff
+queries-service/src/anthropic-proxy.ts -diff
+queries-service/src/app.test.ts -diff
+queries-service/src/app.ts -diff
+queries-service/src/auth.test.ts -diff
+queries-service/src/auth.ts -diff
+queries-service/src/classifier.ts -diff
+queries-service/src/clerk-webhooks.ts -diff
+queries-service/src/conversion-prompt.md -diff
+queries-service/src/index.ts -diff
+queries-service/src/migrate.ts -diff
+queries-service/src/mutators.ts -diff
+queries-service/src/queries.ts -diff
+queries-service/src/rate-limit.test.ts -diff
+queries-service/src/rate-limit.ts -diff
+queries-service/src/releases-proxy.test.ts -diff
+queries-service/src/releases-proxy.ts -diff
+queries-service/src/rhai-strategy-prompt.md -diff
+queries-service/src/stripe-webhooks.ts -diff
+queries-service/src/subscription-service.ts -diff
+queries-service/src/system-prompt.ts -diff
+queries-service/src/validation.ts -diff
+queries-service/tsconfig.json -diff
+queries-service/vitest.config.ts -diff
+schema.cjs -diff
+scripts/calendar-seed.ts -diff
+scripts/init-staging-db.sql -diff
+scripts/set-tier.ts -diff
+shared/schema.ts -diff
+src-tauri/src/ai/proxy_client.rs -diff
+src-tauri/src/ai/tools.rs -diff
+src-tauri/src/db.rs -diff
+src-tauri/src/queries_service.rs -diff
+src/LoginApp.tsx -diff
+src/components/auth/LandingPage.tsx -diff
+src/components/auth/SignInPage.tsx -diff
+src/components/auth/SignUpPage.tsx -diff
+src/components/ui/AuthExpiredBanner.tsx -diff
+src/contexts/DesktopZeroContext.tsx -diff
+src/contexts/ZeroContext.tsx -diff
+src/hooks/useCredentials.ts -diff
+src/hooks/useDesktopDataSourceSync.ts -diff
+src/lib/aiQuotaApi.ts -diff
+src/lib/envValidation.ts -diff
+src/mutators.ts -diff
+src/queries.ts -diff
+
+# AGT-652: suppress line-level diff content for the files this ticket
+# DELETES (the in-app watcher engine, order surface, analysis/auth stacks,
+# and the account/ticket/tradeanalysis/login windows). File-level deletion
+# is the reviewable fact; the dead bodies exceed reviewer context windows.
+e2e/tests/account.spec.ts -diff
+e2e/tests/bug-024-account-switch.spec.ts -diff
+e2e/tests/bug-031-profile-picture.spec.ts -diff
+e2e/tests/bug-033-watcher-ai-context.spec.ts -diff
+e2e/tests/bug-049-test-notification.spec.ts -diff
+e2e/tests/bug-050-notification-persist.spec.ts -diff
+e2e/tests/bug-062-alert-toggle.spec.ts -diff
+e2e/tests/bug-068-cycle-flicker.spec.ts -diff
+e2e/tests/local-trades-analysis.spec.ts -diff
+e2e/tests/strategy-watcher.spec.ts -diff
+src-tauri/src/analysis/ai_prompts.rs -diff
+src-tauri/src/analysis/enrichment.rs -diff
+src-tauri/src/analysis/mod.rs -diff
+src-tauri/src/analysis/patterns.rs -diff
+src-tauri/src/analysis/performance.rs -diff
+src-tauri/src/analysis/statistics.rs -diff
+src-tauri/src/analysis/trade_review.rs -diff
+src-tauri/src/auth/commands.rs -diff
+src-tauri/src/auth/dev_server.rs -diff
+src-tauri/src/auth/dev_storage.rs -diff
+src-tauri/src/auth/keychain.rs -diff
+src-tauri/src/auth/mod.rs -diff
+src-tauri/src/auth/oauth.rs -diff
+src-tauri/src/auth/tokens.rs -diff
+src-tauri/src/commands/analysis.rs -diff
+src-tauri/src/commands/watcher.rs -diff
+src/App.tsx -diff
+src/DesktopLoginApp.tsx -diff
+src/TradeAnalysisApp.tsx -diff
+src/TradingTicketApp.tsx -diff
+src/components/EconomicCalendar.tsx -diff
+src/components/OrdersList.tsx -diff
+src/components/PositionsList.tsx -diff
+src/components/PriceCard.tsx -diff
+src/components/TradeForm.tsx -diff
+src/components/analysis/AnalysisFilters.tsx -diff
+src/components/analysis/DimensionBreakdown.tsx -diff
+src/components/analysis/PatternInsights.tsx -diff
+src/components/analysis/StatsDashboard.tsx -diff
+src/components/analysis/TradeList.tsx -diff
+src/components/analysis/TradeReviewModal.tsx -diff
+src/components/analysis/TradesModal.tsx -diff
+src/components/auth/DesktopLandingPage.tsx -diff
+src/components/ui/ProfileMenu.tsx -diff
+src/components/watcher/ActiveWatchersList.tsx -diff
+src/components/watcher/AddMonitorForm.tsx -diff
+src/components/watcher/InstrumentPriceCard.tsx -diff
+src/components/watcher/MatchCard.tsx -diff
+src/components/watcher/MatchList.tsx -diff
+src/components/watcher/MultiWatcherRow.tsx -diff
+src/components/watcher/WatcherControls.tsx -diff
+src/components/watcher/WatcherError.tsx -diff
+src/components/watcher/index.ts -diff
+src/components/watcher/utils.ts -diff
+src/components/watcher/watcherHelpers.ts -diff
+src/contexts/DesktopAuthContext.tsx -diff
+src/hooks/useAIWatcherCommands.ts -diff
+src/hooks/useStrategyWatcher.ts -diff
+src/hooks/useTradeExecution.ts -diff
+src/stores/ticketConfigStore.ts -diff
+src/stores/watcherStore.ts -diff
+
+# AGT-653: suppress line-level diff content for the files this ticket
+# DELETES (the marketing/billing web site, the entitlement content package,
+# the entitlement UI, and agent docs for those deleted domains). File-level
+# deletion is the reviewable fact; bodies are recoverable via
+# `git show main:<path>`. Every path ceases to exist after this merge.
+web/** -diff
+packages/content/** -diff
+.agent/auth-security/** -diff
+.agent/membership-payments/** -diff
+.agent/web-marketing/** -diff
+.github/workflows/deploy.yml -diff
+netlify.toml -diff
+docs/user-guide.yaml -diff
+src/components/ui/ConfigError.tsx -diff
+src/components/ui/FeatureGate.tsx -diff
+src/components/ui/PricingModal.tsx -diff
+src/components/ui/TokenTopUpModal.tsx -diff
+src/components/ui/UpgradePrompt.tsx -diff
+src/contexts/PricingModalContext.tsx -diff
+src/hooks/useEntitlements.ts -diff
+src/lib/config.ts -diff

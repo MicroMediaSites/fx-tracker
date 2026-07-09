@@ -1,0 +1,11 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2021"
+description = "Shared types for CandleSight strategy definitions"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+rust_decimal_macros = "1.36"

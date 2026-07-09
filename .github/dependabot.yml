@@ -1,0 +1,19 @@
+# AGT-658 AC3 — keep the SHA-pinned GitHub Actions current.
+# All third-party actions in .github/workflows/* are pinned to full commit SHAs
+# (defense against a mutable tag being re-pointed at malicious code inside the
+# signing/release jobs). Dependabot tracks the upstream release tag behind each
+# pinned SHA and opens PRs that bump the SHA (and its `# vX.Y.Z` comment) when a
+# new version ships. Review each bump before merging — a SHA pin is only as good
+# as the review of what it moves to.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"

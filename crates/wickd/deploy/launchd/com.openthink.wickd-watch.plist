@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent that supervises ONE autonomous `wickd watch ... --auto` strategy
+  on the always-on host (AGT-629 AC1). Trust-ladder Stage 2: the watcher
+  autonomously executes tradeable signals on the OANDA PRACTICE account via the
+  guarded auto path (AGT-626/627). It attaches to the shared stream hub
+  (com.openthink.wickd-stream) when one is up, else opens its own direct OANDA
+  source — so the two jobs have NO hard start-order dependency.
+
+  PARAMETERIZED PER STRATEGY. This template is installed once per
+  strategy/account combination — the Label and the log filenames carry a
+  __SLUG__ so many watchers (e.g. rsi on the H-004 basket, ma-crossover on
+  another) coexist as independent launchd jobs, each restarted independently.
+  `install.sh watch <strategy> <instruments> --account <name>` computes the
+  slug, renders the label to com.openthink.wickd-watch.<slug>, and substitutes
+  the placeholders. It is not loadable as-is.
+
+  PRACTICE ONLY. `--env practice` is hardcoded below (not a placeholder): a
+  supervised job must never be able to arm live autonomous execution. Belt and
+  braces — `wickd watch --auto` also refuses `--env live` at startup (exit 3)
+  and the guarded path fails closed on live regardless. A live order always
+  needs an interactive `wickd approve --live` keystroke; it is never supervised.
+
+  See README.md in this directory for full install / verify / uninstall steps.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Per-strategy label: com.openthink.wickd-watch.<slug> (install.sh sets it). -->
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <!--
+      Absolute path to the wickd binary + the autonomous watch invocation:
+
+        wickd watch <strategy> <instruments> --granularity <g> \
+          --env practice --account <name> --units <n> --auto
+
+      __STRATEGY__ is a built-in (`ma-crossover` | `rsi`) or a Rhai script (a
+      bare name under ~/.wickd/strategies/<name>.rhai, or an absolute .rhai
+      path). __INSTRUMENTS__ is a single comma-separated token (clap splits it,
+      so one argv element carries the whole watchlist, e.g. "EUR_USD,GBP_USD").
+      Add `--set id=value` lines to this array for a scripted strategy's
+      @parameters overrides (see README "Scripted strategies").
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__WICKD_BIN__</string>
+        <string>watch</string>
+        <string>__STRATEGY__</string>
+        <string>__INSTRUMENTS__</string>
+        <string>--granularity</string>
+        <string>__GRANULARITY__</string>
+        <string>--env</string>
+        <string>practice</string>
+        <string>--account</string>
+        <string>__ACCOUNT__</string>
+        <string>--units</string>
+        <string>__UNITS__</string>
+        <string>--auto</string>
+    </array>
+
+    <!-- Start as soon as the agent is loaded (i.e. at user login on the box). -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      Restart the watcher whenever it exits abnormally (crash / non-zero exit),
+      but NOT when it exits cleanly (SIGINT/SIGTERM during an intentional stop).
+      This is the crash-supervision behaviour AGT-629 AC2 requires: a killed
+      watcher comes back on its own. On that restart it re-attaches to the hub
+      and (via AGT-628) reconciles/adopts any open positions on its account —
+      see README "Restart + reconcile".
+    -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Don't hammer-restart in a tight crash loop; wait 30s between respawns. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Background service: lower scheduling priority, no UI. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!--
+      Logs (AC1). The log directory must exist before load; install.sh creates
+      ~/Library/Logs/wickd. `wickd watch --auto` emits the NDJSON signal stream
+      AND the autonomous-execution events (auto-place/auto-close/adoption) on
+      stdout; human/error output on stderr.
+    -->
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/watch.__SLUG__.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/watch.__SLUG__.err.log</string>
+
+    <!--
+      Run from the user's home so ~/.wickd/config.json (account id),
+      ~/.wickd/stream.sock (shared hub), ~/.wickd/strategies/ (scripts), and the
+      user's login keychain (API key) all resolve.
+    -->
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <!--
+      No secret here. `wickd watch` reads the OANDA API key from the user's
+      login keychain (written by `wickd login`), resolving the per-account item
+      or the shared-token fallback (AGT-625). Because this LaunchAgent runs in
+      the user's login session, the keychain is unlocked and readable with no
+      password. See README.md "Credentials".
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

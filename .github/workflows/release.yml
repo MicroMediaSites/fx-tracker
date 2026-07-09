@@ -1,0 +1,383 @@
+name: Release
+
+# Stamp-gated release flow (AGT-641):
+# Merges happen on the stamp origin and are mirrored to GitHub as plain pushes,
+# so this workflow triggers on push to main (PR events never fire under stamp).
+# The version bump is computed from conventional-commit messages since the last
+# v* release tag; the git tag is the source of truth for the released version.
+# NOTHING is committed back to main - the GitHub repo is a read-only mirror of
+# the stamp origin, and a CI commit here would diverge the mirror.
+# src-tauri/tauri.conf.json's checked-in version is patched at build time only.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Cut a release even if no new commits since the last tag'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+
+# AGT-658 AC4: least-privilege default. `contents: write` is granted only to the
+# build-macos job that actually creates the GitHub release / uploads assets.
+permissions:
+  contents: read
+
+# Queue concurrent merge pushes instead of racing: a queued run recomputes the
+# commit range since the (new) latest tag and skips if a prior run covered it.
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Compute Version
+    runs-on: [self-hosted, Linux, ARM64]
+    # Read-only: this job only reads git history to compute the next version.
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      bump_type: ${{ steps.compute.outputs.bump_type }}
+      should_release: ${{ steps.compute.outputs.should_release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compute version bump from conventional commits
+        id: compute
+        run: |
+          set -euo pipefail
+
+          # Nearest v* tag that is an ancestor of HEAD = the last release cut
+          # from this history. Release tags live on the GitHub mirror only
+          # (the stamp origin's tags are stale), which is fine: this job
+          # always runs against the mirror's history.
+          LAST_TAG=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || true)
+
+          if [ -n "$LAST_TAG" ]; then
+            BASE_VERSION="${LAST_TAG#v}"
+            RANGE="${LAST_TAG}..HEAD"
+          else
+            BASE_VERSION=$(jq -r '.version' src-tauri/tauri.conf.json)
+            RANGE="HEAD"
+          fi
+          echo "Last release tag: ${LAST_TAG:-<none>} (base version: $BASE_VERSION)"
+
+          SUBJECTS=$(git log --format='%s' "$RANGE")
+          if [ -z "$SUBJECTS" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "No new commits since $LAST_TAG - nothing to release"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Conventional-commit scan over every commit in the merged range
+          # (branch commits + merge commit). Precedence:
+          #   type!: / BREAKING CHANGE -> major
+          #   feat:                    -> minor
+          #   anything else            -> patch (every merge cuts a release)
+          BODIES=$(git log --format='%B' "$RANGE")
+          BUMP="patch"
+          if echo "$SUBJECTS" | grep -qE '^[A-Za-z]+(\([^)]*\))?!:' || echo "$BODIES" | grep -q 'BREAKING CHANGE'; then
+            BUMP="major"
+          elif echo "$SUBJECTS" | grep -qE '^feat(\([^)]*\))?:'; then
+            BUMP="minor"
+          fi
+          echo "Version bump: $BUMP"
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          echo "New version: $NEW_VERSION"
+
+          # Safety: never overwrite an existing tag
+          if git rev-parse -q --verify "refs/tags/v${NEW_VERSION}" >/dev/null; then
+            echo "Tag v${NEW_VERSION} already exists - refusing to overwrite"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "version=$NEW_VERSION"
+            echo "bump_type=$BUMP"
+            echo "should_release=true"
+          } >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    name: macOS Build
+    needs: version
+    if: needs.version.outputs.should_release == 'true'
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # Pin to the commit that triggered the run - main may advance again
+          # (another stamp merge) while this job is queued.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set release version in tauri.conf.json (build-time only, not committed)
+        run: |
+          node -e "
+            const fs = require('fs');
+            const config = JSON.parse(fs.readFileSync('./src-tauri/tauri.conf.json', 'utf8'));
+            config.version = '${{ needs.version.outputs.version }}';
+            fs.writeFileSync('./src-tauri/tauri.conf.json', JSON.stringify(config, null, 2) + '\n');
+          "
+          echo "Building version: $(jq -r '.version' src-tauri/tauri.conf.json)"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check Apple signing secrets
+        id: signcheck
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Apple signing secrets present - signed + notarized build"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::APPLE_CERTIFICATE secret is missing - producing an UNSIGNED build. See HUMAN-ITEMS.md."
+          fi
+
+      - name: Import Apple Certificate
+        if: steps.signcheck.outputs.enabled == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          # Create keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+
+          # Save original keychain list for cleanup, then add temp keychain
+          security list-keychain -d user | tr -d '"' | sed 's/^ *//' > "$RUNNER_TEMP/original-keychains.txt"
+          KEYCHAINS=("$KEYCHAIN_PATH")
+          while IFS= read -r kc; do
+            [ -n "$kc" ] && KEYCHAINS+=("$kc")
+          done < "$RUNNER_TEMP/original-keychains.txt"
+          security list-keychain -d user -s "${KEYCHAINS[@]}"
+
+          # Allow codesign to access the key
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Enable Apple signing + notarization env
+        if: steps.signcheck.outputs.enabled == 'true'
+        run: |
+          # Only exported when the certificate is present, so an unsigned
+          # build never hands tauri a dangling signing identity.
+          # Values written to GITHUB_ENV stay secret-masked in logs.
+          {
+            echo "APPLE_SIGNING_IDENTITY=Developer ID Application: Matt Pardini (B2B36MFVKQ)"
+            echo "APPLE_TEAM_ID=B2B36MFVKQ"
+            echo "APPLE_ID=${{ secrets.APPLE_ID }}"
+            echo "APPLE_PASSWORD=${{ secrets.APPLE_PASSWORD }}"
+          } >> "$GITHUB_ENV"
+
+      - name: Create .env file for Vite
+        run: |
+          echo "VITE_BUILD_MODE=production" > .env.production.local
+
+      - name: Configure updater endpoint
+        run: |
+          # AGT-650: the queries-service releases proxy is gone. latest.json is
+          # uploaded to every GitHub release (verified below), so the updater
+          # feed points straight at the latest-release asset URL.
+          sed -i '' 's|https://localhost/updates/latest.json|https://github.com/${{ github.repository }}/releases/latest/download/latest.json|g' src-tauri/tauri.conf.json
+
+      - name: Build frontend first
+        run: npm run build
+
+      - name: Skip beforeBuildCommand (already built)
+        run: |
+          sed -i '' 's|"beforeBuildCommand": "npm run build"|"beforeBuildCommand": ""|g' src-tauri/tauri.conf.json
+
+      - name: Build Tauri App (skip DMG - created manually below)
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          CI: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Apple signing + notarization env (APPLE_*) is exported by the
+          # "Enable Apple signing" step above only when secrets are present.
+          # Tauri updater signing
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          BUILD_MODE: prod
+        with:
+          # Skip DMG: the self-hosted runner lacks /Volumes mount permission.
+          # DMG is created manually in the next step using hdiutil -srcfolder.
+          args: --bundles app,updater
+          tagName: v${{ needs.version.outputs.version }}
+          releaseName: 'wickd v${{ needs.version.outputs.version }}'
+          releaseBody: |
+            Automated release cut from a stamp merge to main.
+
+            **macOS:** Download the `.dmg` file
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+
+      - name: Verify code signature and notarization
+        if: steps.signcheck.outputs.enabled == 'true'
+        run: |
+          # Bundle name comes from productName ("wickd" since AGT-640) so the
+          # path can never drift from what tauri actually built.
+          APP_NAME=$(jq -r '.productName' src-tauri/tauri.conf.json)
+          APP_PATH="src-tauri/target/release/bundle/macos/${APP_NAME}.app"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          echo "Code signature verified"
+          # Notarization staple check: warn-only, since ticket stapling can
+          # lag Apple's notary service without meaning the submission failed.
+          if xcrun stapler validate "$APP_PATH"; then
+            echo "Notarization ticket stapled and valid"
+          else
+            echo "::warning::stapler validate failed for $APP_PATH - confirm notarization succeeded (check tauri-action logs above)"
+          fi
+
+      - name: Create DMG
+        run: |
+          set -euo pipefail
+          # productName is "wickd" (AGT-640); derive it so artifact names track
+          # tauri.conf.json instead of a hardcoded brand string.
+          APP_NAME=$(jq -r '.productName' src-tauri/tauri.conf.json)
+          VERSION=$(jq -r '.version' src-tauri/tauri.conf.json)
+          BUNDLE_DIR="src-tauri/target/release/bundle"
+          DMG_NAME="${APP_NAME}_${VERSION}_aarch64.dmg"
+          DMG_PATH="${BUNDLE_DIR}/dmg/${DMG_NAME}"
+          RW_DMG="${BUNDLE_DIR}/dmg/rw.${DMG_NAME}"
+
+          mkdir -p "${BUNDLE_DIR}/dmg"
+
+          # Calculate image size (app size + 20MB padding)
+          APP_SIZE=$(du -sm "${BUNDLE_DIR}/macos/${APP_NAME}.app" | cut -f1)
+          IMAGE_SIZE=$((APP_SIZE + 20))
+
+          # 1. Create empty read-write image (does NOT mount to /Volumes)
+          hdiutil create \
+            -volname "$APP_NAME" \
+            -fs HFS+ \
+            -fsargs "-c c=64,a=16,e=16" \
+            -size "${IMAGE_SIZE}m" \
+            "$RW_DMG"
+
+          # 2. Mount to private tmp dir (avoids /Volumes permission issue)
+          MOUNT_DIR=$(mktemp -d /private/tmp/dmg.XXXXXX)
+          hdiutil attach "$RW_DMG" \
+            -readwrite -noverify -noautoopen -nobrowse \
+            -mountpoint "$MOUNT_DIR"
+
+          # 3. Copy app and create Applications symlink
+          cp -R "${BUNDLE_DIR}/macos/${APP_NAME}.app" "${MOUNT_DIR}/"
+          ln -sf /Applications "${MOUNT_DIR}/Applications"
+
+          # 4. Unmount
+          hdiutil detach "$MOUNT_DIR"
+
+          # 5. Convert to compressed UDZO format
+          hdiutil convert "$RW_DMG" \
+            -format UDZO \
+            -imagekey zlib-level=9 \
+            -o "$DMG_PATH"
+
+          rm -f "$RW_DMG"
+          echo "DMG created: $DMG_PATH"
+          ls -la "$DMG_PATH"
+
+      - name: Upload DMG to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APP_NAME=$(jq -r '.productName' src-tauri/tauri.conf.json)
+          VERSION=$(jq -r '.version' src-tauri/tauri.conf.json)
+          DMG_PATH="src-tauri/target/release/bundle/dmg/${APP_NAME}_${VERSION}_aarch64.dmg"
+          TAG="v${{ needs.version.outputs.version }}"
+          gh release upload "$TAG" "$DMG_PATH" --clobber
+
+      - name: Verify release assets + updater metadata
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v${{ needs.version.outputs.version }}"
+          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          echo "Release $TAG assets:"
+          echo "$ASSETS"
+
+          # Artifact names must carry the wickd identity (AGT-643): the DMG is
+          # ${productName}_${version}_aarch64.dmg and productName is "wickd".
+          echo "$ASSETS" | grep -q '^wickd_.*\.dmg$' || { echo "ERROR: no wickd-named DMG asset on release $TAG"; exit 1; }
+          if echo "$ASSETS" | grep -qi 'candlesight'; then
+            echo "ERROR: candlesight-named asset still present on release $TAG"
+            exit 1
+          fi
+          echo "$ASSETS" | grep -q '^latest.json$' || { echo "ERROR: no latest.json updater metadata on release $TAG"; exit 1; }
+
+          # Updater metadata must advertise exactly this version, with a
+          # download URL and signature for the macOS updater artifact, and the
+          # updater archive it points at must also carry the wickd identity.
+          gh release download "$TAG" --pattern latest.json --output "$RUNNER_TEMP/latest.json" --clobber
+          JSON_VERSION=$(jq -r '.version' "$RUNNER_TEMP/latest.json")
+          [ "$JSON_VERSION" = "${{ needs.version.outputs.version }}" ] || { echo "ERROR: latest.json version $JSON_VERSION != ${{ needs.version.outputs.version }}"; exit 1; }
+          jq -e '.platforms["darwin-aarch64"].url and .platforms["darwin-aarch64"].signature' "$RUNNER_TEMP/latest.json" >/dev/null \
+            || { echo "ERROR: latest.json missing darwin-aarch64 url/signature"; exit 1; }
+          jq -e '.platforms["darwin-aarch64"].url | test("wickd[^/]*\\.app\\.tar\\.gz$")' "$RUNNER_TEMP/latest.json" >/dev/null \
+            || { echo "ERROR: latest.json darwin-aarch64 url does not point at a wickd .app.tar.gz: $(jq -r '.platforms["darwin-aarch64"].url' "$RUNNER_TEMP/latest.json")"; exit 1; }
+          echo "Updater metadata verified for $TAG"
+
+      # CRITICAL: Clean up all runner-level state to prevent corrupting the local environment.
+      # This runs even if the build fails, preventing stale keychains, mounted DMGs, and leftover files.
+      - name: Cleanup runner state
+        if: always()
+        run: |
+          # Restore original keychain search list (saved during import step).
+          # Only touch the keychain list if the import step actually ran
+          # (unsigned builds never modify it).
+          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
+          if [ -f "$RUNNER_TEMP/original-keychains.txt" ]; then
+            KEYCHAINS=()
+            while IFS= read -r kc; do
+              [ -n "$kc" ] && KEYCHAINS+=("$kc")
+            done < "$RUNNER_TEMP/original-keychains.txt"
+            security list-keychain -d user -s "${KEYCHAINS[@]}"
+          fi
+
+          # Force-detach any stale DMG mounts
+          for dir in /private/tmp/dmg.*; do
+            [ -d "$dir" ] && hdiutil detach "$dir" -force 2>/dev/null || true
+            rmdir "$dir" 2>/dev/null || true
+          done
+
+          # Remove build-time env file
+          rm -f .env.production.local
+
+          # Remove decoded certificate
+          rm -f "$RUNNER_TEMP/certificate.p12"

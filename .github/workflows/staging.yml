@@ -1,0 +1,429 @@
+name: Staging Build
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - none
+
+env:
+  CARGO_TERM_COLOR: always
+
+# AGT-658 AC4: least-privilege default. Write access is granted per-job only
+# where needed (bump-version pushes a commit; build-macos creates the release).
+permissions:
+  contents: read
+
+jobs:
+  check-label:
+    name: Check Label
+    runs-on: [self-hosted, Linux, ARM64]
+    permissions:
+      contents: read
+    # Run if: (PR was merged AND has build:staging label) OR manual workflow_dispatch
+    if: (github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'build:staging')) || github.event_name == 'workflow_dispatch'
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      bump_type: ${{ steps.check.outputs.bump_type }}
+    steps:
+      - name: Check for build:staging label and determine bump type
+        id: check
+        run: |
+          echo "should_build=true" >> $GITHUB_OUTPUT
+
+          # For workflow_dispatch, use the input; for PR, check labels
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "bump_type=${{ inputs.bump_type }}" >> $GITHUB_OUTPUT
+            echo "Manual trigger - Version bump: ${{ inputs.bump_type }}"
+          else
+            # Determine version bump type from labels (default: none if no bump label)
+            LABELS='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+            if echo "$LABELS" | grep -q '"bump:major"'; then
+              echo "bump_type=major" >> $GITHUB_OUTPUT
+              echo "Version bump: major"
+            elif echo "$LABELS" | grep -q '"bump:minor"'; then
+              echo "bump_type=minor" >> $GITHUB_OUTPUT
+              echo "Version bump: minor"
+            elif echo "$LABELS" | grep -q '"bump:patch"'; then
+              echo "bump_type=patch" >> $GITHUB_OUTPUT
+              echo "Version bump: patch"
+            else
+              echo "bump_type=none" >> $GITHUB_OUTPUT
+              echo "No version bump label - using current version"
+            fi
+          fi
+
+  bump-version:
+    name: Bump Version
+    needs: check-label
+    if: needs.check-label.outputs.should_build == 'true' && needs.check-label.outputs.bump_type != 'none'
+    runs-on: [self-hosted, Linux, ARM64]
+    # AGT-658 AC4: this is the only staging job that needs write access (it
+    # pushes the version-bump commit to main).
+    permissions:
+      contents: write
+    outputs:
+      new_version: ${{ steps.bump.outputs.new_version }}
+    steps:
+      # AGT-658 AC5 — RESIDUAL RISK (GH_RUNNER_TOKEN PAT):
+      # This checkout + `git push` below authenticate with GH_RUNNER_TOKEN, a
+      # long-lived personal access token, from a self-hosted runner. A leaked or
+      # over-scoped PAT is a standing credential to push to `main`. The job's own
+      # GITHUB_TOKEN can't be used for the push because branch-protection /
+      # required-status-checks would reject a token-authored push and, under the
+      # stamp flow, main is only advanced by signed merges — so a dedicated
+      # push credential is required here at all.
+      # RECOMMENDED FIX (see HUMAN-ITEMS.md): replace GH_RUNNER_TOKEN with a
+      # short-lived GitHub App installation token minted per-run via
+      # `actions/create-github-app-token`, scoped to `contents: write` on this
+      # repo only, so no long-lived push credential sits on the runner. Until
+      # the App is created this PAT remains the accepted, documented residual.
+      # NOTE: under the current stamp-gated flow, PR events do not fire on the
+      # GitHub mirror, so this path is effectively dormant today.
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          token: ${{ secrets.GH_RUNNER_TOKEN }}
+
+      - name: Bump version and commit
+        id: bump
+        run: |
+          BUMP_TYPE="${{ needs.check-label.outputs.bump_type }}"
+          CURRENT_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          echo "Current version: $CURRENT_VERSION"
+
+          # Parse version components
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+
+          # Bump based on type
+          case "$BUMP_TYPE" in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+          esac
+
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          echo "New version: $NEW_VERSION"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+          # Update tauri.conf.json using node for proper JSON handling
+          node -e "
+            const fs = require('fs');
+            const config = JSON.parse(fs.readFileSync('./src-tauri/tauri.conf.json', 'utf8'));
+            config.version = '$NEW_VERSION';
+            fs.writeFileSync('./src-tauri/tauri.conf.json', JSON.stringify(config, null, 2) + '\n');
+          "
+
+          # Commit and push
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/tauri.conf.json
+          git commit -m "chore: bump version to $NEW_VERSION [skip ci]"
+          git push
+
+  build-macos:
+    name: macOS Build
+    needs: [check-label, bump-version]
+    # Run if should_build is true, and either bump-version succeeded OR was skipped (no bump label)
+    if: |
+      always() &&
+      needs.check-label.outputs.should_build == 'true' &&
+      (needs.bump-version.result == 'success' || needs.bump-version.result == 'skipped')
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 20
+    environment: staging
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Import Apple Certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          # Create keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security import $RUNNER_TEMP/certificate.p12 -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+
+          # Save original keychain list for cleanup, then add temp keychain
+          security list-keychain -d user | tr -d '"' | sed 's/^ *//' > "$RUNNER_TEMP/original-keychains.txt"
+          KEYCHAINS=("$KEYCHAIN_PATH")
+          while IFS= read -r kc; do
+            [ -n "$kc" ] && KEYCHAINS+=("$kc")
+          done < "$RUNNER_TEMP/original-keychains.txt"
+          security list-keychain -d user -s "${KEYCHAINS[@]}"
+
+          # Allow codesign to access the key
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Create .env file for Vite
+        run: |
+          echo "VITE_BUILD_MODE=staging" > .env.production.local
+
+      - name: Configure updater endpoint
+        run: |
+          # AGT-650: the queries-service staging releases proxy is gone.
+          # Staging builds are per-PR prereleases with no rolling feed, so the
+          # updater points at this build's own release tag — valid metadata,
+          # effectively no-op updates (staging builds are manually installed).
+          sed -i '' 's|https://localhost/updates/latest.json|https://github.com/${{ github.repository }}/releases/download/staging-PR${{ github.event.pull_request.number }}-run${{ github.run_number }}/latest.json|g' src-tauri/tauri.conf.json
+
+      - name: Build Tauri App (skip DMG - created manually below)
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          CI: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Apple signing
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: "Developer ID Application: Matt Pardini (B2B36MFVKQ)"
+          # Apple notarization
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: B2B36MFVKQ
+          # Tauri updater signing
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          BUILD_MODE: staging
+        with:
+          # Skip DMG: the self-hosted runner lacks /Volumes mount permission.
+          # DMG is created manually in the next step using hdiutil -srcfolder.
+          args: --bundles app,updater
+          tagName: staging-PR${{ github.event.pull_request.number }}-run${{ github.run_number }}
+          releaseName: 'wickd Staging (PR #${{ github.event.pull_request.number }})'
+          releaseBody: |
+            Staging build for PR #${{ github.event.pull_request.number }}
+
+            **PR:** ${{ github.event.pull_request.title }}
+            **Branch:** ${{ github.event.pull_request.head.ref }}
+
+            ---
+            **macOS:** Download the `.dmg` file
+          releaseDraft: false
+          prerelease: true
+          includeUpdaterJson: true
+
+      - name: Create DMG
+        run: |
+          set -euo pipefail
+          # productName is "wickd" (AGT-640); derive it so artifact names track
+          # tauri.conf.json instead of a hardcoded brand string.
+          APP_NAME=$(jq -r '.productName' src-tauri/tauri.conf.json)
+          VERSION=$(jq -r '.version' src-tauri/tauri.conf.json)
+          BUNDLE_DIR="src-tauri/target/release/bundle"
+          DMG_NAME="${APP_NAME}_${VERSION}_aarch64.dmg"
+          DMG_PATH="${BUNDLE_DIR}/dmg/${DMG_NAME}"
+          RW_DMG="${BUNDLE_DIR}/dmg/rw.${DMG_NAME}"
+
+          mkdir -p "${BUNDLE_DIR}/dmg"
+
+          # Calculate image size (app size + 20MB padding)
+          APP_SIZE=$(du -sm "${BUNDLE_DIR}/macos/${APP_NAME}.app" | cut -f1)
+          IMAGE_SIZE=$((APP_SIZE + 20))
+
+          # 1. Create empty read-write image (does NOT mount to /Volumes)
+          hdiutil create \
+            -volname "$APP_NAME" \
+            -fs HFS+ \
+            -fsargs "-c c=64,a=16,e=16" \
+            -size "${IMAGE_SIZE}m" \
+            "$RW_DMG"
+
+          # 2. Mount to private tmp dir (avoids /Volumes permission issue)
+          MOUNT_DIR=$(mktemp -d /private/tmp/dmg.XXXXXX)
+          hdiutil attach "$RW_DMG" \
+            -readwrite -noverify -noautoopen -nobrowse \
+            -mountpoint "$MOUNT_DIR"
+
+          # 3. Copy app and create Applications symlink
+          cp -R "${BUNDLE_DIR}/macos/${APP_NAME}.app" "${MOUNT_DIR}/"
+          ln -sf /Applications "${MOUNT_DIR}/Applications"
+
+          # 4. Unmount
+          hdiutil detach "$MOUNT_DIR"
+
+          # 5. Convert to compressed UDZO format
+          hdiutil convert "$RW_DMG" \
+            -format UDZO \
+            -imagekey zlib-level=9 \
+            -o "$DMG_PATH"
+
+          rm -f "$RW_DMG"
+          echo "DMG created: $DMG_PATH"
+          ls -la "$DMG_PATH"
+
+      - name: Upload DMG to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APP_NAME=$(jq -r '.productName' src-tauri/tauri.conf.json)
+          VERSION=$(jq -r '.version' src-tauri/tauri.conf.json)
+          DMG_PATH="src-tauri/target/release/bundle/dmg/${APP_NAME}_${VERSION}_aarch64.dmg"
+          TAG="staging-PR${{ github.event.pull_request.number }}-run${{ github.run_number }}"
+          gh release upload "$TAG" "$DMG_PATH" --clobber
+
+      # CRITICAL: Clean up all runner-level state to prevent corrupting the local environment.
+      # This runs even if the build fails, preventing stale keychains, mounted DMGs, and leftover files.
+      - name: Cleanup runner state
+        if: always()
+        run: |
+          # Restore original keychain search list (saved during import step)
+          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
+          if [ -f "$RUNNER_TEMP/original-keychains.txt" ]; then
+            KEYCHAINS=()
+            while IFS= read -r kc; do
+              [ -n "$kc" ] && KEYCHAINS+=("$kc")
+            done < "$RUNNER_TEMP/original-keychains.txt"
+            security list-keychain -d user -s "${KEYCHAINS[@]}"
+          else
+            security list-keychain -d user -s ~/Library/Keychains/login.keychain-db
+          fi
+
+          # Force-detach any stale DMG mounts
+          for dir in /private/tmp/dmg.*; do
+            [ -d "$dir" ] && hdiutil detach "$dir" -force 2>/dev/null || true
+            rmdir "$dir" 2>/dev/null || true
+          done
+
+          # Remove build-time env file
+          rm -f .env.production.local
+
+          # Remove decoded certificate
+          rm -f "$RUNNER_TEMP/certificate.p12"
+
+  build-windows:
+    name: Windows Build
+    needs: [check-label, bump-version]
+    # Temporarily disabled to conserve Actions minutes (windows-latest-l has 4x billing multiplier)
+    if: false
+    runs-on: windows-latest-l
+    timeout-minutes: 20
+    environment: staging
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main  # Get the latest main (includes the version bump commit)
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable (pinned; Dependabot bumps)
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fix native dependencies (npm bug workaround)
+        shell: pwsh
+        run: |
+          # npm has a bug where optional dependencies for other platforms aren't installed correctly
+          # npm bug: https://github.com/npm/cli/issues/4828
+          # Explicitly install Windows-specific native bindings
+          npm install @rollup/rollup-win32-x64-msvc @tailwindcss/oxide-win32-x64-msvc @tauri-apps/cli-win32-x64-msvc --save-optional --ignore-scripts
+          npm rebuild
+
+      - name: Create .env file for Vite
+        shell: pwsh
+        run: |
+          $content = "VITE_BUILD_MODE=staging"
+          $content | Out-File -FilePath .env.production.local -Encoding utf8NoBOM
+
+      - name: Configure updater endpoint
+        shell: pwsh
+        run: |
+          # Replace placeholder with this build's own release-tag feed (AGT-650)
+          $config = Get-Content -Path "src-tauri/tauri.conf.json" -Raw
+          # AGT-650: point at this build's own release tag (see macOS job note)
+          $config = $config -replace 'https://localhost/updates/latest\.json', 'https://github.com/${{ github.repository }}/releases/download/staging-PR${{ github.event.pull_request.number }}-run${{ github.run_number }}/latest.json'
+          $config | Set-Content -Path "src-tauri/tauri.conf.json" -Encoding utf8NoBOM
+
+      - name: Build frontend
+        shell: pwsh
+        run: |
+          npm run build
+          Write-Host "=== Frontend build complete ==="
+
+      - name: Verify frontend contains staging URL
+        shell: pwsh
+        run: |
+          $bundleFile = Get-ChildItem -Path "build/assets" -Filter "index-*.js" | Select-Object -First 1
+          Write-Host "Bundle present: $($bundleFile.Name)"
+
+      - name: Skip beforeBuildCommand
+        shell: pwsh
+        run: |
+          $config = Get-Content -Path "src-tauri/tauri.conf.json" -Raw
+          $config = $config -replace '"beforeBuildCommand": "npm run build"', '"beforeBuildCommand": ""'
+          $config | Set-Content -Path "src-tauri/tauri.conf.json" -Encoding utf8NoBOM
+
+      - name: Build Tauri App
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          BUILD_MODE: staging
+        with:
+          tagName: staging-PR${{ github.event.pull_request.number }}-run${{ github.run_number }}
+          releaseName: 'wickd Staging (PR #${{ github.event.pull_request.number }})'
+          releaseBody: |
+            Staging build for PR #${{ github.event.pull_request.number }}
+
+            **PR:** ${{ github.event.pull_request.title }}
+            **Branch:** ${{ github.event.pull_request.head.ref }}
+
+            ---
+            **Windows:** Download the `.msi` or `.exe` installer
+          releaseDraft: false
+          prerelease: true
+          includeUpdaterJson: true

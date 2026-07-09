@@ -1,0 +1,10 @@
+Dockerfile
+.dockerignore
+node_modules
+**/node_modules
+.next
+**/.next
+.git
+.env*
+*.md
+.DS_Store

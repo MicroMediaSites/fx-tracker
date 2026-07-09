@@ -1,0 +1,483 @@
+@import 'tailwindcss';
+
+/* Standardize form control heights */
+select,
+input[type="number"],
+input[type="text"],
+input[type="email"],
+input[type="password"] {
+  height: 34px;
+}
+
+/* Consistent disabled state styling for all form inputs
+ * Uses !important to override Tailwind's disabled:opacity-50 classes
+ * which make dark backgrounds too dark when disabled.
+ *
+ * 0.7 opacity is visible enough on dark backgrounds while still
+ * indicating the field is disabled. */
+input:disabled,
+input[disabled],
+select:disabled,
+select[disabled],
+textarea:disabled,
+textarea[disabled] {
+  opacity: 0.7 !important;
+  cursor: not-allowed !important;
+}
+
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  /* ==========================================================================
+   * Design Tokens - Dark Theme (Default)
+   * ========================================================================== */
+
+  /* Background colors */
+  --color-bg-page: #0e1117;
+  --color-bg-elevated: #1a1f26;
+  --color-bg-card: #161b22;
+  --color-bg-input: transparent;
+  --color-bg-hover: rgba(55, 65, 81, 0.3);
+  --color-bg-active: rgba(55, 65, 81, 0.5);
+
+  /* Text colors */
+  --color-text-primary: #f3f4f6;
+  --color-text-secondary: #9ca3af;
+  --color-text-muted: #6b7280;
+  --color-text-faint: #4b5563;
+
+  /* Border colors */
+  --color-border: #374151;
+  --color-border-subtle: #1f2937;
+  --color-border-focus: #6b7280;
+
+  /* Semantic colors - Buy/Long/Positive */
+  --color-buy: #10b981;
+  --color-buy-text: #34d399;
+  --color-buy-bg: rgba(16, 185, 129, 0.1);
+  --color-buy-bg-hover: rgba(16, 185, 129, 0.2);
+  --color-buy-border: #10b981;
+
+  /* Semantic colors - Sell/Short/Negative */
+  --color-sell: #ef4444;
+  --color-sell-text: #f87171;
+  --color-sell-bg: rgba(239, 68, 68, 0.1);
+  --color-sell-bg-hover: rgba(239, 68, 68, 0.2);
+  --color-sell-border: #ef4444;
+
+  /* Semantic colors - Neutral/Info */
+  --color-info: #3b82f6;
+  --color-info-text: #60a5fa;
+  --color-info-bg: rgba(59, 130, 246, 0.1);
+
+  /* Semantic colors - Warning */
+  --color-warning: #f59e0b;
+  --color-warning-text: #fbbf24;
+
+  /* Interactive states */
+  --color-indicator-active: #ffffff;
+  --color-indicator-inactive: #4b5563;
+  --color-indicator-hover: #6b7280;
+
+  /* Legacy - keep for backwards compatibility */
+  color: #213547;
+  background-color: #ffffff;
+}
+
+/* ==========================================================================
+ * Light Theme
+ * ========================================================================== */
+[data-theme="light"] {
+  /* Background colors */
+  --color-bg-page: #ffffff;
+  --color-bg-elevated: #f9fafb;
+  --color-bg-card: #f3f4f6;
+  --color-bg-input: #ffffff;
+  --color-bg-hover: rgba(0, 0, 0, 0.05);
+  --color-bg-active: rgba(0, 0, 0, 0.1);
+
+  /* Text colors */
+  --color-text-primary: #111827;
+  --color-text-secondary: #4b5563;
+  --color-text-muted: #6b7280;
+  --color-text-faint: #9ca3af;
+
+  /* Border colors */
+  --color-border: #d1d5db;
+  --color-border-subtle: #e5e7eb;
+  --color-border-focus: #9ca3af;
+
+  /* Semantic colors stay mostly the same but adjusted for light bg */
+  --color-buy: #059669;
+  --color-buy-text: #059669;
+  --color-buy-bg: rgba(5, 150, 105, 0.1);
+  --color-buy-bg-hover: rgba(5, 150, 105, 0.15);
+  --color-buy-border: #059669;
+
+  --color-sell: #dc2626;
+  --color-sell-text: #dc2626;
+  --color-sell-bg: rgba(220, 38, 38, 0.1);
+  --color-sell-bg-hover: rgba(220, 38, 38, 0.15);
+  --color-sell-border: #dc2626;
+
+  --color-info: #2563eb;
+  --color-info-text: #2563eb;
+  --color-info-bg: rgba(37, 99, 235, 0.1);
+
+  --color-warning: #d97706;
+  --color-warning-text: #d97706;
+
+  /* Interactive states */
+  --color-indicator-active: #111827;
+  --color-indicator-inactive: #d1d5db;
+  --color-indicator-hover: #9ca3af;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+/* ==========================================================================
+ * Custom Scrollbars - Windows only
+ * macOS has beautiful auto-hiding scrollbars; Windows shows them always
+ * so we style them to be thin and subtle on Windows only
+ * ========================================================================== */
+
+/* Webkit scrollbar - Windows only (detected via .os-windows class on html) */
+.os-windows::-webkit-scrollbar,
+.os-windows *::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.os-windows::-webkit-scrollbar-track,
+.os-windows *::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.os-windows::-webkit-scrollbar-thumb,
+.os-windows *::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.os-windows::-webkit-scrollbar-thumb:hover,
+.os-windows *::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-focus);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+/* Corner piece - Windows only */
+.os-windows::-webkit-scrollbar-corner,
+.os-windows *::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* Candle flame flickering animation - morphs between circle and ellipse with subtle size variation */
+@keyframes flicker {
+  0%, 100% { opacity: 1; transform: translateX(-50%) scale(1, 1); }
+  10% { opacity: 0.8; transform: translateX(-50%) scale(0.9, 1.05); }
+  20% { opacity: 1; transform: translateX(-50%) scale(1.02, 0.95); }
+  30% { opacity: 0.9; transform: translateX(-50%) scale(0.92, 1.08); }
+  40% { opacity: 1; transform: translateX(-50%) scale(0.98, 0.98); }
+  50% { opacity: 0.85; transform: translateX(-50%) scale(0.95, 0.95); }
+  60% { opacity: 0.95; transform: translateX(-50%) scale(1.0, 1.02); }
+  70% { opacity: 1; transform: translateX(-50%) scale(0.94, 1.06); }
+  80% { opacity: 0.9; transform: translateX(-50%) scale(0.99, 0.93); }
+  90% { opacity: 0.95; transform: translateX(-50%) scale(0.97, 1.04); }
+}
+
+.animate-flicker {
+  animation: flicker 2s ease-in-out infinite;
+}
+
+/* Clockwise ray sweep animation - fade in, solid, fade out (starts at 12 o'clock) */
+@keyframes ray-sweep {
+  0% { transform: rotate(-120deg); opacity: 0; }
+  25% { transform: rotate(-30deg); opacity: 1; }
+  50% { transform: rotate(60deg); opacity: 1; }
+  75% { transform: rotate(150deg); opacity: 0.1; }
+  100% { transform: rotate(240deg); opacity: 0; }
+}
+
+/* Second ray - fades out earlier at ~200 degrees */
+@keyframes ray-sweep-2 {
+  0% { transform: rotate(-120deg); opacity: 0; }
+  25% { transform: rotate(-30deg); opacity: 1; }
+  50% { transform: rotate(60deg); opacity: 1; }
+  70% { transform: rotate(132deg); opacity: 0.1; }
+  89% { transform: rotate(200deg); opacity: 0; }
+  100% { transform: rotate(240deg); opacity: 0; }
+}
+
+/* Fourth ray - speeds up in middle */
+@keyframes ray-sweep-4 {
+  0% { transform: rotate(-120deg); opacity: 0; }
+  25% { transform: rotate(-30deg); opacity: 1; }
+  40% { transform: rotate(60deg); opacity: 1; }
+  55% { transform: rotate(150deg); opacity: 0.8; }
+  70% { transform: rotate(200deg); opacity: 0.3; }
+  85% { transform: rotate(225deg); opacity: 0.1; }
+  100% { transform: rotate(240deg); opacity: 0; }
+}
+
+/* Third ray - fades out at 180, slows down earlier */
+@keyframes ray-sweep-3 {
+  0% { transform: rotate(-120deg); opacity: 0; }
+  20% { transform: rotate(-30deg); opacity: 1; }
+  35% { transform: rotate(30deg); opacity: 1; }
+  45% { transform: rotate(70deg); opacity: 0.8; }
+  55% { transform: rotate(100deg); opacity: 0.6; }
+  65% { transform: rotate(125deg); opacity: 0.4; }
+  75% { transform: rotate(145deg); opacity: 0.25; }
+  85% { transform: rotate(160deg); opacity: 0.1; }
+  95% { transform: rotate(174deg); opacity: 0.02; }
+  100% { transform: rotate(180deg); opacity: 0; }
+}
+
+.flame-rays {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  /* Explicit dimensions required for Windows WebView2 to render pseudo-element transforms */
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+/* Primary ray sweeping clockwise - only animates when .rays-active is present */
+.flame-rays::before {
+  content: '';
+  position: absolute;
+  width: 85vw;
+  height: 3px;
+  transform-origin: left center;
+  opacity: 0;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    transparent 20px,
+    rgba(168,85,247,0.45) 25px,
+    rgba(168,85,247,0.22) 15%,
+    rgba(168,85,247,0.05) 40%,
+    transparent 100%
+  );
+  filter: drop-shadow(0 0 6px rgba(168,85,247,0.4)) drop-shadow(0 0 15px rgba(168,85,247,0.3)) drop-shadow(0 0 30px rgba(168,85,247,0.18));
+}
+
+.rays-active .flame-rays::before {
+  animation: ray-sweep-2 4.25s linear forwards;
+}
+
+/* Second ray - offset by ~60 degrees */
+.flame-rays::after {
+  content: '';
+  position: absolute;
+  width: 85vw;
+  height: 1px;
+  transform-origin: left center;
+  opacity: 0;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    transparent 20px,
+    rgba(236,72,153,0.4) 25px,
+    rgba(168,85,247,0.18) 20%,
+    transparent 100%
+  );
+  filter: drop-shadow(0 0 6px rgba(236,72,153,0.4)) drop-shadow(0 0 15px rgba(236,72,153,0.3)) drop-shadow(0 0 30px rgba(236,72,153,0.18));
+}
+
+.rays-active .flame-rays::after {
+  animation: ray-sweep 7.5s linear forwards;
+  animation-delay: -1s;
+}
+
+/* Third ray container - explicit dimensions for Windows WebView2 compatibility */
+.flame-ray-3 {
+  position: absolute;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+/* Third ray - violet */
+.flame-ray-3::after {
+  content: '';
+  position: absolute;
+  width: 85vw;
+  height: 2px;
+  transform-origin: left center;
+  opacity: 0;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    transparent 20px,
+    rgba(139,92,246,0.4) 25px,
+    rgba(139,92,246,0.18) 20%,
+    transparent 100%
+  );
+  filter: drop-shadow(0 0 6px rgba(139,92,246,0.4)) drop-shadow(0 0 15px rgba(139,92,246,0.3)) drop-shadow(0 0 30px rgba(139,92,246,0.18));
+}
+
+.rays-active .flame-ray-3::after {
+  animation: ray-sweep-3 3.5s linear forwards;
+}
+
+/* Fourth ray - fuchsia */
+.flame-ray-3::before {
+  content: '';
+  position: absolute;
+  width: 85vw;
+  height: 2px;
+  transform-origin: left center;
+  opacity: 0;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    transparent 20px,
+    rgba(232,121,249,0.4) 25px,
+    rgba(232,121,249,0.18) 20%,
+    transparent 100%
+  );
+  filter: drop-shadow(0 0 6px rgba(232,121,249,0.4)) drop-shadow(0 0 15px rgba(232,121,249,0.3)) drop-shadow(0 0 30px rgba(232,121,249,0.18));
+}
+
+.rays-active .flame-ray-3::before {
+  animation: ray-sweep-4 4.5s linear forwards;
+}
+
+/* Flame ignition animation - glow appears after rays pass with initial burst */
+@keyframes flame-ignite {
+  0%, 78% { opacity: 0; transform: translateX(-50%) scale(0.3); }
+  82% { opacity: 0.5; transform: translateX(-50%) scale(0.8); }
+  88% { opacity: 1; transform: translateX(-50%) scale(2.0); }
+  93% { opacity: 1; transform: translateX(-50%) scale(1.5); }
+  97% { opacity: 1; transform: translateX(-50%) scale(1.1); }
+  100% { opacity: 1; transform: translateX(-50%) scale(1); }
+}
+
+/* Inner core ignites with bigger initial flash */
+@keyframes flame-ignite-core {
+  0%, 81% { opacity: 0; transform: translateX(-50%) scale(0.2); }
+  84% { opacity: 0.7; transform: translateX(-50%) scale(1.0); }
+  89% { opacity: 1; transform: translateX(-50%) scale(2.2); }
+  94% { opacity: 1; transform: translateX(-50%) scale(1.6); }
+  97% { opacity: 1; transform: translateX(-50%) scale(1.1); }
+  100% { opacity: 1; transform: translateX(-50%) scale(1); }
+}
+
+.flame-glow-outer {
+  opacity: 0;
+  top: -3px;
+  left: 50%;
+  background: radial-gradient(circle, rgba(236,72,153,1) 0%, rgba(168,85,247,1) 50%, rgba(139,92,246,0.8) 75%, rgba(139,92,246,0) 100%);
+  will-change: transform, opacity;
+}
+
+/* Steady state - show flame with flicker */
+.flame-steady .flame-glow-outer {
+  opacity: 1;
+  animation: flicker 2s ease-in-out infinite;
+}
+
+.rays-active .flame-glow-outer,
+.ignition-active .flame-glow-outer {
+  animation: flame-ignite 3.5s ease-out forwards;
+}
+
+.flame-glow-inner {
+  opacity: 0;
+}
+
+/* Steady state - show flame with flicker */
+.flame-steady .flame-glow-inner {
+  opacity: 1;
+  animation: flicker 2s ease-in-out infinite;
+}
+
+.rays-active .flame-glow-inner,
+.ignition-active .flame-glow-inner {
+  animation: flame-ignite-core 3.5s ease-out forwards;
+}
+
+/* Dead zone around wick - appears with flame */
+.flame-dead-zone {
+  opacity: 0;
+  will-change: opacity;
+}
+
+.flame-steady .flame-dead-zone {
+  opacity: 1;
+}
+
+.rays-active .flame-dead-zone,
+.ignition-active .flame-dead-zone {
+  animation: flame-ignite-deadzone 3.5s ease-out forwards;
+}
+
+/* Dead zone fades in slightly after the core ignites */
+@keyframes flame-ignite-deadzone {
+  0%, 85% { opacity: 0; }
+  95% { opacity: 1; }
+  100% { opacity: 1; }
+}
+
+/* Ignition-only mode: run ray animations but make them invisible and not affect layout */
+.ignition-active .flame-rays::before {
+  animation: ray-sweep-2 4.25s linear forwards;
+  visibility: hidden;
+}
+
+.ignition-active .flame-rays::after {
+  animation: ray-sweep 7.5s linear forwards;
+  animation-delay: -1s;
+  visibility: hidden;
+}
+
+.ignition-active .flame-ray-3::after {
+  animation: ray-sweep-3 3.5s linear forwards;
+  visibility: hidden;
+}
+
+.ignition-active .flame-ray-3::before {
+  animation: ray-sweep-4 4.5s linear forwards;
+  visibility: hidden;
+}
+
+/* Breathing glow animation - slow pulse that gives "alive" feeling */
+@keyframes breathe {
+  0%, 100% { opacity: 0.7; transform: translateX(-50%) scale(1); }
+  50% { opacity: 1; transform: translateX(-50%) scale(1.25); }
+}
+
+.flame-breathe {
+  position: absolute;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  pointer-events: none;
+  opacity: 0;
+  background: radial-gradient(circle, rgba(236,72,153,0.6) 0%, rgba(168,85,247,0.4) 30%, rgba(139,92,246,0.2) 50%, transparent 70%);
+  filter: blur(6px);
+  top: -2px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 0;
+}
+
+.flame-steady .flame-breathe {
+  opacity: 1;
+  animation: breathe 4s ease-in-out infinite;
+}
