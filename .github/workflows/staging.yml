@@ -207,7 +207,7 @@ jobs:
           sed -i '' 's|https://localhost/updates/latest.json|https://github.com/${{ github.repository }}/releases/download/staging-PR${{ github.event.pull_request.number }}-run${{ github.run_number }}/latest.json|g' src-tauri/tauri.conf.json
 
       - name: Build Tauri App (skip DMG - created manually below)
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           CI: true
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -407,7 +407,7 @@ jobs:
           $config | Set-Content -Path "src-tauri/tauri.conf.json" -Encoding utf8NoBOM
 
       - name: Build Tauri App
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
