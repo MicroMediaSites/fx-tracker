@@ -1,10 +1,10 @@
 # Custom self-hosted runner labels used in this repo's workflows.
 # actionlint can't know these exist, so declare them here to avoid false
 # "unknown label" warnings.
-#   pr-isolated     - AGT-658: unprivileged PR-checks pool, isolated from the
-#                     signing/release fleet (see .github/workflows/pr.yml).
 #   windows-latest-l - larger GitHub-hosted Windows runner (staging.yml, disabled).
+#   ubuntu-24.04-arm - GitHub-hosted ARM runner (pr.yml); declared in case the
+#                      installed actionlint predates the arm64 hosted runners.
 self-hosted-runner:
   labels:
-    - pr-isolated
     - windows-latest-l
+    - ubuntu-24.04-arm
