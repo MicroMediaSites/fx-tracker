@@ -253,6 +253,10 @@ export const ChartApp = () => {
     // Indicator configs come from the Zustand store (single source of truth)
     if (chartIndicatorsRef.current.length === 0) return;
 
+    // Don't render through a time map built for different params (see
+    // loadedTimeMapKeyRef) — the pending loadCandles re-triggers indicators.
+    if (loadedTimeMapKeyRef.current !== timeMapKey) return;
+
     const indicatorConfigs: IndicatorConfig[] = chartIndicatorsRef.current.map((ind) => ({
       id: ind.id,
       type: ind.type,
@@ -336,6 +340,17 @@ export const ChartApp = () => {
   // Request ID ref for cancelling stale loadCandles responses (Bug #2)
   const loadCandlesRequestIdRef = useRef(0);
 
+  // Identifies which (instrument, granularity, range) the shared time map was
+  // last rebuilt for. Candles and indicators load in independent effects; if
+  // the indicator fetch resolves before loadCandles rebuilds the map (a race,
+  // so the bug is sporadic — e.g. on H1→H4 switches), the indicator series get
+  // converted through the previous granularity's map and every point lands at
+  // the wrong chart position. Indicator renders are gated on this key matching
+  // their own fetch params; candlesLoadedCount re-triggers them once the map
+  // for the new params is in place.
+  const loadedTimeMapKeyRef = useRef<string | null>(null);
+  const timeMapKey = `${instrument}|${granularity}|${candleCount}|${fromDate}|${toDate}`;
+
   // Load candle data and indicators
   const loadCandles = useCallback(async () => {
     const requestId = ++loadCandlesRequestIdRef.current;
@@ -374,6 +389,20 @@ export const ChartApp = () => {
 
         const chartData = convertCandles(candles);
         candleSeriesRef.current.setData(chartData);
+
+        // The time map now belongs to this fetch's params. Any indicator
+        // series rendered for a previous map are misaligned — clear them;
+        // the indicator effect re-renders via the candlesLoadedCount bump.
+        loadedTimeMapKeyRef.current = timeMapKey;
+        if (chartRef.current) {
+          clearIndicators(
+            chartRef.current,
+            indicatorSeriesRef.current,
+            candleSeriesRef.current,
+            ichimokuCloudRef.current
+          );
+          ichimokuCloudRef.current = null;
+        }
 
         // Add entry/SL/TP price lines if provided (from watcher signal)
         if (candleSeriesRef.current) {
@@ -696,6 +725,12 @@ export const ChartApp = () => {
       return;
     }
 
+    // Gate on the time map matching this effect's fetch params: rendering
+    // indicator data through a map built for different params misplaces every
+    // series (see loadedTimeMapKeyRef). When loadCandles finishes rebuilding
+    // the map, candlesLoadedCount bumps and this effect runs again.
+    if (loadedTimeMapKeyRef.current !== timeMapKey) return;
+
     // Convert ChartIndicatorConfig[] to IndicatorConfig[] for backend
     const indicatorConfigs: IndicatorConfig[] = chartIndicators.map((ind) => ({
       id: ind.id,
@@ -762,8 +797,10 @@ export const ChartApp = () => {
     loadSelectedIndicators().catch(() => { /* handled inside */ });
 
     return () => { cancelled = true; };
+  // candlesLoadedCount re-runs this effect after loadCandles rebuilds the time
+  // map (the gate above returns early until the map matches these params).
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chartIndicators, instrument, granularity, candleCount, fromDate, toDate]);
+  }, [chartIndicators, instrument, granularity, candleCount, fromDate, toDate, candlesLoadedCount]);
 
   // Track hovered edge for cursor changes
   const [hoveredEdge, setHoveredEdge] = useState<{ zoneId: string; edge: 'upper' | 'lower' } | null>(null);
