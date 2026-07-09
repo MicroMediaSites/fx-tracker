@@ -30,6 +30,8 @@ import {
   clearIndicators,
   getGranularitySeconds,
   getInstrumentPrecision,
+  CANDLE_UP_COLOR,
+  CANDLE_DOWN_COLOR,
   INITIAL_VISIBLE_CANDLES,
   FUTURE_CANDLE_SLOTS,
   formatIndicatorLabel,
@@ -337,6 +339,15 @@ export const ChartApp = () => {
     return toBusinessTimeUtil(actualTime, timeMapStateRef.current.timeMap);
   };
 
+  // Recenter the view: re-enable price auto-scaling (the escape hatch from a
+  // manually-scaled price axis that left candles pinned off-screen) and scroll
+  // the time scale back to the latest candle, preserving the zoom level.
+  const recenterView = useCallback(() => {
+    if (!chartRef.current) return;
+    chartRef.current.priceScale('right').applyOptions({ autoScale: true });
+    chartRef.current.timeScale().scrollToRealTime();
+  }, []);
+
   // Request ID ref for cancelling stale loadCandles responses (Bug #2)
   const loadCandlesRequestIdRef = useRef(0);
 
@@ -504,16 +515,34 @@ export const ChartApp = () => {
       height: initialHeight,
       autoSize: false,
       layout: {
-        background: { color: '#0e1117' },
+        // Slightly grey-lifted from the app bg (#0e1117) — pure-dark canvas
+        // behind candles reads too stark
+        background: { color: '#151a22' },
         textColor: '#9ca3af',
         attributionLogo: false,
       },
       grid: {
-        vertLines: { color: '#1a1f26' },
-        horzLines: { color: '#1a1f26' },
+        vertLines: { color: '#222a35' },
+        horzLines: { color: '#222a35' },
       },
       crosshair: { mode: 0 },  // Normal mode - follows mouse directly
       rightPriceScale: { borderColor: '#2d333b' },
+      // Canvas control: grab-drag pans, wheel/pinch zooms the time scale,
+      // dragging an axis scales it, and double-clicking an axis resets it
+      // (the recovery path when a manual price scale leaves candles pinned
+      // off-screen). Double-clicking the chart itself recenters everything.
+      handleScroll: {
+        mouseWheel: true,
+        pressedMouseMove: true,
+        horzTouchDrag: true,
+        vertTouchDrag: true,
+      },
+      handleScale: {
+        mouseWheel: true,
+        pinch: true,
+        axisPressedMouseMove: true,
+        axisDoubleClickReset: true,
+      },
       timeScale: {
         borderColor: '#2d333b',
         timeVisible: true,
@@ -538,14 +567,16 @@ export const ChartApp = () => {
     });
 
     const precision = getInstrumentPrecision(initialParams.instrument);
+    // Base palette only — per-candle colors from hollowCandleColors() (OANDA
+    // hollow-candle scheme: direction vs previous close) override these.
     const candleSeries = chart.addSeries(CandlestickSeries, {
       upColor: 'transparent',
-      downColor: '#ef4444',
+      downColor: CANDLE_DOWN_COLOR,
       borderVisible: true,
-      borderUpColor: '#22c55e',
-      borderDownColor: '#ef4444',
-      wickUpColor: '#22c55e',
-      wickDownColor: '#ef4444',
+      borderUpColor: CANDLE_UP_COLOR,
+      borderDownColor: CANDLE_DOWN_COLOR,
+      wickUpColor: CANDLE_UP_COLOR,
+      wickDownColor: CANDLE_DOWN_COLOR,
       priceFormat: {
         type: 'price',
         precision: precision,
@@ -645,6 +676,22 @@ export const ChartApp = () => {
       chart.remove();
     };
   }, []);
+
+  // Double-click on the chart pane recenters the view. Disabled while drawing
+  // S/R zones so a double-click can't both place boundaries and yank the view.
+  useEffect(() => {
+    if (!chartRef.current || srZones.srEditingMode) return;
+    const chart = chartRef.current;
+    const handler = () => recenterView();
+    chart.subscribeDblClick(handler);
+    return () => {
+      try {
+        chart.unsubscribeDblClick(handler);
+      } catch {
+        // Chart already disposed during window teardown
+      }
+    };
+  }, [srZones.srEditingMode, recenterView]);
 
   // Update price precision and window title when instrument changes
   useEffect(() => {
@@ -805,9 +852,41 @@ export const ChartApp = () => {
   // Track hovered edge for cursor changes
   const [hoveredEdge, setHoveredEdge] = useState<{ zoneId: string; edge: 'upper' | 'lower' } | null>(null);
 
+  // Vertical grab-pan state. lightweight-charts only pans horizontally while
+  // price auto-scale is on; we translate the vertical component of a pane drag
+  // into a manual price-range shift so the canvas can be grabbed in any
+  // direction (recenter via double-click/⌖ restores auto-scale). `engaged`
+  // flips after a small deadzone so purely horizontal drags never knock the
+  // price scale out of auto mode.
+  const panDragRef = useRef<{ startY: number; lastY: number; engaged: boolean } | null>(null);
+
   // Handle chart mouse events for S/R zone drawing and edge detection
   const handleChartMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (!candleSeriesRef.current || !chartContainerRef.current) return;
+
+    // 2D grab-pan: shift the price range by the vertical drag delta (the
+    // horizontal component is lightweight-charts' native pan). Engages after
+    // a small deadzone so horizontal drags keep price auto-scale intact.
+    if (panDragRef.current && chartRef.current) {
+      const drag = panDragRef.current;
+      if (drag.engaged || Math.abs(e.clientY - drag.startY) > 4) {
+        const priceScale = chartRef.current.priceScale('right');
+        const range = priceScale.getVisibleRange();
+        const paneHeight = chartRef.current.panes()[0]?.getHeight() ?? 0;
+        if (range && paneHeight > 0) {
+          const pricePerPixel = (range.to - range.from) / paneHeight;
+          const dy = e.clientY - drag.lastY;
+          if (!drag.engaged) priceScale.setAutoScale(false);
+          drag.engaged = true;
+          priceScale.setVisibleRange({
+            from: range.from + dy * pricePerPixel,
+            to: range.to + dy * pricePerPixel,
+          });
+        }
+      }
+      panDragRef.current.lastY = e.clientY;
+      if (panDragRef.current.engaged) return;
+    }
 
     const rect = chartContainerRef.current.getBoundingClientRect();
     const y = e.clientY - rect.top;
@@ -903,18 +982,33 @@ export const ChartApp = () => {
 
   // Handle mouse down for edge resize
   const handleChartMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    if (!hoveredEdge || !candleSeriesRef.current) return;
+    if (hoveredEdge && candleSeriesRef.current) {
+      const zone = srZones.srZones.find(z => z.id === hoveredEdge.zoneId);
+      if (zone) {
+        e.preventDefault();
+        const startPrice = hoveredEdge.edge === 'upper' ? zone.upper_price : zone.lower_price;
+        srZones.setResizingEdge({ zoneId: hoveredEdge.zoneId, edge: hoveredEdge.edge, startPrice });
+        return;
+      }
+    }
 
-    const zone = srZones.srZones.find(z => z.id === hoveredEdge.zoneId);
-    if (!zone) return;
-
-    e.preventDefault();
-    const startPrice = hoveredEdge.edge === 'upper' ? zone.upper_price : zone.lower_price;
-    srZones.setResizingEdge({ zoneId: hoveredEdge.zoneId, edge: hoveredEdge.edge, startPrice });
-  }, [hoveredEdge, srZones.srZones, srZones.setResizingEdge]);
+    // Start 2D grab-pan tracking: left button, not drawing zones, and only
+    // within the main price pane (not the axes or oscillator panes — vertical
+    // panning there would wrongly shift the main price scale).
+    if (e.button !== 0 || srZones.srEditingMode) return;
+    if (!chartRef.current || !chartContainerRef.current) return;
+    const rect = chartContainerRef.current.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const priceAxisWidth = chartRef.current.priceScale('right').width();
+    const mainPaneHeight = chartRef.current.panes()[0]?.getHeight() ?? 0;
+    if (x >= rect.width - priceAxisWidth || y >= mainPaneHeight) return;
+    panDragRef.current = { startY: e.clientY, lastY: e.clientY, engaged: false };
+  }, [hoveredEdge, srZones.srZones, srZones.setResizingEdge, srZones.srEditingMode]);
 
   // Handle mouse up to commit edge resize
   const handleChartMouseUp = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    panDragRef.current = null;
     if (!srZones.resizingEdge || !candleSeriesRef.current || !chartContainerRef.current) return;
 
     const rect = chartContainerRef.current.getBoundingClientRect();
@@ -1229,6 +1323,7 @@ export const ChartApp = () => {
           }}
           signalDirection={signalDirection}
           strategyId={strategyId}
+          onRecenter={recenterView}
           />
         }
       />
@@ -1254,6 +1349,7 @@ export const ChartApp = () => {
           onMouseDown={handleChartMouseDown}
           onMouseUp={handleChartMouseUp}
           onMouseLeave={() => {
+            panDragRef.current = null;
             if (srZones.resizingEdge) {
               srZones.setResizingEdge(null);
               srZones.setPreviewZone(null);

@@ -4,6 +4,8 @@ name = "candlesight"
 version = "0.1.0"
 edition = "2021"
 description = "Trading strategy research and analysis platform"
+# `cargo run` (tauri dev) must pick the app binary, not import_candlesight
+default-run = "candlesight"
 
 [lib]
 name = "candlesight_lib"

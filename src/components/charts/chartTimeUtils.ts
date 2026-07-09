@@ -1,5 +1,6 @@
 import type { CandlestickData, Time } from 'lightweight-charts';
 import type { IndicatorSeries } from './chartTypes';
+import { hollowCandleColors } from './chartConstants';
 
 // CandleData interface matching the backend response
 export interface CandleData {
@@ -69,12 +70,18 @@ export const convertCandles = (
     state.timeMap.set(actualTime, businessTime);
     state.reverseTimeMap.set(businessTime, actualTime);
 
+    const open = parseFloat(c.open);
+    const close = parseFloat(c.close);
+    const prevClose = i > 0 ? parseFloat(candles[i - 1].close) : null;
+
     return {
       time: businessTime as Time,
-      open: parseFloat(c.open),
+      open,
       high: parseFloat(c.high),
       low: parseFloat(c.low),
-      close: parseFloat(c.close),
+      close,
+      // OANDA-style hollow candle coloring (direction vs previous close)
+      ...hollowCandleColors(open, close, prevClose),
     };
   });
 

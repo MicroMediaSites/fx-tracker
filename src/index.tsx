@@ -2,6 +2,7 @@ import React, { Component, ReactNode, lazy, Suspense } from 'react';
 import ReactDOM from 'react-dom/client';
 import { Router, Route, Switch } from 'wouter';
 import { CredentialGate } from './components/CredentialGate';
+import { initWebviewZoom } from './lib/webviewZoom';
 import './index.css';
 
 // Detect OS and add class to html element for platform-specific styling
@@ -48,6 +49,11 @@ document.addEventListener('wheel', (e) => {
 // WebKit gesture events (trackpad pinch-to-zoom on macOS)
 document.addEventListener('gesturestart', (e) => e.preventDefault());
 document.addEventListener('gesturechange', (e) => e.preventDefault());
+
+// App-wide zoom is keyboard-stepped instead (Cmd/Ctrl + '+'/'-'/'0'); the
+// native continuous zoom (zoom_hotkeys / ctrl+scroll) is disabled in the
+// Rust shell — see webviewZoom.ts.
+initWebviewZoom();
 
 // Lazy load app components - each window only loads what it needs.
 // AGT-652: surface reduced to local (strategy viewer, boot), chart, backtest,

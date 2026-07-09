@@ -1,5 +1,35 @@
 import { OVERLAY_INDICATOR_TYPES } from '../../types/strategy';
 
+// Candle palette — TradingView/OANDA-style teal-green and muted red rather
+// than the electric tailwind green/red.
+export const CANDLE_UP_COLOR = '#089981';
+export const CANDLE_DOWN_COLOR = '#f23645';
+
+/**
+ * OANDA/TradingView "hollow candles" styling for a single candle:
+ * - COLOR is direction vs the PREVIOUS CLOSE (up teal / down red) — not vs
+ *   the candle's own open, which is why naive close-vs-open coloring
+ *   disagrees with OANDA on gap candles.
+ * - FILL is hollow (transparent body) when the body is bullish
+ *   (close >= open), filled when bearish.
+ * The first candle of a series has no previous close; fall back to
+ * close-vs-open for its direction.
+ */
+export const hollowCandleColors = (
+  open: number,
+  close: number,
+  prevClose: number | null
+): { color: string; borderColor: string; wickColor: string } => {
+  const isUp = prevClose === null ? close >= open : close >= prevClose;
+  const directionColor = isUp ? CANDLE_UP_COLOR : CANDLE_DOWN_COLOR;
+  const isHollow = close >= open;
+  return {
+    color: isHollow ? 'transparent' : directionColor,
+    borderColor: directionColor,
+    wickColor: directionColor,
+  };
+};
+
 // Colors for indicator lines
 export const INDICATOR_COLORS: Record<string, string> = {
   // Moving averages
