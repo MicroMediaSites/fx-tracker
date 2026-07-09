@@ -4,9 +4,24 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import type { CandlestickData, Time } from 'lightweight-charts';
 import type { PriceUpdate, UpdateCandleCallback } from '../components/charts/chartTypes';
 import type { TimeMapState } from '../components/charts/chartTimeUtils';
-import { getGranularitySeconds } from '../components/charts/chartConstants';
+import { getGranularitySeconds, hollowCandleColors } from '../components/charts/chartConstants';
+import { addDebugLog } from '../components/ui/DebugOverlay';
 
 const DAILY_ALIGNMENT = 2; // OANDA dailyAlignment=2 UTC (H4 at 02, 06, 10, 14, 18, 22)
+
+// Streaming diagnostics for the in-app debug overlay (Ctrl+Shift+D).
+// Per-message rate limiting: each distinct message logs on its 1st, 25th,
+// 50th... occurrence, so per-tick messages can't flood the 100-entry buffer.
+const streamDebugCounts = new Map<string, number>();
+const streamDebug = (message: string) => {
+  const count = (streamDebugCounts.get(message) ?? 0) + 1;
+  streamDebugCounts.set(message, count);
+  if (count === 1) {
+    addDebugLog('STREAM', message);
+  } else if (count % 25 === 0) {
+    addDebugLog('STREAM', `${message} (x${count})`);
+  }
+};
 
 /**
  * Calculate the candle start time for a given timestamp and granularity,
@@ -81,6 +96,10 @@ export const usePriceStreaming = ({
   const [streaming, setStreaming] = useState(false);
   const [currentPrice, setCurrentPrice] = useState<PriceUpdate | null>(null);
   const currentCandleRef = useRef<CandlestickData | null>(null);
+  // Close of the candle before the forming one — drives OANDA-style hollow
+  // candle coloring (direction vs previous close). Lazily read from series
+  // data on the first tick, then maintained on each boundary roll.
+  const prevCloseRef = useRef<number | null>(null);
   const currentInstrumentRef = useRef<string>(instrument);
   const updateCurrentCandleRef = useRef<UpdateCandleCallback | null>(null);
   const onNewCandleRef = useRef(onNewCandle);
@@ -94,6 +113,7 @@ export const usePriceStreaming = ({
     }
 
     if (!candleSeriesRef.current) {
+      streamDebug('tick dropped: no candle series');
       return;
     }
 
@@ -102,10 +122,12 @@ export const usePriceStreaming = ({
     try {
       const seriesData = candleSeriesRef.current.data();
       if (!seriesData || seriesData.length === 0) {
+        streamDebug('tick dropped: series empty');
         return;
       }
     } catch {
       // Series may be in transitional state during granularity change
+      streamDebug('tick dropped: series transitional');
       return;
     }
 
@@ -114,7 +136,10 @@ export const usePriceStreaming = ({
 
     // Guard: if time map is empty, candles haven't loaded yet for this instrument.
     // Skip the update to prevent orphan candles at wrong positions (Bug #6).
-    if (timeMapState.timeMap.size === 0) return;
+    if (timeMapState.timeMap.size === 0) {
+      streamDebug('tick dropped: time map empty');
+      return;
+    }
 
     const priceTime = new Date(price.time).getTime() / 1000;
 
@@ -146,7 +171,24 @@ export const usePriceStreaming = ({
         candle.high = Math.max(candle.high as number, midPrice);
         candle.low = Math.min(candle.low as number, midPrice);
         candle.close = midPrice;
+        // Recolor per tick — direction (vs previous close) and hollowness
+        // (vs open) can both flip while the candle forms
+        if (prevCloseRef.current === null) {
+          try {
+            const bars = candleSeriesRef.current.data();
+            if (bars.length > 1) {
+              prevCloseRef.current = (bars[bars.length - 2] as CandlestickData).close as number;
+            }
+          } catch {
+            // Series transitional — color falls back to close-vs-open
+          }
+        }
+        Object.assign(
+          candle,
+          hollowCandleColors(candle.open as number, midPrice, prevCloseRef.current)
+        );
         candleSeriesRef.current.update(candle);
+        streamDebug('tick applied to forming candle');
       } else {
         // First tick for this candle period — check if historical data exists
         const hadPreviousCandle = currentCandleRef.current !== null;
@@ -162,6 +204,20 @@ export const usePriceStreaming = ({
         try {
           const seriesData = candleSeriesRef.current.data();
           const lastBar = seriesData.length > 0 ? seriesData[seriesData.length - 1] as CandlestickData : null;
+
+          // Maintain the previous close for hollow-candle coloring: the candle
+          // we just rolled off of, or the bar behind the one we're extending.
+          if (currentCandleRef.current && currentCandleRef.current.time !== currentBusinessTime) {
+            prevCloseRef.current = currentCandleRef.current.close as number;
+          } else if (lastBar && lastBar.time === currentBusinessTime) {
+            const beforeLast = seriesData.length > 1
+              ? (seriesData[seriesData.length - 2] as CandlestickData)
+              : null;
+            if (beforeLast) prevCloseRef.current = beforeLast.close as number;
+          } else if (lastBar) {
+            prevCloseRef.current = lastBar.close as number;
+          }
+
           if (lastBar && lastBar.time === currentBusinessTime) {
             // Historical candle exists — extend it with the new tick
             const prevHigh = lastBar.high ?? midPrice;
@@ -181,8 +237,13 @@ export const usePriceStreaming = ({
           newCandle = freshCandle();
         }
 
+        Object.assign(
+          newCandle,
+          hollowCandleColors(newCandle.open as number, newCandle.close as number, prevCloseRef.current)
+        );
         currentCandleRef.current = newCandle;
         candleSeriesRef.current.update(newCandle);
+        streamDebug(`candle roll -> business time ${String(newCandle.time)}`);
 
         // Notify that a new candle boundary was crossed (for indicator refresh)
         // Only fire when transitioning from an existing candle (not on the first
@@ -191,9 +252,12 @@ export const usePriceStreaming = ({
           onNewCandleRef.current?.();
         }
       }
-    } catch {
-      // Ignore errors during chart data transitions (e.g., granularity switch)
-      // The next successful update will sync the candle state
+    } catch (err) {
+      // Errors during chart data transitions (e.g., granularity switch) are
+      // expected and self-heal on the next tick — but surface them in the
+      // debug overlay: a PERSISTENT failure here means the chart looks live
+      // (header price ticks) while candles silently never move.
+      streamDebug(`candle update failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }, [granularity, candleSeriesRef, timeMapStateRef]);
 
@@ -205,6 +269,7 @@ export const usePriceStreaming = ({
     currentInstrumentRef.current = instrument;
     setCurrentPrice(null);
     currentCandleRef.current = null;
+    prevCloseRef.current = null;
     // Clear time maps to prevent stale data from contaminating new instrument's candles
     const timeMapState = timeMapStateRef.current;
     if (timeMapState) {
@@ -235,6 +300,7 @@ export const usePriceStreaming = ({
           // Skip if effect was cancelled (instrument changed)
           if (cancelled) return;
           if (event.payload.instrument === instrument) {
+            streamDebug(`price-update received for ${instrument}`);
             setCurrentPrice(event.payload);
             // Use ref to call the latest version of updateCurrentCandle
             updateCurrentCandleRef.current?.(event.payload);
