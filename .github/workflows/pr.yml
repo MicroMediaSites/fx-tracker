@@ -8,22 +8,17 @@ name: PR Checks
 # Tauri updater signing key and the Apple Developer cert (release.yml,
 # staging.yml). Two controls enforce that:
 #
-#   1. RUNNER-POOL ISOLATION (enforced here, in YAML): every job below targets
-#      the `pr-isolated` label. The signing/release runners carry
-#      `[self-hosted, Linux|macOS, ARM64]` but NOT `pr-isolated`, so GitHub can
-#      never schedule a PR job onto a signing-fleet host. The `pr-isolated` pool
-#      must be provisioned as an UNPRIVILEGED host (no signing secrets, no Apple
-#      keychain) — see HUMAN-ITEMS.md. (Alternative if you'd rather run zero
-#      self-hosted PR runners: switch these jobs to GitHub-hosted
-#      `ubuntu-24.04-arm` ephemeral runners and add toolchain-setup steps.)
+#   1. RUNNER ISOLATION (enforced here, in YAML): every job below runs on
+#      GitHub-hosted `ubuntu-24.04-arm` ephemeral VMs — zero contact with the
+#      self-hosted signing/release fleet, fresh workspace every run, free for
+#      public repos. No self-hosted PR pool exists or is needed; internal
+#      development merges via the stamp flow and never opens GitHub PRs, so
+#      these jobs only fire for fork PRs.
 #   2. APPROVAL GATE (repo setting, required): enable Settings → Actions →
 #      General → "Fork pull request workflows from outside collaborators" →
 #      "Require approval for all outside collaborators" (or first-time
 #      contributors). This pauses fork-PR runs until a maintainer approves, so
-#      untrusted code never executes — even on the isolated pool — unattended.
-#
-# `clean: false` was also removed below (AGT-658 AC2): a shared self-hosted
-# workspace with `clean: false` lets one run poison the next run's checkout.
+#      untrusted code never executes — even on ephemeral runners — unattended.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -44,7 +39,7 @@ jobs:
   # Detect which paths changed to conditionally run jobs
   changes:
     name: Detect Changes
-    runs-on: [self-hosted, Linux, ARM64, pr-isolated]
+    runs-on: ubuntu-24.04-arm
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       frontend: ${{ steps.filter.outputs.frontend }}
@@ -77,15 +72,32 @@ jobs:
     name: Rust Tests
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: [self-hosted, Linux, ARM64, pr-isolated]
+    runs-on: ubuntu-24.04-arm
     env:
       CARGO_INCREMENTAL: 0
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: clang
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install Tauri Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable (pinned; Dependabot bumps)
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
@@ -94,10 +106,16 @@ jobs:
     name: Frontend Tests
     needs: changes
     if: ${{ needs.changes.outputs.frontend == 'true' }}
-    runs-on: [self-hosted, Linux, ARM64, pr-isolated]
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
 
       - name: Install dependencies
         run: |
@@ -111,10 +129,16 @@ jobs:
     name: TypeScript Check
     needs: changes
     if: ${{ needs.changes.outputs.frontend == 'true' }}
-    runs-on: [self-hosted, Linux, ARM64, pr-isolated]
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
 
       - name: Install dependencies
         run: |
@@ -128,10 +152,16 @@ jobs:
     name: E2E Tests
     needs: changes
     if: ${{ needs.changes.outputs.frontend == 'true' }}
-    runs-on: [self-hosted, Linux, ARM64, pr-isolated]
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
 
       - name: Install dependencies
         run: |
@@ -139,7 +169,7 @@ jobs:
           npm install @rollup/rollup-linux-arm64-gnu @tailwindcss/oxide-linux-arm64-gnu --no-save
 
       - name: Install Playwright Chromium
-        run: npx playwright install chromium
+        run: npx playwright install --with-deps chromium
 
       - name: Run E2E tests
         run: npm run test:e2e
@@ -156,10 +186,16 @@ jobs:
     name: Frontend Build
     needs: changes
     if: ${{ needs.changes.outputs.frontend == 'true' }}
-    runs-on: [self-hosted, Linux, ARM64, pr-isolated]
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
 
       - name: Install dependencies
         run: |
