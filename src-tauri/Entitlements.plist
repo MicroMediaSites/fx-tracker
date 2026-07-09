@@ -8,7 +8,7 @@
     <!-- Allow unsigned executable memory (needed for WebKit) -->
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
-    <!-- Allow outbound network connections (needed for OANDA API, Clerk, Zero) -->
+    <!-- Allow outbound network connections (needed for OANDA API) -->
     <key>com.apple.security.network.client</key>
     <true/>
 </dict>
