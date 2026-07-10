@@ -26,6 +26,7 @@ import {
 } from './lib/localStore';
 import { LocalBacktestsSection } from './components/local/LocalBacktestsSection';
 import { UpdateModal } from './components/ui/UpdateModal';
+import { SignalsSection } from './components/watcher/SignalFeed';
 import { useSettingsStore } from './stores/settingsStore';
 import { openBacktestWindow, openChartWindow, openWatcherWindow } from './utils/windows';
 
@@ -280,6 +281,12 @@ export const LocalApp = () => {
             <LocalBacktestsSection strategyId={selected.id} strategyName={selected.name} />
           ) : null;
         })()}
+
+        {/* Fired-signal history from the wickd daemon. Informational — the
+            Live Monitor stays reserved for actionable state. */}
+        <div className="mt-6">
+          <SignalsSection />
+        </div>
       </main>
 
       <footer className="px-8 py-4 border-t border-white/10 flex items-center justify-between">

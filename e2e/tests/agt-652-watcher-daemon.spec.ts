@@ -98,13 +98,9 @@ test.describe('AGT-652 — Live Monitor as a wickd daemon client', () => {
     await expect(externalRows.first().getByText('H1')).toBeVisible();
     await expect(externalRows.first()).toHaveAttribute('title', /pid 61105/);
 
-    // Live signals render from the daemon's durable queue (AC2).
-    const alertRows = appPage.page.getByTestId('queue-alert-row');
-    await expect(alertRows).toHaveCount(2);
-    // Newest first: the 15:10 price-level alert precedes the 14:30 buy signal.
-    await expect(alertRows.filter({ hasText: 'buy' })).toHaveCount(1);
-    await expect(alertRows.filter({ hasText: 'buy' }).getByText('revert_adx')).toBeVisible();
-    await expect(appPage.page.getByText('cross-up 1.2700 @ 1.2703')).toBeVisible();
+    // The signal feed moved to the Home window ("Signals") — the Monitor
+    // stays reserved for actionable state.
+    await expect(appPage.page.getByTestId('queue-alert-row')).toHaveCount(0);
 
     // The semi-auto pending/approve queue renders read-only (AC1/AC2):
     // approval is a CLI action, so the affordance is the exact command.
@@ -128,12 +124,28 @@ test.describe('AGT-652 — Live Monitor as a wickd daemon client', () => {
 
     await expect(appPage.page.getByText('no wickd watch daemon running')).toBeVisible();
     await expect(appPage.page.getByTestId('pending-empty')).toBeVisible();
-    await expect(appPage.page.getByTestId('queue-empty')).toBeVisible();
 
     await appPage.page.screenshot({
       path: `${EVIDENCE_DIR}/AGT-652-watcher-daemon-idle.png`,
       fullPage: true,
     });
+  });
+
+  test('signal feed renders on the Home window as "Signals"', async ({ appPage }) => {
+    await appPage.page.addInitScript(
+      ({ queue }) => {
+        (window as unknown as Record<string, unknown>).__E2E_DAEMON_QUEUE__ = queue;
+      },
+      { queue: QUEUE_ALERTS },
+    );
+
+    await appPage.goto('local');
+
+    const alertRows = appPage.page.getByTestId('queue-alert-row');
+    await expect(alertRows).toHaveCount(2);
+    await expect(alertRows.filter({ hasText: 'buy' })).toHaveCount(1);
+    await expect(alertRows.filter({ hasText: 'buy' }).getByText('revert_adx')).toBeVisible();
+    await expect(appPage.page.getByText('cross-up 1.2700 @ 1.2703')).toBeVisible();
   });
 
   test('instrument-first flow: pin a price window, attach a strategy under it', async ({ appPage }) => {

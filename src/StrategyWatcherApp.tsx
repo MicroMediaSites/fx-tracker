@@ -14,7 +14,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useWatchDaemon, type PendingSignal, type QueuedAlert } from './hooks/useWatchDaemon';
+import { useWatchDaemon, type PendingSignal } from './hooks/useWatchDaemon';
 import { usePriceStream } from './hooks/usePriceStream';
 import { useEnvironmentSync } from './hooks/useEnvironmentSync';
 import { WindowHeader } from './components/ui/WindowHeader';
@@ -22,13 +22,14 @@ import { CollapsibleSection } from './components/ui/CollapsibleSection';
 import { PriceWindow } from './components/ui/PriceDisplay';
 import { buildWatcherContext } from './lib/chatContextBuilder';
 import { getTerminalWelcome } from './lib/terminalWelcome';
-import { GRANULARITIES, DEFAULT_GRANULARITY } from './constants';
+
 import {
   StrategyRow,
   ExternalWatcherRow,
   type StrategyRowConfig,
   type RowMode,
 } from './components/watcher/StrategyRow';
+import { OpenChartButton, chartableGranularity } from './components/watcher/OpenChartButton';
 import { useSettingsStore } from './stores/settingsStore';
 
 const formatTs = (ts: string): string => {
@@ -37,52 +38,9 @@ const formatTs = (ts: string): string => {
   return date.toLocaleString();
 };
 
-const CHARTABLE_GRANULARITIES = new Set<string>(GRANULARITIES.map((g) => g.value));
-
-/**
- * Map a watcher granularity onto one the chart can render. Watchers can run
- * timeframes the chart doesn't offer (e.g. the synthesized H8) — fall back to
- * H4 for hour-based ones, else the default.
- */
-const chartableGranularity = (granularity: string | null | undefined): string => {
-  if (!granularity) return DEFAULT_GRANULARITY;
-  if (CHARTABLE_GRANULARITIES.has(granularity)) return granularity;
-  return granularity.startsWith('H') ? 'H4' : DEFAULT_GRANULARITY;
-};
-
 /** Parse `--granularity <X>` out of a watcher's command line. */
 const parseGranularity = (command: string): string | null =>
   command.match(/--granularity\s+(\S+)/)?.[1] ?? null;
-
-/** Opens the instrument in a chart window (contextual multi-chart label). */
-const OpenChartButton = ({
-  instrument,
-  granularity,
-}: {
-  instrument: string;
-  granularity?: string | null;
-}) => {
-  const chartGranularity = chartableGranularity(granularity);
-  return (
-    <button
-      data-testid="open-chart-button"
-      onClick={() => {
-        void invoke('open_chart_window', {
-          instrument,
-          granularity: chartGranularity,
-        }).catch((err) => console.error('[LiveMonitor] Failed to open chart:', err));
-      }}
-      className="p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-info)] transition-colors"
-      title={`Open ${instrument.replace('_', '/')} chart (${chartGranularity})`}
-      aria-label={`Open ${instrument.replace('_', '/')} chart`}
-    >
-      <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
-        <path strokeLinecap="round" d="M4 20h16" />
-        <path strokeLinecap="round" d="M7 16v-5M12 16V6M17 16v-8" />
-      </svg>
-    </button>
-  );
-};
 
 const CopyApproveCommand = ({ signalId }: { signalId: string }) => {
   const [copied, setCopied] = useState(false);
@@ -117,6 +75,15 @@ interface InstrumentWatcher {
 
 /** localStorage key for the per-instrument strategy row configs. */
 const STRATEGY_ROWS_KEY = 'wickd-monitor-strategy-rows';
+
+/** Store entry from store_list_strategies — indicators/parameters are the
+ * script's structured @indicators / @parameters metadata. */
+interface StoreStrategy {
+  name: string;
+  valid: boolean;
+  indicators?: unknown[];
+  parameters?: unknown[];
+}
 
 /** How many watcher chips a tile shows before collapsing behind "+N more". */
 const MAX_VISIBLE_WATCHER_CHIPS = 3;
@@ -230,6 +197,7 @@ const WatchedInstrumentTile = ({
   environment,
   lastAddedRowId,
   stoppedPids,
+  indicatorSeedFor,
   onPidStopped,
   onConfigChange,
   onConfigDelete,
@@ -244,6 +212,7 @@ const WatchedInstrumentTile = ({
   environment: string;
   lastAddedRowId: string | null;
   stoppedPids: number[];
+  indicatorSeedFor: (strategyName: string) => string | undefined;
   onPidStopped: (pid: number) => void;
   onConfigChange: (next: StrategyRowConfig) => void;
   onConfigDelete: (id: string) => void;
@@ -302,6 +271,13 @@ const WatchedInstrumentTile = ({
         granularity={proc.granularity}
         mode={proc.mode}
         pid={proc.pid}
+        onOpenChart={() => {
+          void invoke('open_chart_window', {
+            instrument,
+            granularity: chartableGranularity(proc.granularity),
+            indicators: indicatorSeedFor(proc.strategy),
+          }).catch((err) => console.error('[LiveMonitor] Failed to open chart:', err));
+        }}
         onStop={
           proc.stoppable
             ? () => {
@@ -325,6 +301,13 @@ const WatchedInstrumentTile = ({
         onDelete={() => onConfigDelete(config.id)}
         onProcessChange={onProcessChange}
         onPidStopped={onPidStopped}
+        onOpenChart={() => {
+          void invoke('open_chart_window', {
+            instrument,
+            granularity: chartableGranularity(config.granularity),
+            indicators: indicatorSeedFor(config.strategy),
+          }).catch((err) => console.error('[LiveMonitor] Failed to open chart:', err));
+        }}
         startEditingName={config.id === lastAddedRowId}
       />
     )),
@@ -410,55 +393,13 @@ const PendingSignalRow = ({ signal, granularity }: { signal: PendingSignal; gran
   </div>
 );
 
-const QueueAlertRow = ({ alert, granularity }: { alert: QueuedAlert; granularity?: string | null }) => {
-  const payload = alert.payload;
-  return (
-    <div
-      data-testid="queue-alert-row"
-      className="flex flex-wrap items-center gap-3 px-3 py-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)]"
-    >
-      <span className="text-xs text-[var(--color-text-muted)] whitespace-nowrap">{formatTs(alert.ts)}</span>
-      {payload.kind === 'strategy-signal' ? (
-        <>
-          <span
-            className={`px-1.5 py-0.5 text-xs font-semibold rounded uppercase ${
-              payload.signal === 'buy'
-                ? 'bg-[var(--color-buy)]/15 text-[var(--color-buy)]'
-                : 'bg-[var(--color-sell)]/15 text-[var(--color-sell)]'
-            }`}
-          >
-            {payload.signal}
-          </span>
-          <span className="font-semibold">{payload.instrument}</span>
-          <OpenChartButton instrument={payload.instrument} granularity={granularity} />
-          <span className="text-sm text-[var(--color-text-secondary)]">{payload.proposal.strategy}</span>
-          <span className="flex-1 min-w-0 text-xs text-[var(--color-text-muted)] truncate" title={payload.proposal.reason}>
-            {payload.proposal.reason}
-          </span>
-        </>
-      ) : (
-        <>
-          <span className="px-1.5 py-0.5 text-xs font-semibold rounded uppercase bg-[var(--color-info)]/15 text-[var(--color-info)]">
-            level
-          </span>
-          <span className="font-semibold">{payload.instrument}</span>
-          <OpenChartButton instrument={payload.instrument} granularity={granularity} />
-          <span className="text-sm text-[var(--color-text-secondary)]">
-            {payload.direction} {payload.level} @ {payload.price}
-          </span>
-        </>
-      )}
-    </div>
-  );
-};
-
 export const StrategyWatcherApp = () => {
   // Keep the environment badge in sync across windows (BUG-024).
   useEnvironmentSync();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [environment, setEnvironment] = useState('practice');
   const [startableStrategies, setStartableStrategies] = useState<string[]>([]);
-  const { status, queue, pending, hubStream, error, loading, refresh } = useWatchDaemon();
+  const { status, pending, hubStream, error, loading, refresh } = useWatchDaemon();
 
   // Instruments pinned by the user as price-only tiles (persisted per app).
   // Watcher/hub instruments appear automatically; pins let you watch a price
@@ -488,16 +429,31 @@ export const StrategyWatcherApp = () => {
   }, []);
 
   // Startable strategies for the per-tile add-strategy form: valid store
-  // scripts plus the CLI's built-ins.
+  // scripts plus the CLI's built-ins. The full store entries are kept so
+  // chart links can seed the chart with the strategy's declared @indicators.
+  const [storeStrategies, setStoreStrategies] = useState<StoreStrategy[]>([]);
   useEffect(() => {
-    invoke<{ name: string; valid: boolean }[]>('store_list_strategies')
+    invoke<StoreStrategy[]>('store_list_strategies')
       .then((list) => {
-        const names = list.filter((s) => s.valid).map((s) => s.name);
+        const valid = list.filter((s) => s.valid);
+        setStoreStrategies(valid);
+        const names = valid.map((s) => s.name);
         const builtins = ['ma-crossover', 'rsi'].filter((b) => !names.includes(b));
         setStartableStrategies([...names, ...builtins]);
       })
       .catch(() => setStartableStrategies(['ma-crossover', 'rsi']));
   }, []);
+
+  // JSON envelope for ChartApp's indicator seed (see useChartParams /
+  // strategyIndicatorsToChartConfigs): the strategy's declared @indicators
+  // with $param refs resolved against its @parameters defaults.
+  const indicatorSeedFor = (strategyName: string): string | undefined => {
+    const entry = storeStrategies.find((s) => s.name === strategyName);
+    if (!entry || !Array.isArray(entry.indicators) || entry.indicators.length === 0) {
+      return undefined;
+    }
+    return JSON.stringify({ indicators: entry.indicators, parameters: entry.parameters });
+  };
 
   // Price monitoring: everything the daemon watches, plus whatever the hub is
   // observed streaming. Subscribing to hub-covered instruments never opens a
@@ -689,6 +645,7 @@ export const StrategyWatcherApp = () => {
                 environment={environment}
                 lastAddedRowId={lastAddedRowId}
                 stoppedPids={stoppedPids}
+                indicatorSeedFor={indicatorSeedFor}
                 onPidStopped={markPidStopped}
                 onConfigChange={(next) =>
                   setStrategyRows((prev) => prev.map((r) => (r.id === next.id ? next : r)))
@@ -759,28 +716,8 @@ export const StrategyWatcherApp = () => {
           )}
         </CollapsibleSection>
 
-        {/* Signal feed */}
-        <CollapsibleSection
-          id="watcher_daemon_feed"
-          title="Signal feed"
-          badge={status?.queue_len ? <span className="text-xs text-[var(--color-text-muted)]">({status.queue_len})</span> : undefined}
-        >
-          {queue.length === 0 ? (
-            <p data-testid="queue-empty" className="text-sm text-[var(--color-text-muted)] px-1">
-              No alerts yet. Fired strategy signals and price-level alerts from the wickd daemon land here.
-            </p>
-          ) : (
-            <div className="space-y-2">
-              {queue.map((alert) => (
-                <QueueAlertRow
-                  key={alert.id}
-                  alert={alert}
-                  granularity={watchersByInstrument.get(alert.payload.instrument)?.[0]?.granularity}
-                />
-              ))}
-            </div>
-          )}
-        </CollapsibleSection>
+        {/* Signal history lives on the Home window ("Signals") — this window
+            stays reserved for actionable state. */}
       </main>
     </div>
   );

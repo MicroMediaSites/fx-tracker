@@ -13,6 +13,7 @@ export const GRANULARITIES = [
   { value: 'M30', label: 'M30' },
   { value: 'H1', label: 'H1' },
   { value: 'H4', label: 'H4' },
+  { value: 'H8', label: 'H8' },
   { value: 'D', label: 'D1' },
   { value: 'W', label: 'W1' },
 ] as const;
