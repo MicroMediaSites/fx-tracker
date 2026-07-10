@@ -267,7 +267,7 @@ pub async fn start_watcher(
         .map_err(|e| e.to_string())?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
 
-    let mut cmd = std::process::Command::new(&bin);
+    let mut cmd = tokio::process::Command::new(&bin);
     cmd.arg("watch")
         .arg(&strategy)
         .arg(instruments.join(","))
@@ -281,10 +281,23 @@ pub async fn start_watcher(
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(log)
-        .stderr(log_err);
+        .stderr(log_err)
+        // The watcher outlives the app on purpose; never kill it on drop
+        .kill_on_drop(false);
 
-    let child = cmd.spawn().map_err(|e| format!("Failed to start wickd watch: {e}"))?;
-    Ok(child.id())
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to start wickd watch: {e}"))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| "wickd watch exited before it could be observed".to_string())?;
+
+    // Reap the child when it exits. Without this the Child handle is dropped
+    // unawaited and every watcher stopped from the UI lingers as a <defunct>
+    // zombie owned by the app until the app quits.
+    tauri::async_runtime::spawn(async move {
+        let _ = child.wait().await;
+    });
+
+    Ok(pid)
 }
 
 /// Stop a UI-manageable watcher process (SIGTERM).
