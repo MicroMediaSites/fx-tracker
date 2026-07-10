@@ -43,7 +43,7 @@ use commands::backtest::{
     is_walk_forward_running, run_parameter_sweep, validate_strategy_json,
     convert_strategy_script,
 };
-use commands::daemon::{daemon_status, daemon_queue_list, daemon_pending_list};
+use commands::daemon::{daemon_status, daemon_queue_list, daemon_pending_list, start_watcher, stop_watcher};
 use commands::chat::{
     chat_stream, chat_cancel, is_chat_enabled, check_ai_model, create_chat_compaction,
     recover_strategy_error, ChatSessionState,
@@ -406,6 +406,8 @@ async fn main() {
             daemon_status,
             daemon_queue_list,
             daemon_pending_list,
+            start_watcher,
+            stop_watcher,
             sync_trades,
             get_candles,
             get_indicator_data,
