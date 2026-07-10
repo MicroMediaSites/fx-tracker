@@ -146,8 +146,8 @@ pub async fn daemon_pending_list() -> Result<Vec<PendingSignal>, String> {
 // Start a watcher from the UI (trust-ladder capped)
 // ============================================================================
 
-/// Granularities the UI may start a watcher with (superset of the chart's
-/// list — the daemon synthesizes multi-hour timeframes like H8).
+/// Granularities the UI may start a watcher with — all native OANDA candle
+/// granularities the watch daemon accepts (superset of the chart selector).
 const UI_WATCH_GRANULARITIES: &[&str] = &[
     "M1", "M5", "M15", "M30", "H1", "H2", "H4", "H6", "H8", "H12", "D", "W",
 ];

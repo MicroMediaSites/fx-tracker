@@ -171,6 +171,8 @@ interface StrategyRowProps {
   onProcessChange: () => void;
   /** Report a pid this row stopped, so its process row hides immediately. */
   onPidStopped: (pid: number) => void;
+  /** Open the instrument's chart at this row's timeframe. */
+  onOpenChart: () => void;
   /** Open a fresh row with its name menu already showing. */
   startEditingName?: boolean;
 }
@@ -184,6 +186,7 @@ export const StrategyRow = ({
   onDelete,
   onProcessChange,
   onPidStopped,
+  onOpenChart,
   startEditingName = false,
 }: StrategyRowProps) => {
   const [editing, setEditing] = useState<'name' | 'timeframe' | null>(
@@ -343,6 +346,19 @@ export const StrategyRow = ({
         </span>
 
         <button
+          data-testid="strategy-row-chart"
+          onClick={onOpenChart}
+          className="shrink-0 p-0.5 text-[var(--color-text-muted)] hover:text-[var(--color-info)] transition-colors"
+          title={`Open ${config.instrument.replace('_', '/')} chart (${config.granularity})`}
+          aria-label="Open chart at this timeframe"
+        >
+          <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" d="M4 20h16" />
+            <path strokeLinecap="round" d="M7 16v-5M12 16V6M17 16v-8" />
+          </svg>
+        </button>
+
+        <button
           data-testid="strategy-row-delete"
           onClick={() => void handleDelete()}
           disabled={busy}
@@ -374,6 +390,7 @@ export const ExternalWatcherRow = ({
   mode,
   pid,
   onStop,
+  onOpenChart,
 }: {
   strategy: string;
   granularity: string | null;
@@ -381,6 +398,8 @@ export const ExternalWatcherRow = ({
   pid: number;
   /** Present when the process is stoppable from the UI (plain wickd binary). */
   onStop?: () => void;
+  /** Open the instrument's chart at this watcher's timeframe. */
+  onOpenChart: () => void;
 }) => {
   const [stopping, setStopping] = useState(false);
   return (
@@ -398,6 +417,18 @@ export const ExternalWatcherRow = ({
       </span>
       <span className="min-w-0 flex-1 truncate text-[var(--color-text-secondary)]">{strategy}</span>
       <span className="shrink-0 font-mono text-[var(--color-text-muted)]">{granularity ?? '—'}</span>
+      <button
+        data-testid="external-watcher-chart"
+        onClick={onOpenChart}
+        className="shrink-0 p-0.5 text-[var(--color-text-muted)] hover:text-[var(--color-info)] transition-colors"
+        title={`Open chart (${granularity ?? 'default'})`}
+        aria-label="Open chart at this timeframe"
+      >
+        <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" d="M4 20h16" />
+          <path strokeLinecap="round" d="M7 16v-5M12 16V6M17 16v-8" />
+        </svg>
+      </button>
       {onStop ? (
         <button
           data-testid="external-watcher-stop"
