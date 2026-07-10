@@ -89,10 +89,14 @@ test.describe('AGT-652 — Live Monitor as a wickd daemon client', () => {
     await expect(appPage.page.getByTestId('daemon-status')).toBeVisible();
     await expect(appPage.page.getByText('1 wickd watch daemon running')).toBeVisible();
     await expect(appPage.page.getByText('attached to wickd stream hub')).toBeVisible();
-    const processRow = appPage.page.getByTestId('watch-process-row');
-    await expect(processRow).toHaveCount(1);
-    await expect(processRow.getByText('revert_adx')).toBeVisible();
-    await expect(processRow.getByText('pid 61105')).toBeVisible();
+    // CLI/launchd-managed watchers render as read-only external rows on the
+    // per-instrument tiles of the merged "Watching" section: one row per
+    // (watcher, instrument) with strategy + timeframe; pid in the tooltip.
+    const externalRows = appPage.page.getByTestId('external-watcher-row');
+    await expect(externalRows).toHaveCount(4); // one watcher x 4 instruments
+    await expect(externalRows.first().getByText('revert_adx')).toBeVisible();
+    await expect(externalRows.first().getByText('H1')).toBeVisible();
+    await expect(externalRows.first()).toHaveAttribute('title', /pid 61105/);
 
     // Live signals render from the daemon's durable queue (AC2).
     const alertRows = appPage.page.getByTestId('queue-alert-row');
@@ -130,5 +134,67 @@ test.describe('AGT-652 — Live Monitor as a wickd daemon client', () => {
       path: `${EVIDENCE_DIR}/AGT-652-watcher-daemon-idle.png`,
       fullPage: true,
     });
+  });
+
+  test('instrument-first flow: pin a price window, attach a strategy under it', async ({ appPage }) => {
+    await appPage.mockTauriCommand('store_list_strategies', [
+      { name: 'kijun_revert_trend', valid: true },
+      { name: 'broken_script', valid: false },
+    ]);
+    await appPage.mockTauriCommand('start_watcher', 12345);
+    await appPage.mockTauriCommand('stop_watcher', null);
+
+    await appPage.goto('watcher');
+
+    // Pin a pair: the ghost tile's header spot opens the pair menu in place.
+    await appPage.page.getByTestId('add-pair-trigger').click();
+    const pairMenu = appPage.page.getByTestId('add-pair-menu');
+    await expect(pairMenu).toBeVisible();
+    await expect(appPage.page.getByTestId('add-pair-all')).toBeVisible();
+    await pairMenu.getByText('EUR/USD', { exact: true }).click();
+    await expect(pairMenu).not.toBeVisible();
+    const grid = appPage.page.getByTestId('price-grid');
+    await expect(grid.getByText('EUR/USD', { exact: true })).toBeVisible();
+
+    // "+ strategy" appends an inline-editable row with its name menu already
+    // open (inline editing philosophy — the row is the editor).
+    await appPage.page.getByTestId('add-strategy-button').click();
+    const row = appPage.page.getByTestId('strategy-row');
+    await expect(row).toHaveCount(1);
+    const nameMenu = appPage.page.getByTestId('strategy-row-name-menu');
+    await expect(nameMenu).toBeVisible();
+    // Only valid store strategies (plus builtins) are offered.
+    await expect(nameMenu.locator('button')).toHaveText([
+      'kijun_revert_trend',
+      'ma-crossover',
+      'rsi',
+    ]);
+    await nameMenu.getByText('kijun_revert_trend').click();
+    await expect(nameMenu).not.toBeVisible();
+    await expect(row.getByTestId('strategy-row-name')).toHaveText('kijun_revert_trend');
+
+    // Timeframe edits in place the same way.
+    await row.getByTestId('strategy-row-timeframe').click();
+    const timeframeMenu = appPage.page.getByTestId('strategy-row-timeframe-menu');
+    await expect(timeframeMenu).toBeVisible();
+    await timeframeMenu.getByText('H4', { exact: true }).click();
+    await expect(row.getByTestId('strategy-row-timeframe')).toHaveText('H4');
+
+    // A fresh row is disarmed; the state icon cycles the trust ladder
+    // disarmed -> monitor -> semi-auto -> disarmed (semi-auto is the UI
+    // ceiling — no --auto state exists). Arming renders immediately via the
+    // config's own pid, before any daemon poll.
+    const stateButton = row.getByTestId('strategy-row-state');
+    await expect(stateButton).toHaveAttribute('title', /Disarmed/);
+    await stateButton.click();
+    await expect(stateButton).toHaveAttribute('title', /Monitoring/);
+    await stateButton.click();
+    await expect(stateButton).toHaveAttribute('title', /Semi-auto/);
+    await stateButton.click();
+    await expect(stateButton).toHaveAttribute('title', /Disarmed/);
+    await expect(row.getByTestId('strategy-row-error')).toHaveCount(0);
+
+    // Disarmed rows can be deleted.
+    await expect(row.getByTestId('strategy-row-delete')).toBeVisible();
   });
 });
