@@ -26,6 +26,7 @@ mod alert_queue {
 mod audit;
 mod auto_exec;
 mod baseline;
+mod books;
 mod commands;
 mod convert;
 mod dashboard;
@@ -61,6 +62,7 @@ use commands::alert::AlertArgs;
 use commands::approve::ApproveArgs;
 use commands::audit::AuditArgs;
 use commands::backtest::BacktestArgs;
+use commands::books::BooksArgs;
 use commands::candles::CandlesArgs;
 use commands::dashboard::DashboardArgs;
 use commands::instruments::InstrumentsArgs;
@@ -109,6 +111,8 @@ enum Command {
     Strategy(StrategyArgs),
     /// Backtest a strategy over historical candles → JSON metrics + trades.
     Backtest(BacktestArgs),
+    /// Snapshot OANDA order/position books (client sentiment) → JSON, optionally stored.
+    Books(BooksArgs),
     /// Open an on-demand ui-leaf view (FX ticket or live signal watcher); headless otherwise.
     View(ViewArgs),
     /// Monitor a strategy against live candles → JSON signal daemon (never trades).
@@ -153,6 +157,7 @@ async fn main() {
         Command::Dashboard(args) => commands::dashboard::run(args, out).await,
         Command::Strategy(args) => commands::strategy::run(args, out).await,
         Command::Backtest(args) => commands::backtest::run(args, out).await,
+        Command::Books(args) => commands::books::run(args, out).await,
         Command::View(args) => commands::view::run(args, out).await,
         Command::Watch(args) => commands::watch::run(args, out).await,
         Command::Audit(args) => commands::audit::run(args, out).await,

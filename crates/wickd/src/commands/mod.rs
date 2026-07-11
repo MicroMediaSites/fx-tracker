@@ -4,6 +4,7 @@ pub mod alert;
 pub mod approve;
 pub mod audit;
 pub mod backtest;
+pub mod books;
 pub mod candles;
 pub mod client;
 pub mod dashboard;

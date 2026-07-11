@@ -13,12 +13,19 @@ automatically, restart on crash, and survive reboots (AGT-629).
 > session is the human launch step (**AGT-633**), not something the build does.
 > Do not `launchctl load` this on a dev laptop you reboot/sleep.
 
-## The two jobs
+## The jobs
 
 | Job | Label | Command it supervises |
 |-----|-------|-----------------------|
 | **Stream hub** (singleton) | `com.openthink.wickd-stream` | `wickd stream <instruments> --env <e> --account <a>` |
 | **Autonomous watcher** (one per strategy) | `com.openthink.wickd-watch.<slug>` | `wickd watch <strategy> <instruments> --granularity <g> --env practice --account <a> --units <n> --auto` |
+| **Books collector** (singleton, periodic one-shot) | `com.openthink.wickd-books` | `wickd books <instruments> --store --env <e> --account <a>` every `StartInterval` seconds |
+
+**The books collector is not a daemon.** launchd fires it on an interval
+(default 1200s — OANDA's 20-minute book-snapshot cadence), it appends any new
+order/position-book snapshots to `~/.wickd/books.db` (idempotent
+`INSERT OR IGNORE`), and exits. It has no `KeepAlive` — a failed run just
+waits for the next tick.
 
 **One hub, N watchers.** The hub holds a single OANDA price subscription and
 fans it out over `~/.wickd/stream.sock`. Each watcher probes that socket at
@@ -87,6 +94,8 @@ plist** — the API key is read from the keychain at runtime.
 - **Watcher `<slug>`:** `~/Library/Logs/wickd/watch.<slug>.out.log` (NDJSON
   signal stream **plus** autonomous-execution events — `auto-place`,
   `auto-close`, position adoption) / `watch.<slug>.err.log`.
+- **Books collector:** `~/Library/Logs/wickd/books.out.log` (one JSON summary
+  per run: stored/skipped counts) / `books.err.log`.
 
 `install.sh` creates `~/Library/Logs/wickd` (launchd will not create the log
 directory for you). For rotation, drop in the shipped
@@ -115,6 +124,10 @@ cd crates/wickd/deploy/launchd
 # 2) One autonomous watcher per strategy (repeatable).
 ./install.sh watch rsi "EUR_USD,GBP_USD" --account h004 --granularity H1 --units 1000
 ./install.sh watch h004_reversion "EUR_USD" --account h004 --slug h004-eurusd
+
+# 3) The books collector (once). Basket defaults to the 8 USD majors + crosses;
+#    interval defaults to 1200s. Override either: ./install.sh books "EUR_USD" --interval 3600
+./install.sh books
 ```
 
 `INSTRUMENTS` is a single comma-separated token (`clap` splits it) or `all`.
@@ -249,6 +262,7 @@ intervention the experiment's registration must explicitly allow.
 cd crates/wickd/deploy/launchd
 ./uninstall.sh stream                 # stop + remove the hub
 ./uninstall.sh watch h004-eurusd      # stop + remove one watcher (by slug)
+./uninstall.sh books                  # stop + remove the books collector
 ./uninstall.sh --all                  # stop + remove every wickd job
 ./uninstall.sh --all --purge-logs     # also delete ~/Library/Logs/wickd
 ```
