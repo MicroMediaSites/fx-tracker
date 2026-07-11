@@ -69,6 +69,7 @@ impl Strategy for FixedSignalStrategy {
 /// take_profit so the engine's SL/TP branch never triggers).
 fn fixture_config() -> BacktestConfig {
     BacktestConfig {
+        warmup_bars: 0,
         initial_balance: dec!(10000),
         position_size: dec!(10000),
         use_percentage: false,
@@ -289,8 +290,11 @@ fn test_aggregate_metrics_exact() {
     //   variance = sum((r - mean)^2) / 5
     //            = 8.573305669325404130290048055957262004649217147948e-7
     //   std_dev  = sqrt(variance) = 0.00092592146909580858526341477485794704...
-    //   sharpe = (mean / std_dev) * sqrt(252)
-    //          = 11.991762667627341244880746610477428352378566923777
+    //   Annualization scales by the actual candle frequency (hourly fixture):
+    //   span = 4h = 14,400s; periods_per_year = 5 / (14,400 / 31,557,600)
+    //          = 10,957.5; sqrt = 104.67807793420740871680570468748263...
+    //   sharpe = (mean / std_dev) * sqrt(10957.5)
+    //          = 79.074871338110230900594492190832600794356629305135
     // The engine approximates the two sqrt() calls with a 20-iteration Newton's
     // method over rust_decimal's fixed ~28-significant-digit division (see
     // decimal_sqrt, independently unit-tested in engine::tests::test_decimal_sqrt).
@@ -300,7 +304,7 @@ fn test_aggregate_metrics_exact() {
     // bar the codebase already uses for Newton's-method sqrt comparisons in
     // engine::tests::test_decimal_sqrt, and is still four orders of magnitude
     // tighter than the raw Sharpe value -- not a "close enough" hand-wave.
-    let expected_sharpe = dec!(11.99176266762734);
+    let expected_sharpe = dec!(79.07487133811023);
     let diff = (m.sharpe_ratio - expected_sharpe).abs();
     assert!(
         diff < dec!(0.0001),

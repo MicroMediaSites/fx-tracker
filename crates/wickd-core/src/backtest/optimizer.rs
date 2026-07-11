@@ -381,6 +381,7 @@ pub fn run_optimization(
                 strategy.set_pip_value_for_instrument(instrument);
 
                 let backtest_config = BacktestConfig {
+                    warmup_bars: 0,
                     initial_balance,
                     position_size: dec!(1000),
                     use_percentage: false,
@@ -468,6 +469,7 @@ pub fn run_optimization(
 
             // Create backtest config with risk-based position sizing
             let backtest_config = BacktestConfig {
+                warmup_bars: 0,
                 initial_balance,
                 position_size: dec!(1000), // Fallback, not used when risk_percent is set
                 use_percentage: false,

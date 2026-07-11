@@ -23,6 +23,7 @@ use clap::Args;
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 
+use wickd_core::backtest::costs;
 use wickd_core::backtest::strategy::ExtendedSignal;
 use wickd_core::backtest::{
     BacktestConfig, BacktestEngine, MovingAverageCrossover, RsiStrategy, Signal, Strategy,
@@ -64,6 +65,17 @@ pub struct BacktestArgs {
     /// Position size in units.
     #[arg(long)]
     pub position_size: Option<String>,
+    /// Half-spread in pips charged per fill side (round-trip cost = 2×
+    /// this value). Defaults to a per-instrument table of typical OANDA
+    /// spreads; pass 0 for costless mid-to-mid fills.
+    #[arg(long)]
+    pub spread_pips: Option<String>,
+    /// Indicator warmup: fetch this many candles BEFORE --from and feed them
+    /// to the strategy without trading them (excluded from metrics/equity).
+    /// Lets slow indicators (e.g. SMA-200) be warm at the window start
+    /// instead of consuming the tested span. Requires --from and --to.
+    #[arg(long, default_value_t = 0)]
+    pub warmup: usize,
 
     // --- walk-forward mode ---
     /// Run walk-forward analysis: split the range into sequential in-sample /
@@ -237,7 +249,51 @@ pub(crate) fn build_config(args: &BacktestArgs) -> Result<BacktestConfig> {
         }
         config.position_size = position_size;
     }
+    // Execution-cost model: pip size follows the instrument (0.01 for
+    // JPY-quoted pairs), half-spread defaults to the per-instrument table
+    // unless overridden.
+    config.pip_value = costs::pip_value_for(&args.instrument);
+    config.spread_pips = match &args.spread_pips {
+        Some(s) => {
+            let v = Decimal::from_str(s).map_err(|_| anyhow!("invalid --spread-pips '{s}'"))?;
+            if v < Decimal::ZERO {
+                bail!("--spread-pips must be >= 0");
+            }
+            v
+        }
+        None => costs::default_half_spread_pips(&args.instrument),
+    };
     Ok(config)
+}
+
+/// Approximate calendar seconds per candle, used only to over-estimate how
+/// far before `--from` to start the warmup fetch (weekend gaps are covered
+/// by the 1.6× factor at the call site; the exact cut is done on the fetched
+/// candles themselves).
+fn approx_candle_secs(gran: Granularity) -> i64 {
+    match gran {
+        Granularity::S5 => 5,
+        Granularity::S10 => 10,
+        Granularity::S15 => 15,
+        Granularity::S30 => 30,
+        Granularity::M1 => 60,
+        Granularity::M2 => 120,
+        Granularity::M4 => 240,
+        Granularity::M5 => 300,
+        Granularity::M10 => 600,
+        Granularity::M15 => 900,
+        Granularity::M30 => 1800,
+        Granularity::H1 => 3600,
+        Granularity::H2 => 7200,
+        Granularity::H3 => 10800,
+        Granularity::H4 => 14400,
+        Granularity::H6 => 21600,
+        Granularity::H8 => 28800,
+        Granularity::H12 => 43200,
+        Granularity::D => 86400,
+        Granularity::W => 604800,
+        Granularity::M => 2_592_000,
+    }
 }
 
 async fn run_backtest(args: BacktestArgs) -> Result<Value> {
@@ -256,11 +312,17 @@ async fn run_backtest(args: BacktestArgs) -> Result<Value> {
         if !args.set.is_empty() {
             bail!("'--set' parameter overrides conflict with --walk-forward (the per-window search optimizes parameters)");
         }
+        if args.warmup > 0 {
+            bail!("--warmup conflicts with --walk-forward (walk-forward manages its own windowing)");
+        }
         None
     } else {
         Some(build_strategy(&args)?)
     };
-    let config = build_config(&args)?;
+    if args.warmup > 0 && (args.from.is_none() || args.to.is_none()) {
+        bail!("--warmup requires both --from and --to");
+    }
+    let mut config = build_config(&args)?;
 
     let (_env, client) = client::resolve(&args.env, vault_store::DEFAULT_ACCOUNT)?;
 
@@ -269,7 +331,39 @@ async fn run_backtest(args: BacktestArgs) -> Result<Value> {
     // requests, stitched and deduped, bounded client-side by `to` (#292).
     // Otherwise fetch the most recent N candles in one request.
     let candles = if let (Some(from), Some(to)) = (args.from.as_deref(), args.to.as_deref()) {
-        endpoints::get_candles_paginated(&client, &args.instrument, gran, from, to).await
+        if args.warmup > 0 {
+            // Fetch a lead-in before `from` so indicators are warm at the
+            // window start. Over-fetch on calendar time (×1.6 + 3 days covers
+            // weekends/holidays), then cut to exactly `warmup` lead-in
+            // candles on the actual data.
+            let from_dt = chrono::DateTime::parse_from_rfc3339(from)
+                .map_err(|e| anyhow!("invalid --from '{from}': {e}"))?
+                .with_timezone(&chrono::Utc);
+            let lead_secs = (approx_candle_secs(gran) * args.warmup as i64 * 16) / 10
+                + 3 * 86_400;
+            let fetch_from = (from_dt - chrono::Duration::seconds(lead_secs)).to_rfc3339();
+            let all = endpoints::get_candles_paginated(
+                &client,
+                &args.instrument,
+                gran,
+                &fetch_from,
+                to,
+            )
+            .await?;
+            // First candle at/after the requested window start.
+            let window_start = all.partition_point(|c| c.time < from_dt);
+            let lead_start = window_start.saturating_sub(args.warmup);
+            config.warmup_bars = window_start - lead_start;
+            if config.warmup_bars < args.warmup {
+                eprintln!(
+                    "warning: only {} of {} requested warmup candles available before --from",
+                    config.warmup_bars, args.warmup
+                );
+            }
+            Ok(all[lead_start..].to_vec())
+        } else {
+            endpoints::get_candles_paginated(&client, &args.instrument, gran, from, to).await
+        }
     } else {
         // from-only or neither (--to without --from is rejected above, so
         // `to` is always None here; forwarded for self-evident parity).
@@ -298,6 +392,10 @@ async fn run_backtest(args: BacktestArgs) -> Result<Value> {
     let (strategy, effective_params) = strategy
         .as_mut()
         .expect("single-strategy path always constructs a strategy");
+    // Echo the cost/warmup model so every run is self-describing.
+    let spread_pips = config.spread_pips;
+    let pip_value = config.pip_value;
+    let warmup_bars = config.warmup_bars;
     let result = run_engine(strategy.as_mut(), config, &candles);
 
     let mut out = json!({
@@ -305,6 +403,9 @@ async fn run_backtest(args: BacktestArgs) -> Result<Value> {
         "instrument": args.instrument,
         "granularity": args.granularity,
         "candles": candles.len(),
+        "spreadPips": spread_pips,
+        "pipValue": pip_value,
+        "warmupBars": warmup_bars,
         "metrics": result.metrics,
         "finalBalance": result.final_balance,
         "equityCurve": result.equity_curve,
@@ -386,6 +487,8 @@ mod tests {
             env: "practice".to_string(),
             balance: None,
             position_size: None,
+            spread_pips: None,
+            warmup: 0,
             walk_forward: false,
             is_size: 250,
             oos_size: 50,

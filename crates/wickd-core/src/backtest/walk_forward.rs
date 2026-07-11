@@ -560,6 +560,7 @@ pub fn run_walk_forward(
 
         // Run backtest on test data with optimized params
         let backtest_config = BacktestConfig {
+            warmup_bars: 0,
             initial_balance,
             position_size: dec!(1000),
             use_percentage: false,

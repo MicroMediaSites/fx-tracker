@@ -747,6 +747,7 @@ mod tests {
 
     fn zero_cost_config() -> BacktestConfig {
         BacktestConfig {
+            warmup_bars: 0,
             initial_balance: dec!(10000),
             position_size: dec!(1000),
             use_percentage: false,
@@ -754,6 +755,7 @@ mod tests {
             estimated_stop_pips: dec!(20),
             spread_pips: dec!(0), // zero spread → P&L is pure price move, no fixed drag
             pip_value: dec!(0.0001),
+            instrument: String::new(),
         }
     }
 
