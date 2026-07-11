@@ -105,6 +105,14 @@ pub fn open_at(path: impl AsRef<Path>) -> Result<Connection> {
     }
     let conn = Connection::open(path)
         .with_context(|| format!("could not open books db {}", path.display()))?;
+    // books.db has concurrent writers by design (the launchd collector + the
+    // wickd-lab historical backfill both INSERT OR IGNORE into the same
+    // store). Without a busy handler rusqlite fails a colliding write with
+    // SQLITE_BUSY instantly — which silently killed every collector tick
+    // that landed inside the backfill's write window. Wait out short locks
+    // instead.
+    conn.busy_timeout(std::time::Duration::from_secs(60))
+        .context("could not set books db busy timeout")?;
     // Local trading data must not be world-readable (AGT-668).
     crate::fs_perms::restrict_file(path)?;
     init_schema(&conn)?;
