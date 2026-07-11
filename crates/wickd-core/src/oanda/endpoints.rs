@@ -1105,6 +1105,51 @@ mod tests {
         })
     }
 
+    // Financing terms ride along on the instruments response (carry research
+    // needs them); older/omitted payloads parse with financing = None.
+    #[tokio::test]
+    async fn test_get_instruments_parses_financing() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        let body = json!({
+            "instruments": [
+                {
+                    "name": "EUR_USD",
+                    "type": "CURRENCY",
+                    "displayName": "EUR/USD",
+                    "financing": {
+                        "longRate": "-0.0245",
+                        "shortRate": "0.0042",
+                        "financingDaysOfWeek": [
+                            {"dayOfWeek": "MONDAY", "daysCharged": 1},
+                            {"dayOfWeek": "WEDNESDAY", "daysCharged": 3}
+                        ]
+                    }
+                },
+                {
+                    "name": "XAU_USD",
+                    "type": "METAL",
+                    "displayName": "Gold"
+                }
+            ],
+            "lastTransactionID": "99999"
+        });
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/instruments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&mock_server)
+            .await;
+
+        let instruments = get_instruments(&client).await.unwrap();
+        assert_eq!(instruments.len(), 2);
+        let fin = instruments[0].financing.as_ref().expect("financing present");
+        assert_eq!(fin.long_rate, "-0.0245");
+        assert_eq!(fin.short_rate, "0.0042");
+        assert_eq!(fin.financing_days_of_week[1].days_charged, 3);
+        assert!(instruments[1].financing.is_none());
+    }
+
     #[tokio::test]
     async fn test_get_order_book_success() {
         let mock_server = MockServer::start().await;

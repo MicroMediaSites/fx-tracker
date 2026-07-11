@@ -775,6 +775,35 @@ pub struct OandaInstrument {
     pub maximum_order_units: Option<String>,
     #[serde(default)]
     pub margin_rate: Option<String>,
+    /// Financing (swap/carry) terms — current annualized long/short rates
+    /// plus the days-charged calendar (Wednesday triple-charges the weekend).
+    /// OANDA returns this for every currency instrument; historical rates are
+    /// NOT exposed anywhere in v20, so a time series requires sampling this.
+    #[serde(default)]
+    pub financing: Option<InstrumentFinancing>,
+}
+
+/// Per-instrument financing terms (`instrument.financing` in the OANDA
+/// account-instruments response). Rates are annualized decimal fractions as
+/// OANDA-precision strings (e.g. `"-0.0245"` = −2.45%/yr); long and short are
+/// asymmetric — the gap is the broker's financing spread (measured ~1–2%/yr
+/// round-trip on G10, wickd-lab STUDY-010).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstrumentFinancing {
+    pub long_rate: String,
+    pub short_rate: String,
+    #[serde(default)]
+    pub financing_days_of_week: Vec<FinancingDayOfWeek>,
+}
+
+/// One weekday's financing charge multiplier (`daysCharged` 0 on weekends,
+/// 3 on Wednesday for FX — the weekend roll).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinancingDayOfWeek {
+    pub day_of_week: String,
+    pub days_charged: i32,
 }
 
 // ============================================================================
