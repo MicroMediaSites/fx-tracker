@@ -2,6 +2,7 @@
 
 pub mod strategy;
 pub mod engine;
+pub mod costs;
 pub mod strategies;
 pub mod indicators;
 pub mod indicator_engine;

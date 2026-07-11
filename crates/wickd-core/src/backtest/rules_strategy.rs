@@ -580,6 +580,7 @@ mod tests {
         // Step 4: Run a mini backtest with H1 candles
         use crate::backtest::engine::{BacktestEngine, BacktestConfig};
         let config = BacktestConfig {
+            warmup_bars: 0,
             initial_balance: dec!(10000),
             position_size: dec!(1000),
             use_percentage: false,
@@ -760,6 +761,7 @@ mod tests {
         // Step 5: Run backtest
         use crate::backtest::engine::{BacktestEngine, BacktestConfig};
         let config = BacktestConfig {
+            warmup_bars: 0,
             initial_balance: dec!(10000),
             position_size: dec!(1000),
             use_percentage: false,
@@ -904,6 +906,7 @@ mod tests {
 
         use crate::backtest::engine::{BacktestEngine, BacktestConfig};
         let config = BacktestConfig {
+            warmup_bars: 0,
             initial_balance: dec!(10000),
             position_size: dec!(1000),
             use_percentage: false,
@@ -1036,6 +1039,7 @@ mod tests {
 
         use crate::backtest::engine::{BacktestEngine, BacktestConfig};
         let config = BacktestConfig {
+            warmup_bars: 0,
             initial_balance: dec!(10000),
             position_size: dec!(1000),
             use_percentage: false,
@@ -1145,6 +1149,7 @@ mod tests {
 
         use crate::backtest::engine::{BacktestEngine, BacktestConfig};
         let config = BacktestConfig {
+            warmup_bars: 0,
             initial_balance: dec!(10000),
             position_size: dec!(1000),
             use_percentage: false,

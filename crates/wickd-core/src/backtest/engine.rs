@@ -37,6 +37,11 @@ pub struct BacktestConfig {
     /// `serde(default)` keeps JSON that predates this field deserializable.
     #[serde(default)]
     pub instrument: String,
+    /// Number of leading candles used only to warm up indicators: the
+    /// strategy sees them (state/indicators build normally) but no entries
+    /// are taken and they are excluded from the equity curve and metrics.
+    #[serde(default)]
+    pub warmup_bars: usize,
 }
 
 impl Default for BacktestConfig {
@@ -50,6 +55,7 @@ impl Default for BacktestConfig {
             spread_pips: dec!(1),
             pip_value: dec!(0.0001),
             instrument: String::new(),
+            warmup_bars: 0,
         }
     }
 }
@@ -64,6 +70,10 @@ pub struct SimulatedTrade {
     pub exit_price: Option<Decimal>,
     pub units: Decimal,
     pub pnl: Decimal,
+    /// Round-trip spread cost embedded in `pnl` (home currency): what this
+    /// trade paid vs a mid-to-mid fill. Gross P&L = pnl + spread_cost.
+    #[serde(default)]
+    pub spread_cost: Decimal,
     pub is_long: bool,
     /// ID of the entry rule that triggered this trade
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,8 +99,14 @@ pub struct SimulatedTrade {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BacktestMetrics {
-    /// Total profit/loss
+    /// Total profit/loss, NET of simulated spread costs (fills at mid ± spread)
     pub total_pnl: Decimal,
+    /// Total round-trip spread cost paid across all trades (home currency)
+    #[serde(default)]
+    pub total_spread_cost: Decimal,
+    /// Total profit/loss as if fills were mid-to-mid: total_pnl + total_spread_cost
+    #[serde(default)]
+    pub gross_pnl: Decimal,
     /// Return as percentage
     pub total_return_pct: Decimal,
     /// Annualized return as percentage (projected to 1 year)
@@ -120,6 +136,8 @@ impl Default for BacktestMetrics {
     fn default() -> Self {
         Self {
             total_pnl: Decimal::ZERO,
+            total_spread_cost: Decimal::ZERO,
+            gross_pnl: Decimal::ZERO,
             total_return_pct: Decimal::ZERO,
             annualized_return_pct: Decimal::ZERO,
             winning_trades: 0,
@@ -240,11 +258,16 @@ impl BacktestEngine {
         // Prepare strategy with full candle data (for pattern detection, etc.)
         strategy.prepare(candles);
 
-        for candle in candles {
+        for (candle_idx, candle) in candles.iter().enumerate() {
             // Only process complete candles
             if !candle.complete {
                 continue;
             }
+            // Warmup candles feed the strategy (indicator/state build-up in
+            // Step 4) but take no entries and don't count toward the equity
+            // curve. No position can exist during warmup, so Steps 1–3 are
+            // structurally no-ops there.
+            let in_warmup = candle_idx < self.config.warmup_bars;
 
             // === Step 1: Check pending orders for fills ===
             // This must happen before executing pending market signals and before SL/TP checks.
@@ -270,6 +293,7 @@ impl BacktestEngine {
                             exit_price: None,
                             units,
                             pnl: Decimal::ZERO,
+                            spread_cost: Decimal::ZERO,
                             is_long,
                             entry_rule_id: order.entry_rule_id.clone(),
                             entry_rule_name: order.entry_rule_name.clone(),
@@ -348,6 +372,7 @@ impl BacktestEngine {
                                         exit_price: None,
                                         units,
                                         pnl: Decimal::ZERO,
+                                        spread_cost: Decimal::ZERO,
                                         is_long: true,
                                         entry_rule_id: ext_signal.entry_rule_id.clone(),
                                         entry_rule_name: ext_signal.entry_rule_name.clone(),
@@ -371,6 +396,7 @@ impl BacktestEngine {
                                     exit_price: None,
                                     units,
                                     pnl: Decimal::ZERO,
+                                    spread_cost: Decimal::ZERO,
                                     is_long: true,
                                     entry_rule_id: ext_signal.entry_rule_id.clone(),
                                     entry_rule_name: ext_signal.entry_rule_name.clone(),
@@ -430,6 +456,7 @@ impl BacktestEngine {
                                         exit_price: None,
                                         units,
                                         pnl: Decimal::ZERO,
+                                        spread_cost: Decimal::ZERO,
                                         is_long: false,
                                         entry_rule_id: ext_signal.entry_rule_id.clone(),
                                         entry_rule_name: ext_signal.entry_rule_name.clone(),
@@ -453,6 +480,7 @@ impl BacktestEngine {
                                     exit_price: None,
                                     units,
                                     pnl: Decimal::ZERO,
+                                    spread_cost: Decimal::ZERO,
                                     is_long: false,
                                     entry_rule_id: ext_signal.entry_rule_id.clone(),
                                     entry_rule_name: ext_signal.entry_rule_name.clone(),
@@ -554,9 +582,12 @@ impl BacktestEngine {
                 entry_price: pos.entry_price,
                 is_long: pos.is_long,
             }));
-            // Use on_candle_extended to get stop_loss/take_profit info for position sizing
+            // Use on_candle_extended to get stop_loss/take_profit info for position sizing.
+            // During warmup the strategy still runs (its indicators/state must
+            // build), but its signals are discarded so no entry can originate
+            // from a warmup candle.
             let ext_signal = strategy.on_candle_extended(candle);
-            if ext_signal.signal != Signal::Hold {
+            if !in_warmup && ext_signal.signal != Signal::Hold {
                 if ext_signal.pending_order.is_some()
                     && matches!(ext_signal.signal, Signal::Buy | Signal::Sell)
                 {
@@ -612,7 +643,12 @@ impl BacktestEngine {
             } else {
                 balance
             };
-            equity_curve.push(mtm_balance);
+            // Warmup candles are excluded from the equity curve so drawdown /
+            // Sharpe measure the trading span only (a long flat warmup would
+            // dilute per-candle return statistics).
+            if !in_warmup {
+                equity_curve.push(mtm_balance);
+            }
         }
 
         // Close any remaining position at the last candle
@@ -636,7 +672,17 @@ impl BacktestEngine {
             }
         }
 
-        let metrics = self.calculate_metrics(&trades, &equity_curve, candles);
+        // Stamp each closed trade with the round-trip spread cost embedded in
+        // its P&L (2 × half-spread × units, converted to home currency the
+        // same way the P&L itself was).
+        for trade in &mut trades {
+            trade.spread_cost = self.trade_spread_cost(trade);
+        }
+
+        // Metrics cover the trading span only: warmup candles are excluded
+        // from time-based calculations (annualization, Sharpe frequency).
+        let trading_candles = &candles[self.config.warmup_bars.min(candles.len())..];
+        let metrics = self.calculate_metrics(&trades, &equity_curve, trading_candles);
 
         BacktestResult {
             metrics,
@@ -701,6 +747,19 @@ impl BacktestEngine {
         self.to_home_currency(pnl_quote, exit_price)
     }
 
+    /// Round-trip spread cost of a closed trade in the home currency: the
+    /// engine fills each side at mid ± spread_amount, so a completed trade
+    /// paid `2 × spread_amount × units` in the quote currency vs mid-to-mid
+    /// fills. Converted to home the same way P&L is (at the exit price).
+    /// For pending-order (stop/limit) entries the entry-side cost is an
+    /// approximation: the fill happened at the order's bid/ask-crossed price,
+    /// which sits within one spread of mid by construction.
+    fn trade_spread_cost(&self, trade: &SimulatedTrade) -> Decimal {
+        let cost_quote = dec!(2) * self.spread_amount() * trade.units;
+        let reference_price = trade.exit_price.unwrap_or(trade.entry_price);
+        self.to_home_currency(cost_quote, reference_price)
+    }
+
     /// Convert a quote-currency amount to the USD home currency using the pair
     /// price at the moment of realization.
     /// - `*_USD` (EUR_USD, GBP_USD): quote is already USD → no change.
@@ -745,6 +804,8 @@ impl BacktestEngine {
 
         let total_trades = trades.len() as u32;
         let total_pnl: Decimal = trades.iter().map(|t| t.pnl).sum();
+        let total_spread_cost: Decimal = trades.iter().map(|t| t.spread_cost).sum();
+        let gross_pnl = total_pnl + total_spread_cost;
         let total_return_pct = (total_pnl / self.config.initial_balance) * dec!(100);
 
         // Calculate annualized return based on data range
@@ -784,6 +845,8 @@ impl BacktestEngine {
 
         BacktestMetrics {
             total_pnl,
+            total_spread_cost,
+            gross_pnl,
             total_return_pct,
             annualized_return_pct,
             winning_trades,
@@ -1136,8 +1199,77 @@ mod tests {
     }
 
     #[test]
+    fn test_warmup_bars_suppress_entries_and_shrink_equity_curve() {
+        let candles = create_test_candles();
+
+        // Baseline: first signal (bullish candle 0) executes at candle 1's open.
+        let baseline = BacktestEngine::new(BacktestConfig::default())
+            .run(&mut SimpleStrategy::new(), &candles);
+        assert_eq!(
+            baseline.trades[0].entry_time,
+            candles[1].time.to_rfc3339(),
+            "baseline sanity: entry at candle 1"
+        );
+        assert_eq!(baseline.equity_curve.len(), 1 + candles.len());
+
+        // With 2 warmup candles, the earliest capturable signal is candle 2's,
+        // executing at candle 3's open — and the equity curve only covers the
+        // trading span.
+        let config = BacktestConfig {
+            warmup_bars: 2,
+            ..Default::default()
+        };
+        let result = BacktestEngine::new(config).run(&mut SimpleStrategy::new(), &candles);
+        let window_start = candles[2].time.to_rfc3339();
+        for trade in &result.trades {
+            assert!(
+                trade.entry_time > window_start,
+                "trade entered during warmup: {} <= {}",
+                trade.entry_time,
+                window_start
+            );
+        }
+        assert!(!result.trades.is_empty(), "should still trade after warmup");
+        assert_eq!(result.equity_curve.len(), 1 + candles.len() - 2);
+    }
+
+    #[test]
+    fn test_gross_net_spread_cost_identity() {
+        let candles = create_test_candles();
+        let config = BacktestConfig {
+            instrument: "EUR_USD".to_string(),
+            ..Default::default()
+        };
+        let costed = BacktestEngine::new(config).run(&mut SimpleStrategy::new(), &candles);
+
+        // Per trade: round-trip cost = 2 × spread_pips × pip_value × units.
+        for trade in &costed.trades {
+            assert_eq!(
+                trade.spread_cost,
+                dec!(2) * dec!(1) * dec!(0.0001) * trade.units,
+                "per-trade round-trip spread cost"
+            );
+        }
+        let metrics = &costed.metrics;
+        assert_eq!(metrics.gross_pnl, metrics.total_pnl + metrics.total_spread_cost);
+        assert!(metrics.total_spread_cost > Decimal::ZERO);
+
+        // A zero-spread run books mid-to-mid fills at the same candles, so its
+        // net P&L equals the costed run's gross P&L exactly.
+        let zero_config = BacktestConfig {
+            spread_pips: Decimal::ZERO,
+            instrument: "EUR_USD".to_string(),
+            ..Default::default()
+        };
+        let gross = BacktestEngine::new(zero_config).run(&mut SimpleStrategy::new(), &candles);
+        assert_eq!(gross.metrics.total_pnl, costed.metrics.gross_pnl);
+        assert_eq!(gross.metrics.total_spread_cost, Decimal::ZERO);
+    }
+
+    #[test]
     fn test_backtest_metrics() {
         let config = BacktestConfig {
+            warmup_bars: 0,
             initial_balance: dec!(10000),
             position_size: dec!(10000),
             use_percentage: false,

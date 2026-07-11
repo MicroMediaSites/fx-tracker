@@ -405,6 +405,7 @@ fn run_backtest_with_strategy<S: candlesight_lib::backtest::Strategy>(
         .unwrap_or(dec!(1)); // Default 1% risk per trade
 
     let config = BacktestConfig {
+        warmup_bars: 0,
         initial_balance: init_balance,
         position_size: dec!(1000), // Fallback, not used when risk_percent is set
         use_percentage: false,
@@ -907,6 +908,7 @@ pub async fn run_backtest_debug(
 
             let pip_value = shared::get_pip_value(&instrument_clone);
             let config = BacktestConfig {
+                warmup_bars: 0,
                 initial_balance: initial_balance
                     .map(|v| Decimal::from_str(&v.to_string()).unwrap_or(dec!(10000)))
                     .unwrap_or(dec!(10000)),
@@ -966,6 +968,7 @@ pub async fn run_backtest_debug(
         // Configure and run backtest
         let pip_value = shared::get_pip_value(&instrument_clone);
         let config = BacktestConfig {
+            warmup_bars: 0,
             initial_balance: initial_balance
                 .map(|v| Decimal::from_str(&v.to_string()).unwrap_or(dec!(10000)))
                 .unwrap_or(dec!(10000)),
