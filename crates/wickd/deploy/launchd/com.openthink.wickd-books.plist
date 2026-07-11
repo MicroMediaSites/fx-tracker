@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent that collects OANDA order/position-book snapshots into the local
+  append-only store (~/.wickd/books.db) — the wickd-lab CAMPAIGN-003 WS1
+  positioning collector. Unlike the stream/watch jobs this is NOT a daemon: it
+  is a periodic one-shot — launchd fires `wickd books ... --store` every
+  StartInterval seconds, the command snapshots both books for the basket,
+  appends anything new, and exits.
+
+  Singleton: label com.openthink.wickd-books. OANDA publishes book snapshots
+  on 20-minute boundaries, so the default interval is 1200s; because the store
+  is idempotent (INSERT OR IGNORE keyed on instrument/book/snapshot-time),
+  any cadence only changes fetch traffic, never the stored series.
+
+  READ-ONLY against OANDA: `wickd books` places no orders and touches no
+  account state — it only GETs the two public instrument book endpoints.
+
+  See README.md in this directory ("Books collector") for install / verify /
+  uninstall steps.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openthink.wickd-books</string>
+
+    <!--
+      wickd books <instruments> --store --env <env>
+
+      __INSTRUMENTS__ is a single comma-separated token (clap splits it), e.g.
+      "EUR_USD,GBP_USD,USD_JPY,USD_CHF,AUD_USD,USD_CAD,NZD_USD,EUR_GBP".
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__WICKD_BIN__</string>
+        <string>books</string>
+        <string>__INSTRUMENTS__</string>
+        <string>--store</string>
+        <string>--env</string>
+        <string>__ENV__</string>
+        <string>--account</string>
+        <string>__ACCOUNT__</string>
+    </array>
+
+    <!-- Collect once at load (login), then every __INTERVAL__ seconds. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>__INTERVAL__</integer>
+
+    <!-- Background one-shot: no KeepAlive — launchd re-fires it on the
+         interval; a crash simply waits for the next tick. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- One JSON summary line per run on stdout; errors on stderr. -->
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/books.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/books.err.log</string>
+
+    <!--
+      Run from the user's home so ~/.wickd/config.json (account id),
+      ~/.wickd/books.db (the store), and the user's login keychain (API key)
+      all resolve.
+    -->
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <!--
+      No secret here. `wickd books` reads the OANDA API key from the user's
+      login keychain (written by `wickd login`). Because this LaunchAgent runs
+      in the user's login session, the keychain is unlocked and readable with
+      no password.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

@@ -2,7 +2,7 @@
 #
 # Install a wickd LaunchAgent (macOS) — AGT-629.
 #
-# Two supervised job kinds:
+# Three job kinds:
 #
 #   install.sh stream [INSTRUMENTS] [--env ENV] [--account NAME] [--wickd PATH] [--dry-run]
 #       Supervise the `wickd stream` socket hub — one OANDA subscription fanned
@@ -15,6 +15,14 @@
 #       (practice only). Parameterized per strategy: label
 #       com.openthink.wickd-watch.<slug> (slug defaults to <strategy>-<account>),
 #       so many strategies coexist as independent jobs.
+#
+#   install.sh books [INSTRUMENTS] [--interval SECS] [--env ENV] \
+#                    [--account NAME] [--wickd PATH] [--dry-run]
+#       Periodic one-shot `wickd books <instruments> --store` collecting
+#       order/position-book snapshots into ~/.wickd/books.db. Singleton:
+#       label com.openthink.wickd-books. Default interval 1200s (OANDA's
+#       20-minute snapshot cadence); the store is idempotent, so the interval
+#       only affects fetch traffic.
 #
 # INSTRUMENTS is a single comma-separated token, e.g. "EUR_USD,GBP_USD" (clap
 # splits it) or "all". Common options:
@@ -34,7 +42,7 @@ LOG_DIR="${HOME}/Library/Logs/wickd"
 die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
@@ -184,11 +192,49 @@ install_watch() {
         "__UNITS__=${units}"
 }
 
+# --- books sub-command --------------------------------------------------------
+install_books() {
+    local instruments="EUR_USD,GBP_USD,USD_JPY,USD_CHF,AUD_USD,USD_CAD,NZD_USD,EUR_GBP"
+    local interval="1200" env="practice" account="default" wickd="" dry="0"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interval) interval="$2"; shift 2 ;;
+            --env)      env="$2"; shift 2 ;;
+            --account)  account="$2"; shift 2 ;;
+            --wickd)    wickd="$2"; shift 2 ;;
+            --dry-run)  dry="1"; shift ;;
+            -h|--help)  usage 0 ;;
+            --*)        die "unknown option: $1" ;;
+            *)          instruments="$1"; shift ;;
+        esac
+    done
+    [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -gt 0 ]] \
+        || die "--interval must be a positive integer (seconds)"
+
+    local bin label dest template
+    bin="$(resolve_wickd "${wickd}")"
+    label="com.openthink.wickd-books"
+    dest="${LA_DIR}/${label}.plist"
+    template="${SCRIPT_DIR}/${label}.plist"
+
+    echo "books collector: ${bin} books ${instruments} --store --env ${env} --account ${account}"
+    echo "  every ${interval}s; logs: ${LOG_DIR}/books.{out,err}.log; store: ~/.wickd/books.db"
+    render_and_install "${template}" "${dest}" "${label}" "${dry}" \
+        "__WICKD_BIN__=${bin}" \
+        "__HOME__=${HOME}" \
+        "__LOG_DIR__=${LOG_DIR}" \
+        "__INSTRUMENTS__=${instruments}" \
+        "__INTERVAL__=${interval}" \
+        "__ENV__=${env}" \
+        "__ACCOUNT__=${account}"
+}
+
 # --- dispatch -----------------------------------------------------------------
 [[ $# -ge 1 ]] || usage 1
 case "$1" in
     stream) shift; install_stream "$@" ;;
     watch)  shift; install_watch "$@" ;;
+    books)  shift; install_books "$@" ;;
     -h|--help) usage 0 ;;
-    *)      die "unknown job kind '$1' (expected 'stream' or 'watch')" ;;
+    *)      die "unknown job kind '$1' (expected 'stream', 'watch', or 'books')" ;;
 esac

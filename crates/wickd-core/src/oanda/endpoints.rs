@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::models::{Trade, Position, Order, Candle};
 use super::client::OandaClient;
-use super::types::{TradesResponse, PositionsResponse, OrdersResponse, MarketOrderRequest, EntryOrderRequest, OrderCreateResponse, ClosePositionRequest, ClosePositionResponse, CandlesResponse, AutochartistResponse, InstrumentsResponse, OandaInstrument};
+use super::types::{TradesResponse, PositionsResponse, OrdersResponse, MarketOrderRequest, EntryOrderRequest, OrderCreateResponse, ClosePositionRequest, ClosePositionResponse, CandlesResponse, AutochartistResponse, InstrumentsResponse, OandaInstrument, OandaBook, OrderBookResponse, PositionBookResponse};
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -479,6 +479,57 @@ pub async fn get_candles_paginated(
     );
 
     Ok(all_candles)
+}
+
+/// Shared fetch for the two instrument book endpoints. OANDA publishes book
+/// snapshots on 20-minute boundaries; `time` (RFC3339) selects a historical
+/// snapshot, `None` returns the most recent one. A `time` that is not an
+/// exact snapshot boundary, or predates retention (~2018), comes back as an
+/// OANDA "snapshot does not exist" error via [`parse_response`].
+async fn get_book(
+    client: &OandaClient,
+    instrument: &str,
+    kind: &str,
+    time: Option<&str>,
+) -> Result<String> {
+    let mut url = format!(
+        "{}/v3/instruments/{}/{}",
+        client.base_url(),
+        instrument,
+        kind
+    );
+    if let Some(t) = time {
+        url.push_str(&format!("?time={}", t));
+    }
+    // No error_for_status(): OANDA answers a missing/misaligned snapshot with
+    // 404/400 plus an errorMessage body — parse_response surfaces that message
+    // instead of a bare HTTP status.
+    let response = client.get(&url).send().await?;
+    Ok(response.text().await?)
+}
+
+/// Fetch the client **order book** (pending orders bucketed by price) for an
+/// instrument — current snapshot, or the one at `time` when given.
+pub async fn get_order_book(
+    client: &OandaClient,
+    instrument: &str,
+    time: Option<&str>,
+) -> Result<OandaBook> {
+    let text = get_book(client, instrument, "orderBook", time).await?;
+    let parsed: OrderBookResponse = parse_response(&text)?;
+    Ok(parsed.order_book)
+}
+
+/// Fetch the client **position book** (open positions bucketed by price) for
+/// an instrument — current snapshot, or the one at `time` when given.
+pub async fn get_position_book(
+    client: &OandaClient,
+    instrument: &str,
+    time: Option<&str>,
+) -> Result<OandaBook> {
+    let text = get_book(client, instrument, "positionBook", time).await?;
+    let parsed: PositionBookResponse = parse_response(&text)?;
+    Ok(parsed.position_book)
 }
 
 /// Fetch Autochartist support/resistance signals from ForexLabs API
@@ -1036,6 +1087,106 @@ mod tests {
         assert_eq!(reject.cause(), "PRICE_PRECISION_EXCEEDED");
         assert!(result.order_fill_transaction.is_none());
         assert!(result.order_create_transaction.is_none());
+    }
+
+    fn mock_book_body(root: &str) -> serde_json::Value {
+        json!({
+            root: {
+                "instrument": "EUR_USD",
+                "time": "2026-07-11T18:00:00Z",
+                "unixTime": "1783792800",
+                "price": "1.14150",
+                "bucketWidth": "0.00050",
+                "buckets": [
+                    {"price": "1.14100", "longCountPercent": "0.6722", "shortCountPercent": "0.5418"},
+                    {"price": "1.14150", "longCountPercent": "0.1630", "shortCountPercent": "0.1505"}
+                ]
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_get_order_book_success() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v3/instruments/EUR_USD/orderBook"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_book_body("orderBook")))
+            .mount(&mock_server)
+            .await;
+
+        let book = get_order_book(&client, "EUR_USD", None).await.unwrap();
+        assert_eq!(book.instrument, "EUR_USD");
+        assert_eq!(book.time, "2026-07-11T18:00:00Z");
+        assert_eq!(book.bucket_width, "0.00050");
+        assert_eq!(book.buckets.len(), 2);
+        assert_eq!(book.buckets[0].long_count_percent, "0.6722");
+    }
+
+    #[tokio::test]
+    async fn test_get_position_book_with_time_param() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v3/instruments/EUR_USD/positionBook"))
+            .and(query_param("time", "2023-01-03T12:00:00Z"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_book_body("positionBook")))
+            .mount(&mock_server)
+            .await;
+
+        let book = get_position_book(&client, "EUR_USD", Some("2023-01-03T12:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(book.instrument, "EUR_USD");
+        assert_eq!(book.buckets.len(), 2);
+    }
+
+    // Older historical snapshots omit `unixTime`; the model must not require it.
+    #[tokio::test]
+    async fn test_get_order_book_historical_without_unix_time() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        let body = json!({
+            "orderBook": {
+                "instrument": "EUR_USD",
+                "time": "2018-06-01T12:00:00Z",
+                "price": "1.16740",
+                "bucketWidth": "0.00050",
+                "buckets": []
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path("/v3/instruments/EUR_USD/orderBook"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&mock_server)
+            .await;
+
+        let book = get_order_book(&client, "EUR_USD", None).await.unwrap();
+        assert_eq!(book.time, "2018-06-01T12:00:00Z");
+        assert!(book.buckets.is_empty());
+    }
+
+    // OANDA's "snapshot does not exist" error surfaces as Error::OandaApi.
+    #[tokio::test]
+    async fn test_get_order_book_missing_snapshot_error() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        let body = json!({
+            "errorMessage": "The snapshot for EUR_USD does not exist at the given time 2016-06-01T12:00:00Z."
+        });
+        Mock::given(method("GET"))
+            .and(path("/v3/instruments/EUR_USD/orderBook"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(body))
+            .mount(&mock_server)
+            .await;
+
+        let result = get_order_book(&client, "EUR_USD", Some("2016-06-01T12:00:00Z")).await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
     }
 
     #[tokio::test]

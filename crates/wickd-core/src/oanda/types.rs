@@ -693,6 +693,53 @@ pub struct ClosePositionResponse {
 }
 
 // ============================================================================
+// Order / Position Book Types (client sentiment snapshots)
+// ============================================================================
+
+/// `GET /v3/instruments/{instrument}/orderBook` response wrapper.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderBookResponse {
+    pub order_book: OandaBook,
+}
+
+/// `GET /v3/instruments/{instrument}/positionBook` response wrapper.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PositionBookResponse {
+    pub position_book: OandaBook,
+}
+
+/// One order- or position-book snapshot: OANDA's aggregate view of client
+/// orders/positions bucketed by price. Snapshots are published on 20-minute
+/// boundaries; historical snapshots are served via the `time` query parameter
+/// (verified reachable back to ~2018). NOTE: `unixTime` is absent on older
+/// historical snapshots, so it is not modelled — `time` (RFC3339) is the key.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OandaBook {
+    pub instrument: String,
+    /// Snapshot instant (RFC3339, always a 20-minute boundary).
+    pub time: String,
+    /// Instrument price at snapshot time (OANDA-precision string).
+    pub price: String,
+    /// Price width covered by each bucket (OANDA-precision string).
+    pub bucket_width: String,
+    #[serde(default)]
+    pub buckets: Vec<BookBucket>,
+}
+
+/// One price bucket of a book: the percentage of all client orders/positions
+/// (long and short) sitting in `[price, price + bucketWidth)`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookBucket {
+    pub price: String,
+    pub long_count_percent: String,
+    pub short_count_percent: String,
+}
+
+// ============================================================================
 // Instruments Types
 // ============================================================================
 

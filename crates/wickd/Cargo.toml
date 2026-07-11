@@ -46,6 +46,11 @@ uuid = { version = "1", features = ["v4"] }
 # `bundled` compiles SQLite in-tree so there is no system-sqlite dependency.
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# Book snapshot bucket arrays (~/.wickd/books.db) are stored gzip-compressed:
+# ~15-30KB of bucket JSON per snapshot compresses ~5x, and the collector
+# writes ~1k snapshots/day at the 20-minute native cadence.
+flate2 = "1"
+
 # Terminal dashboard (`wickd dashboard`, AGT-616): ratatui renders the live
 # watchlist table, crossterm drives raw mode / the alternate screen / key input.
 # ratatui 0.29 re-exports crossterm 0.28, so the versions stay in lockstep.
