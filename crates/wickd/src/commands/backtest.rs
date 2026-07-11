@@ -446,6 +446,13 @@ impl Strategy for StrategyRef<'_> {
     fn notify_position_closed(&mut self) {
         self.0.notify_position_closed()
     }
+    // Forward the ABI v5 position push. Without this the engine's per-candle
+    // sync lands on the trait's default no-op and every scripted
+    // `in_position()` / `entry_price()` / `bars_since_entry()` silently reads
+    // the flat sentinels for the whole backtest.
+    fn sync_position_state(&mut self, position: Option<wickd_core::backtest::PositionSnapshot>) {
+        self.0.sync_position_state(position)
+    }
     fn notify_entry_rejected(&mut self) {
         self.0.notify_entry_rejected()
     }
@@ -627,6 +634,39 @@ fn on_candle() {
             result.metrics.winning_trades + result.metrics.losing_trades
         );
         assert_eq!(result.trades.len(), result.metrics.total_trades as usize);
+    }
+
+    #[test]
+    fn scripted_v5_position_state_reaches_the_engine_through_strategy_ref() {
+        // Regression: StrategyRef (the newtype run_engine wraps every strategy
+        // in) must forward sync_position_state — before the fix it fell
+        // through to the trait's default no-op, so scripted in_position()/
+        // entry_price()/bars_since_entry() read flat sentinels for the whole
+        // CLI backtest and v5-gated exits could never fire. This script exits
+        // via a v5-gated rule; if the sentinels leak through, no trade ever
+        // closes and the assertion fails.
+        let script = TempScript::new(
+            r#"
+fn on_candle() {
+    if in_position() {
+        if entry_price() <= 0.0 { return #{ signal: "close", exit_reason: "bad-entry" }; }
+        if bars_since_entry() >= 3 { return #{ signal: "close", exit_reason: "v5-bars" }; }
+        return "hold";
+    }
+    if bar_count() == 1 { return "buy"; }
+    "hold"
+}
+"#,
+        );
+        let args = backtest_args(script.0.to_str().unwrap());
+        let (mut strategy, _params) = build_strategy(&args).unwrap();
+        let config = build_config(&args).unwrap();
+        let candles = sample_candles();
+
+        let result = run_engine(strategy.as_mut(), config, &candles);
+
+        assert_eq!(result.trades.len(), 1, "v5 exit never fired: {:?}", result.trades);
+        assert_eq!(result.trades[0].exit_reason.as_deref(), Some("v5-bars"));
     }
 
     #[test]
