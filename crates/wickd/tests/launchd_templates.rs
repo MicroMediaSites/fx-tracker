@@ -191,3 +191,65 @@ fn uninstall_script_handles_stream_watch_and_all() {
         assert!(mode & 0o111 != 0, "uninstall.sh is not executable (mode {mode:o})");
     }
 }
+
+// --- Candle watchdog: the external liveness check ----------------------------
+
+#[test]
+fn watchdog_template_is_a_readonly_periodic_oneshot() {
+    let t = read("com.openthink.wickd-watchdog.plist");
+
+    assert!(
+        t.contains("<string>com.openthink.wickd-watchdog</string>"),
+        "watchdog label"
+    );
+    assert!(t.contains("<string>/usr/bin/python3</string>"), "runs via system python3");
+    assert!(t.contains("<string>__SCRIPT__</string>"), "script path placeholder");
+    assert!(t.contains("<string>--grace</string>"), "threads --grace");
+    assert!(t.contains("<string>--realert</string>"), "threads --realert");
+
+    // Periodic one-shot like the books collector: interval + run-at-load,
+    // and NO KeepAlive — exit 1 (problems found) is normal operation, the
+    // next StartInterval firing is the retry.
+    assert!(t.contains("<key>StartInterval</key>"), "fires on an interval");
+    assert!(t.contains("<key>RunAtLoad</key>"), "checks once at login");
+    assert!(!t.contains("<key>KeepAlive</key>"), "one-shot must not be kept alive");
+
+    assert!(t.contains("watchdog.out.log") && t.contains("watchdog.err.log"), "log filenames");
+
+    let rendered = render(
+        &t,
+        &[
+            (
+                "__SCRIPT__",
+                "/Users/tester/Library/Application Support/wickd-watchdog/wickd-candle-watchdog.py",
+            ),
+            ("__HOME__", "/Users/tester"),
+            ("__LOG_DIR__", "/Users/tester/Library/Logs/wickd"),
+            ("__INTERVAL__", "300"),
+            ("__GRACE__", "1200"),
+            ("__REALERT__", "3600"),
+        ],
+    );
+    assert_plutil_valid(&rendered, "watchdog");
+}
+
+#[test]
+fn install_and_uninstall_scripts_cover_the_watchdog() {
+    let i = read("install.sh");
+    assert!(i.contains("install_watchdog"), "install.sh has a watchdog installer");
+    assert!(i.contains("wickd-candle-watchdog.py"), "install.sh copies the script");
+
+    let u = read("uninstall.sh");
+    assert!(u.contains("com.openthink.wickd-watchdog"), "uninstall.sh removes the watchdog");
+
+    // The watchdog script itself ships in the deploy dir and is executable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(deploy_dir().join("wickd-candle-watchdog.py"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert!(mode & 0o111 != 0, "wickd-candle-watchdog.py is not executable (mode {mode:o})");
+    }
+}

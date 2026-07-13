@@ -20,6 +20,7 @@ automatically, restart on crash, and survive reboots (AGT-629).
 | **Stream hub** (singleton) | `com.openthink.wickd-stream` | `wickd stream <instruments> --env <e> --account <a>` |
 | **Autonomous watcher** (one per strategy) | `com.openthink.wickd-watch.<slug>` | `wickd watch <strategy> <instruments> --granularity <g> --env practice --account <a> --units <n> --auto` |
 | **Books collector** (singleton, periodic one-shot) | `com.openthink.wickd-books` | `wickd books <instruments> --store --env <e> --account <a>` every `StartInterval` seconds |
+| **Candle watchdog** (singleton, periodic one-shot) | `com.openthink.wickd-watchdog` | `python3 wickd-candle-watchdog.py --grace <s> --realert <s>` every `StartInterval` seconds |
 
 **The books collector is not a daemon.** launchd fires it on an interval
 (default 1200s — OANDA's 20-minute book-snapshot cadence), it appends any new
@@ -128,6 +129,9 @@ cd crates/wickd/deploy/launchd
 # 3) The books collector (once). Basket defaults to the 8 USD majors + crosses;
 #    interval defaults to 1200s. Override either: ./install.sh books "EUR_USD" --interval 3600
 ./install.sh books
+
+# 4) The candle watchdog (once). Checks every installed watch job every 300s.
+./install.sh watchdog
 ```
 
 `INSTRUMENTS` is a single comma-separated token (`clap` splits it) or `all`.
@@ -141,6 +145,31 @@ job on a machine you don't want to load it on:
 
 ```sh
 ./install.sh watch rsi "EUR_USD" --account h004 --wickd /usr/local/bin/wickd --dry-run
+```
+
+### Candle watchdog
+
+`install.sh watchdog` installs the **external liveness check** for every
+`com.openthink.wickd-watch.*` job on the box. Motivation: a watcher attached
+to a stream hub that wedges (socket open, no ticks) keeps running and
+heartbeating while processing **no candles at all** — observed 2026-07-09..13,
+when two watchers sat blind for three days. `TickStreamSource` now has an
+in-process REST fallback for exactly that case; the watchdog is the external
+belt to those braces, and it also catches a watch job vanishing from launchd
+entirely.
+
+Every `--interval` (default 300s) it reads each watch job's plist +
+`watch.<slug>.out.log`, computes which bar closes should have been processed
+by now (`dailyAlignment=2` UTC boundaries, skipping the weekend
+market-closed window Fri 20:00Z → Sun 22:30Z), and posts a **macOS
+notification** when a close is more than `--grace` (default 1200s) overdue or
+a job is unloaded. Repeat alerts for one continuing stall are throttled to
+one per `--realert` (default 3600s); a new missed close always alerts
+immediately. State lives in `~/Library/Application Support/wickd-watchdog/`
+— never in `~/.wickd`. Run it by hand anytime:
+
+```sh
+python3 wickd-candle-watchdog.py --dry-run   # report only, no notification
 ```
 
 ### Scripted strategies (`--set` overrides)

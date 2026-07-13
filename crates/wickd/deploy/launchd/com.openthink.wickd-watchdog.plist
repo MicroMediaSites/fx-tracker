@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for the wickd candle watchdog — the EXTERNAL liveness check for
+  every com.openthink.wickd-watch.* job on this box. A watcher attached to a
+  wedged stream hub keeps running (and heartbeating) while processing no
+  candles at all — observed 2026-07-09..13, three days blind. This job is the
+  belt to the in-process REST-fallback braces: every StartInterval seconds it
+  compares each watcher's newest logged `watcher-tick` against the bar closes
+  that should have happened by now (dailyAlignment=2, UTC), skipping the
+  weekend market-closed window, and raises a macOS notification when a close
+  went unprocessed or a watch job is no longer loaded.
+
+  Singleton: label com.openthink.wickd-watchdog. Like the books collector this
+  is a periodic ONE-SHOT, not a daemon: launchd fires the python script, it
+  checks, notifies if needed, and exits. Exit 1 (problems found) is normal
+  operation, so no KeepAlive — the next StartInterval firing is the retry.
+
+  READ-ONLY: it reads LaunchAgents plists + watcher logs and talks to
+  launchctl/osascript. It never touches ~/.wickd — its own state lives in
+  ~/Library/Application Support/wickd-watchdog/.
+
+  install.sh copies wickd-candle-watchdog.py to __SCRIPT__ and renders this
+  template. See README.md ("Candle watchdog") for install / verify /
+  uninstall steps.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openthink.wickd-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>__SCRIPT__</string>
+        <string>--grace</string>
+        <string>__GRACE__</string>
+        <string>--realert</string>
+        <string>__REALERT__</string>
+    </array>
+
+    <!-- Check once at load (login), then every __INTERVAL__ seconds. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>__INTERVAL__</integer>
+
+    <!-- Background service: lower scheduling priority, no UI beyond the
+         notification it posts. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/watchdog.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/watchdog.err.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
