@@ -2,7 +2,7 @@
 #
 # Install a wickd LaunchAgent (macOS) — AGT-629.
 #
-# Three job kinds:
+# Four job kinds:
 #
 #   install.sh stream [INSTRUMENTS] [--env ENV] [--account NAME] [--wickd PATH] [--dry-run]
 #       Supervise the `wickd stream` socket hub — one OANDA subscription fanned
@@ -24,6 +24,15 @@
 #       20-minute snapshot cadence); the store is idempotent, so the interval
 #       only affects fetch traffic.
 #
+#   install.sh watchdog [--interval SECS] [--grace SECS] [--realert SECS] [--dry-run]
+#       Periodic one-shot candle watchdog: checks every installed
+#       com.openthink.wickd-watch.* job for bar closes that went unprocessed
+#       (and for the job vanishing from launchd) and posts a macOS
+#       notification when a watcher has gone blind. Singleton: label
+#       com.openthink.wickd-watchdog. Defaults: --interval 300, --grace 1200,
+#       --realert 3600. Copies wickd-candle-watchdog.py to
+#       ~/Library/Application Support/wickd-watchdog/.
+#
 # INSTRUMENTS is a single comma-separated token, e.g. "EUR_USD,GBP_USD" (clap
 # splits it) or "all". Common options:
 #   --wickd PATH   absolute path to the wickd binary (default: resolve from PATH)
@@ -42,7 +51,7 @@ LOG_DIR="${HOME}/Library/Logs/wickd"
 die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,43p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
@@ -229,12 +238,57 @@ install_books() {
         "__ACCOUNT__=${account}"
 }
 
+# --- watchdog sub-command -------------------------------------------------------
+install_watchdog() {
+    local interval="300" grace="1200" realert="3600" dry="0"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interval) interval="$2"; shift 2 ;;
+            --grace)    grace="$2"; shift 2 ;;
+            --realert)  realert="$2"; shift 2 ;;
+            --dry-run)  dry="1"; shift ;;
+            -h|--help)  usage 0 ;;
+            *)          die "unknown option: $1" ;;
+        esac
+    done
+    local n
+    for n in interval grace realert; do
+        [[ "${!n}" =~ ^[0-9]+$ && "${!n}" -gt 0 ]] \
+            || die "--${n} must be a positive integer (seconds)"
+    done
+
+    local label dest template script_src script_dest
+    label="com.openthink.wickd-watchdog"
+    dest="${LA_DIR}/${label}.plist"
+    template="${SCRIPT_DIR}/${label}.plist"
+    script_src="${SCRIPT_DIR}/wickd-candle-watchdog.py"
+    script_dest="${HOME}/Library/Application Support/wickd-watchdog/wickd-candle-watchdog.py"
+    [[ -f "${script_src}" ]] || die "missing ${script_src}"
+
+    echo "candle watchdog: python3 ${script_dest} --grace ${grace} --realert ${realert}"
+    echo "  every ${interval}s; logs: ${LOG_DIR}/watchdog.{out,err}.log; alerts via macOS notifications"
+    if [[ "${dry}" != "1" ]]; then
+        mkdir -p "$(dirname "${script_dest}")"
+        cp "${script_src}" "${script_dest}"
+        chmod 755 "${script_dest}"
+        echo "installed ${script_dest}"
+    fi
+    render_and_install "${template}" "${dest}" "${label}" "${dry}" \
+        "__SCRIPT__=${script_dest}" \
+        "__HOME__=${HOME}" \
+        "__LOG_DIR__=${LOG_DIR}" \
+        "__INTERVAL__=${interval}" \
+        "__GRACE__=${grace}" \
+        "__REALERT__=${realert}"
+}
+
 # --- dispatch -----------------------------------------------------------------
 [[ $# -ge 1 ]] || usage 1
 case "$1" in
-    stream) shift; install_stream "$@" ;;
-    watch)  shift; install_watch "$@" ;;
-    books)  shift; install_books "$@" ;;
+    stream)   shift; install_stream "$@" ;;
+    watch)    shift; install_watch "$@" ;;
+    books)    shift; install_books "$@" ;;
+    watchdog) shift; install_watchdog "$@" ;;
     -h|--help) usage 0 ;;
-    *)      die "unknown job kind '$1' (expected 'stream', 'watch', or 'books')" ;;
+    *)      die "unknown job kind '$1' (expected 'stream', 'watch', 'books', or 'watchdog')" ;;
 esac

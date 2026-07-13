@@ -5,6 +5,7 @@
 #   uninstall.sh stream                    stop + remove the stream-hub job
 #   uninstall.sh watch SLUG                stop + remove one watcher job
 #   uninstall.sh books                     stop + remove the books collector
+#   uninstall.sh watchdog                  stop + remove the candle watchdog
 #   uninstall.sh --all [--purge-logs]      stop + remove EVERY wickd job
 #
 # Logs under ~/Library/Logs/wickd are left in place unless --purge-logs is
@@ -20,7 +21,7 @@ DOMAIN="gui/$(id -u)"
 die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
@@ -67,6 +68,12 @@ case "$1" in
         remove_label "com.openthink.wickd-books"
         purge_logs_if_asked "${2:-}"
         ;;
+    watchdog)
+        remove_label "com.openthink.wickd-watchdog"
+        rm -rf "${HOME}/Library/Application Support/wickd-watchdog"
+        echo "removed ${HOME}/Library/Application Support/wickd-watchdog"
+        purge_logs_if_asked "${2:-}"
+        ;;
     --all)
         # Enumerate loaded wickd jobs, plus any installed plists not currently loaded.
         labels="$(
@@ -86,5 +93,5 @@ case "$1" in
         purge_logs_if_asked "${2:-}"
         ;;
     -h|--help) usage 0 ;;
-    *) die "unknown target '$1' (expected 'stream', 'watch SLUG', 'books', or '--all')" ;;
+    *) die "unknown target '$1' (expected 'stream', 'watch SLUG', 'books', 'watchdog', or '--all')" ;;
 esac
