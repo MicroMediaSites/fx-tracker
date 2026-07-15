@@ -855,6 +855,7 @@ impl StrategyWatcher {
             candle_time: candle.time.to_rfc3339(),
             close_price: candle.mid.close.to_string(),
             signal_result: signal_result.clone(),
+            backfill: false,
         };
         sink.watcher_tick(&tick_event);
 

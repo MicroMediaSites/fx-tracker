@@ -250,7 +250,7 @@ async fn watch(args: WatchArgs) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
 
     let mut watcher = MultiInstrumentWatcher::new(
-        watcher_id,
+        watcher_id.clone(),
         format!("wickd-watch-{}", resolved.label),
         resolved.label.clone(),
         resolved.definition,
@@ -261,6 +261,20 @@ async fn watch(args: WatchArgs) -> Result<()> {
         command_rx,
         stop.clone(),
     );
+
+    // Restart backfill: attach the durable candle ledger so candles that
+    // close while the process is down (machine shutdown, crash) are replayed
+    // and evaluated at the next startup instead of silently skipped. An
+    // unopenable ledger degrades to the historical skip-the-gap behavior —
+    // it must never stop the watcher.
+    match wickd_core::strategy::WatchStateStore::default_dir()
+        .and_then(|dir| wickd_core::strategy::WatchStateStore::open(&dir, &watcher_id))
+    {
+        Ok(store) => watcher.set_state_store(store),
+        Err(e) => eprintln!(
+            "wickd watch: watch-state ledger unavailable ({e}) — restart backfill disabled"
+        ),
+    }
 
     // Scripted watch (AGT-624): hand the validated `--set` overrides to the
     // watcher (AC2) and inject each instrument's event calendar so ABI v3

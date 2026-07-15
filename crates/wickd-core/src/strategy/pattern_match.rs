@@ -309,6 +309,11 @@ pub struct WatcherTickEvent {
     pub candle_time: String,
     pub close_price: String,
     pub signal_result: String,
+    /// True when this candle closed while the watcher was down and is being
+    /// replayed at startup. Omitted (not `false`) on live ticks so existing
+    /// NDJSON consumers see byte-identical events.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub backfill: bool,
 }
 
 // Type aliases for backwards compatibility during migration

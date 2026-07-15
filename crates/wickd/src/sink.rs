@@ -461,6 +461,7 @@ mod tests {
             candle_time: "2024-01-01T00:00:00+00:00".to_string(),
             close_price: "1.0850".to_string(),
             signal_result: "Hold".to_string(),
+            backfill: false,
         };
         let line = SignalSink::render("watcher-tick", &event).expect("line");
         let v: Value = serde_json::from_str(&line).expect("valid json");

@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -35,11 +36,19 @@ use super::pattern_match::{
     MatchType as SignalType, MatchStatus as SignalStatus,
     MatchStatusUpdateEvent as SignalStatusUpdateEvent,
 };
+use super::watch_state::WatchStateStore;
 use super::watcher::ExecutionMode;
 use crate::event_sink::EventSink;
 
 /// Default number of candles before a signal expires
 const DEFAULT_SIGNAL_TTL_CANDLES: u32 = 3;
+
+/// Ceiling on how many missed candles are rule-evaluated at startup
+/// (see [`MultiInstrumentWatcher::backfill_instrument`]). Candles beyond
+/// this — a multi-day outage — are indicator warmup material again:
+/// rule-evaluating a long stale stretch would only produce noise, and the
+/// truncation is reported, never silent.
+const MAX_BACKFILL_CANDLES: usize = 24;
 
 /// Commands that can be sent to a running watcher
 #[derive(Debug)]
@@ -86,7 +95,6 @@ use super::watcher::StrategyExecutor;
 /// State for a single instrument within the multi-watcher
 struct InstrumentState {
     /// Instrument name (e.g., "EUR_USD")
-    #[allow(dead_code)]
     instrument: String,
     /// Candle data source for this instrument
     candle_source: Box<dyn CandleSource>,
@@ -94,6 +102,11 @@ struct InstrumentState {
     executor: StrategyExecutor,
     /// Pending signals that haven't been executed yet
     pending_signals: Vec<PendingSignal>,
+    /// Candles that closed while the previous watcher process was down,
+    /// stashed by [`Self::warmup`] for the startup backfill replay
+    /// (never fed to `warmup_candle` — each candle advances the executor
+    /// exactly once).
+    pending_backfill: Vec<Candle>,
     /// Whether this instrument has been initialized (warmup complete)
     initialized: bool,
     /// Consecutive error count for this instrument
@@ -158,25 +171,73 @@ impl InstrumentState {
             candle_source,
             executor,
             pending_signals: Vec::new(),
+            pending_backfill: Vec::new(),
             initialized: false,
             consecutive_errors: 0,
             signal_filter,
         })
     }
 
-    /// Warm up the instrument with historical candles
-    async fn warmup(&mut self, warmup_candles: u32) -> Result<()> {
-        let candles = self.candle_source.get_candles(warmup_candles).await?;
+    /// Warm up the instrument with historical candles.
+    ///
+    /// `cutoff` is the last candle this instrument evaluated before the
+    /// previous process died (from the [`WatchStateStore`] ledger). Candles
+    /// at or before it are warmup material; candles after it were never
+    /// rule-evaluated, so they are stashed in `pending_backfill` for the
+    /// startup replay instead of being fed here — feeding *and* replaying
+    /// would advance the executor's indicators twice on the same candle.
+    ///
+    /// Returns the newest candle time covered by warmup, so a fresh start
+    /// (no ledger entry) can seed the ledger without waiting for a tick.
+    async fn warmup(
+        &mut self,
+        warmup_candles: u32,
+        cutoff: Option<DateTime<Utc>>,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let mut candles = self.candle_source.get_candles(warmup_candles).await?;
+        candles.sort_by_key(|c| c.time);
+
+        let mut missed: Vec<Candle> = Vec::new();
+        if let Some(cutoff) = cutoff {
+            let split = candles.partition_point(|c| c.time <= cutoff);
+            missed = candles.split_off(split);
+        }
+
+        // A very long outage is warmup material again for all but the newest
+        // candles — rule-evaluating a week of stale candles produces noise.
+        if missed.len() > MAX_BACKFILL_CANDLES {
+            let overflow = missed.len() - MAX_BACKFILL_CANDLES;
+            warn!(
+                "[{}] outage gap of {} candles exceeds the {}-candle replay cap — the oldest {} are warmup-only (not rule-evaluated)",
+                self.instrument,
+                missed.len(),
+                MAX_BACKFILL_CANDLES,
+                overflow
+            );
+            candles.extend(missed.drain(..overflow));
+        }
 
         for candle in &candles {
             self.executor.warmup_candle(candle);
         }
 
-        // Prime the candle source
-        let _ = self.candle_source.get_latest_candle().await?;
+        // Prime the candle source. A candle that closed between the warmup
+        // fetch and now would be swallowed unevaluated — when we have a
+        // ledger to compare against, append it to the replay set instead.
+        let primed = self.candle_source.get_latest_candle().await?;
+        if let (Some(c), Some(cutoff)) = (primed, cutoff) {
+            let newest_known = missed
+                .last()
+                .map(|m| m.time)
+                .or_else(|| candles.last().map(|k| k.time));
+            if c.complete && c.time > cutoff && newest_known.is_none_or(|t| c.time > t) {
+                missed.push(c);
+            }
+        }
 
+        self.pending_backfill = missed;
         self.initialized = true;
-        Ok(())
+        Ok(candles.last().map(|c| c.time))
     }
 
     /// Get the latest candle if available
@@ -322,6 +383,12 @@ pub struct MultiInstrumentWatcher {
     /// legs become that instance's default filter). Set via
     /// [`Self::set_script_surprise_calendar`] BEFORE instruments are added.
     script_surprise_calendar: Option<SurpriseCalendar>,
+    /// Durable per-instrument candle-progress ledger. When set, every
+    /// evaluated candle is recorded, and startup replays candles that closed
+    /// while the previous process was down (see
+    /// [`Self::backfill_instrument`]). `None` preserves the historical
+    /// behavior: restarts resume at the current candle, skipping the gap.
+    state_store: Option<WatchStateStore>,
 }
 
 impl MultiInstrumentWatcher {
@@ -360,7 +427,17 @@ impl MultiInstrumentWatcher {
             script_params: HashMap::new(),
             script_event_calendars: HashMap::new(),
             script_surprise_calendar: None,
+            state_store: None,
         }
+    }
+
+    /// Attach the durable candle-progress ledger, enabling restart backfill:
+    /// every evaluated candle is recorded, and the next startup replays the
+    /// candles that closed while this process was down. Call BEFORE
+    /// [`Self::start`]; without it, restarts skip the gap (the historical
+    /// behavior).
+    pub fn set_state_store(&mut self, store: WatchStateStore) {
+        self.state_store = Some(store);
     }
 
     /// Whether this watcher hosts a scripted (Rhai) strategy. Every instrument
@@ -795,10 +872,22 @@ impl MultiInstrumentWatcher {
                         self.watcher_id, instrument, warmup_candles
                     );
 
+                    // Last evaluated candle from the previous process, if a
+                    // ledger is attached — candles after it become the
+                    // startup backfill instead of warmup material.
+                    let cutoff = self
+                        .state_store
+                        .as_ref()
+                        .and_then(|s| s.last_evaluated(&instrument));
+
                     // Warmup and capture any error
+                    let mut covered: Option<DateTime<Utc>> = None;
                     let warmup_error: Option<String> = if let Some(state) = self.instruments.get_mut(&instrument) {
-                        match state.warmup(warmup_candles).await {
-                            Ok(()) => None,
+                        match state.warmup(warmup_candles, cutoff).await {
+                            Ok(t) => {
+                                covered = t;
+                                None
+                            }
                             Err(e) => {
                                 warn!(
                                     "[MultiWatcher {}] Failed to warm up {}: {}",
@@ -812,6 +901,13 @@ impl MultiInstrumentWatcher {
                     } else {
                         None
                     };
+
+                    // Seed the ledger with the newest warmup-covered candle so
+                    // a crash before the first tick still leaves a resume
+                    // point (no-op when the ledger is already further along).
+                    if let (Some(store), Some(t)) = (self.state_store.as_mut(), covered) {
+                        store.record(&instrument, t);
+                    }
 
                     // Emit error after releasing the mutable borrow
                     if let Some(error_msg) = warmup_error {
@@ -830,15 +926,26 @@ impl MultiInstrumentWatcher {
     async fn warmup_single(&mut self, sink: &dyn EventSink, instrument: &str) {
         let warmup_candles = self.warmup_candles;
 
+        // Last evaluated candle from the previous process, if a ledger is
+        // attached (see warmup_all).
+        let cutoff = self
+            .state_store
+            .as_ref()
+            .and_then(|s| s.last_evaluated(instrument));
+
         // Warmup and capture any error
+        let mut covered: Option<DateTime<Utc>> = None;
         let warmup_error: Option<String> = if let Some(state) = self.instruments.get_mut(instrument) {
             info!(
                 "[MultiWatcher {}] Warming up {} with {} candles",
                 self.watcher_id, instrument, warmup_candles
             );
 
-            match state.warmup(warmup_candles).await {
-                Ok(()) => None,
+            match state.warmup(warmup_candles, cutoff).await {
+                Ok(t) => {
+                    covered = t;
+                    None
+                }
                 Err(e) => {
                     warn!(
                         "[MultiWatcher {}] Failed to warm up {}: {}",
@@ -851,9 +958,23 @@ impl MultiInstrumentWatcher {
             None
         };
 
+        // Seed the ledger with the newest warmup-covered candle (see warmup_all).
+        if let (Some(store), Some(t)) = (self.state_store.as_mut(), covered) {
+            store.record(instrument, t);
+        }
+
         // Emit error after releasing the mutable borrow
         if let Some(error_msg) = warmup_error {
             self.emit_instrument_error(sink, instrument, "warmup_failed", &error_msg);
+        }
+
+        // An instrument added mid-run replays any gap right away — its
+        // initial-evaluation slot has already passed.
+        if let Err(e) = self.backfill_instrument(sink, instrument).await {
+            warn!(
+                "[MultiWatcher {}] Backfill failed for {}: {}",
+                self.watcher_id, instrument, e
+            );
         }
     }
 
@@ -881,7 +1002,21 @@ impl MultiInstrumentWatcher {
                     return;
                 }
 
-                if let Err(e) = self.evaluate_instrument_initial(sink, &instrument).await {
+                // A restart gap stashed by warmup takes the initial-evaluation
+                // slot: the replay's newest candle IS the current market
+                // state, so running both would evaluate it twice.
+                let has_backfill = self
+                    .instruments
+                    .get(&instrument)
+                    .is_some_and(|s| !s.pending_backfill.is_empty());
+
+                let result = if has_backfill {
+                    self.backfill_instrument(sink, &instrument).await
+                } else {
+                    self.evaluate_instrument_initial(sink, &instrument).await
+                };
+
+                if let Err(e) = result {
                     warn!(
                         "[MultiWatcher {}] Initial evaluation failed for {}: {}",
                         self.watcher_id, instrument, e
@@ -979,6 +1114,135 @@ impl MultiInstrumentWatcher {
                     state.add_pending_signal(strategy_signal.clone());
                 }
                 self.emit_signal(sink, strategy_signal);
+            }
+        }
+
+        // Record progress so a restart resumes from here, not from wherever
+        // the last tick happened to be.
+        if let Some(store) = self.state_store.as_mut() {
+            store.record(instrument, candle.time);
+        }
+
+        Ok(())
+    }
+
+    /// Replay candles that closed while the watcher process was down.
+    ///
+    /// Runs once per instrument at startup (taking the initial-evaluation
+    /// slot) whenever the [`WatchStateStore`] ledger shows a gap between the
+    /// last evaluated candle and now. Every replayed candle goes through the
+    /// normal evaluation path and is emitted as a `backfill: true`
+    /// watcher-tick, so the NDJSON record has no silent hole.
+    ///
+    /// Signal policy for replayed candles:
+    /// - The NEWEST candle behaves exactly like the regular initial
+    ///   evaluation — it is the current market state, and its signal emits
+    ///   normally (tradeable under `--auto`).
+    /// - An interior Entry is STALE — the market has already moved past its
+    ///   close — so it is surfaced as a `missed_signal` strategy-error
+    ///   instead of a tradeable signal.
+    /// - Interior Exit/PartialExit signals emit normally: acting late on an
+    ///   exit is strictly safer than never acting on it.
+    async fn backfill_instrument(&mut self, sink: &dyn EventSink, instrument: &str) -> Result<()> {
+        let candles = {
+            let state = self.instruments.get_mut(instrument).ok_or_else(|| {
+                crate::error::Error::Strategy(format!("Instrument {} not found", instrument))
+            })?;
+            std::mem::take(&mut state.pending_backfill)
+        };
+
+        let Some(last) = candles.last() else {
+            return Ok(()); // no gap — nothing to replay
+        };
+
+        info!(
+            "[MultiWatcher {}] {} replaying {} candle(s) that closed while the watcher was down: {} .. {}",
+            self.watcher_id,
+            instrument,
+            candles.len(),
+            candles[0].time,
+            last.time
+        );
+
+        // One position fetch for the whole replay — same source of truth the
+        // regular tick path uses.
+        self.refresh_position_cache().await?;
+        let position_direction = self.get_cached_position(instrument);
+
+        let last_idx = candles.len() - 1;
+        for (idx, candle) in candles.iter().enumerate() {
+            let is_newest = idx == last_idx;
+
+            let (signal, indicator_snapshot, health_event) = {
+                let state = self.instruments.get_mut(instrument).unwrap();
+                let (signal, snapshot) = state.evaluate_candle(candle, position_direction);
+                let health_event = state.executor.take_health_event();
+                (signal, snapshot, health_event)
+            };
+
+            if let Some(reason) = health_event {
+                self.emit_instrument_error(sink, instrument, "script_aborted", &reason);
+            }
+
+            let signal_result = match &signal {
+                RulesSignal::Hold => "Hold".to_string(),
+                RulesSignal::Entry { direction, .. } => format!("Entry {:?}", direction),
+                RulesSignal::Exit { .. } => "Exit".to_string(),
+                RulesSignal::PartialExit { .. } => "PartialExit".to_string(),
+            };
+
+            sink.watcher_tick(&WatcherTickEvent {
+                config_id: format!("{}_{}", self.watcher_id, instrument),
+                instrument: instrument.to_string(),
+                timeframe: self.timeframe.to_string(),
+                candle_time: candle.time.to_rfc3339(),
+                close_price: candle.mid.close.to_string(),
+                signal_result: signal_result.clone(),
+                backfill: true,
+            });
+
+            let stale_entry = !is_newest && matches!(signal, RulesSignal::Entry { .. });
+            if stale_entry {
+                warn!(
+                    "[MultiWatcher {}] {} missed {} at candle {} (watcher was down) — reported, not emitted",
+                    self.watcher_id, instrument, signal_result, candle.time
+                );
+                self.emit_instrument_error(
+                    sink,
+                    instrument,
+                    "missed_signal",
+                    &format!(
+                        "{} on backfilled candle {} (closed while the watcher was down) — stale, not emitted as tradeable",
+                        signal_result,
+                        candle.time.to_rfc3339()
+                    ),
+                );
+            } else if let Some(strategy_signal) = self
+                .create_signal(&signal, position_direction, candle, Some(indicator_snapshot), instrument)
+                .await
+            {
+                // Same filter-before-track discipline as the live tick path (BUG-062).
+                let signal_filter = self
+                    .instruments
+                    .get(&strategy_signal.instrument)
+                    .map(|state| state.signal_filter.clone())
+                    .unwrap_or_else(|| "all".to_string());
+
+                if !self.should_emit_signal(&strategy_signal, &signal_filter) {
+                    info!(
+                        "[MultiWatcher {}] Backfill signal filtered out for {}, signal_filter='{}': {:?} {:?}",
+                        self.watcher_id, instrument, signal_filter, strategy_signal.match_type, strategy_signal.direction
+                    );
+                } else {
+                    if let Some(state) = self.instruments.get_mut(instrument) {
+                        state.add_pending_signal(strategy_signal.clone());
+                    }
+                    self.emit_signal(sink, strategy_signal);
+                }
+            }
+
+            if let Some(store) = self.state_store.as_mut() {
+                store.record(instrument, candle.time);
             }
         }
 
@@ -1082,8 +1346,15 @@ impl MultiInstrumentWatcher {
             candle_time: candle.time.to_rfc3339(),
             close_price: candle.mid.close.to_string(),
             signal_result: signal_result.clone(),
+            backfill: false,
         };
         sink.watcher_tick(&tick_event);
+
+        // Record progress so a restart replays exactly the candles after
+        // this one (restart backfill), instead of skipping the gap.
+        if let Some(store) = self.state_store.as_mut() {
+            store.record(instrument, candle.time);
+        }
 
         // Create and emit signal if applicable
         if let Some(strategy_signal) = self.create_signal(
@@ -1852,5 +2123,235 @@ fn on_candle() {
                 close: dec!(1.0855),
             },
         }
+    }
+
+    // ---- restart backfill (watch-state ledger) ----
+
+    fn candle_at(rfc3339: &str) -> Candle {
+        let mut c = test_candle();
+        c.time = DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc);
+        c
+    }
+
+    /// Offline source with a fixed history — lets warmup tests control
+    /// exactly which candles exist.
+    struct FixedHistorySource {
+        history: Vec<Candle>,
+    }
+
+    impl CandleSource for FixedHistorySource {
+        fn get_latest_candle(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = crate::error::Result<Option<Candle>>> + Send + '_>>
+        {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn get_candles(
+            &self,
+            _count: u32,
+        ) -> Pin<Box<dyn Future<Output = crate::error::Result<Vec<Candle>>> + Send + '_>> {
+            let history = self.history.clone();
+            Box::pin(async move { Ok(history) })
+        }
+
+        fn timeframe(&self) -> Granularity {
+            Granularity::H1
+        }
+
+        fn instrument(&self) -> &str {
+            "EUR_USD"
+        }
+
+        fn poll_interval(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+    }
+
+    /// Sink that records every event category the backfill touches.
+    #[derive(Default)]
+    struct RecordingSink {
+        ticks: std::sync::Mutex<Vec<WatcherTickEvent>>,
+        errors: std::sync::Mutex<Vec<StrategyErrorEvent>>,
+        signals: std::sync::Mutex<Vec<StrategySignalEvent>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn pattern_matched(&self, event: &StrategySignalEvent) {
+            self.signals.lock().unwrap().push(event.clone());
+        }
+        fn strategy_status(&self, _event: &StrategyStatusEvent) {}
+        fn strategy_error(&self, event: &StrategyErrorEvent) {
+            self.errors.lock().unwrap().push(event.clone());
+        }
+        fn match_status_update(&self, _event: &SignalStatusUpdateEvent) {}
+        fn watcher_tick(&self, event: &WatcherTickEvent) {
+            self.ticks.lock().unwrap().push(event.clone());
+        }
+        fn price_update(&self, _event: &crate::oanda::streaming::PriceUpdate) {}
+        fn stream_error(&self, _event: &crate::oanda::streaming::StreamError) {}
+        fn stream_health(&self, _event: &crate::oanda::streaming::StreamHealthStatus) {}
+    }
+
+    const ALWAYS_BUY_SCRIPT: &str = r#"
+fn on_candle() {
+    "buy"
+}
+"#;
+
+    fn hourly_candles(n: usize) -> Vec<Candle> {
+        (0..n)
+            .map(|i| candle_at(&format!("2026-07-14T{:02}:00:00Z", i)))
+            .collect()
+    }
+
+    async fn instrument_state_with_history(history: Vec<Candle>) -> InstrumentState {
+        InstrumentState::new(
+            "EUR_USD".to_string(),
+            Box::new(FixedHistorySource { history }),
+            &definition("scripted", Some(ALWAYS_BUY_SCRIPT)),
+            Vec::new(),
+            "all".to_string(),
+            "H1",
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    // No ledger entry (fresh start): everything is warmup, nothing to replay —
+    // the pre-ledger behavior, unchanged.
+    #[tokio::test]
+    async fn warmup_without_cutoff_stashes_no_backfill() {
+        let mut state = instrument_state_with_history(hourly_candles(6)).await;
+        let covered = state.warmup(100, None).await.unwrap();
+        assert!(state.pending_backfill.is_empty());
+        assert_eq!(covered, Some(candle_at("2026-07-14T05:00:00Z").time));
+    }
+
+    // With a ledger cutoff, candles after it are stashed for replay and NOT
+    // fed to warmup — each candle must advance the executor exactly once.
+    #[tokio::test]
+    async fn warmup_splits_history_at_the_ledger_cutoff() {
+        let mut state = instrument_state_with_history(hourly_candles(6)).await;
+        let cutoff = candle_at("2026-07-14T03:00:00Z").time;
+        let covered = state.warmup(100, Some(cutoff)).await.unwrap();
+
+        let stashed: Vec<_> = state.pending_backfill.iter().map(|c| c.time).collect();
+        assert_eq!(
+            stashed,
+            vec![
+                candle_at("2026-07-14T04:00:00Z").time,
+                candle_at("2026-07-14T05:00:00Z").time,
+            ]
+        );
+        // Warmup covered exactly the candles up to the cutoff.
+        assert_eq!(covered, Some(cutoff));
+    }
+
+    // A gap longer than the replay cap folds its oldest candles back into
+    // warmup; only the newest MAX_BACKFILL_CANDLES are replayed.
+    #[tokio::test]
+    async fn warmup_caps_the_replay_at_max_backfill_candles() {
+        let n = MAX_BACKFILL_CANDLES + 10;
+        // 1 candle before the cutoff + n after it.
+        let mut history = vec![candle_at("2026-07-10T00:00:00Z")];
+        history.extend((0..n).map(|i| {
+            candle_at(&format!("2026-07-14T{:02}:{:02}:00Z", i / 60, i % 60))
+        }));
+        let mut state = instrument_state_with_history(history).await;
+
+        let cutoff = candle_at("2026-07-10T00:00:00Z").time;
+        state.warmup(100, Some(cutoff)).await.unwrap();
+
+        assert_eq!(state.pending_backfill.len(), MAX_BACKFILL_CANDLES);
+        // The newest survive; the oldest of the gap were folded into warmup.
+        assert_eq!(
+            state.pending_backfill.last().unwrap().time,
+            candle_at(&format!("2026-07-14T00:{:02}:00Z", n - 1)).time
+        );
+    }
+
+    // The replay policy: every candle emits a backfill tick; interior Entry
+    // signals are reported as missed (never tradeable); the newest candle's
+    // Entry emits normally, exactly like the regular initial evaluation.
+    #[tokio::test]
+    async fn backfill_suppresses_interior_entries_and_emits_the_newest() {
+        let mut w = watcher(definition("scripted", Some(ALWAYS_BUY_SCRIPT)));
+        w.add_instrument_with_source(
+            "EUR_USD".to_string(),
+            Box::new(NoopCandleSource),
+            Vec::new(),
+            "all".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let replay = vec![
+            candle_at("2026-07-15T02:00:00Z"),
+            candle_at("2026-07-15T10:00:00Z"),
+            candle_at("2026-07-15T18:00:00Z"),
+        ];
+        w.instruments.get_mut("EUR_USD").unwrap().pending_backfill = replay;
+        // Seed the position cache so the replay never touches the network.
+        w.cached_positions = Some((Instant::now(), HashMap::new()));
+
+        let sink = RecordingSink::default();
+        w.backfill_instrument(&sink, "EUR_USD").await.unwrap();
+
+        let ticks = sink.ticks.lock().unwrap();
+        assert_eq!(ticks.len(), 3, "every replayed candle gets a tick");
+        assert!(ticks.iter().all(|t| t.backfill), "replay ticks are marked");
+        assert!(
+            ticks.iter().all(|t| t.signal_result == "Entry Long"),
+            "the always-buy script fires on every candle"
+        );
+
+        let errors = sink.errors.lock().unwrap();
+        let missed: Vec<_> = errors.iter().filter(|e| e.error_type == "missed_signal").collect();
+        assert_eq!(missed.len(), 2, "both interior entries are reported as missed");
+        assert!(missed.iter().all(|e| e.message.contains("not emitted as tradeable")));
+
+        let signals = sink.signals.lock().unwrap();
+        assert_eq!(signals.len(), 1, "only the newest candle's entry is tradeable");
+        assert_eq!(
+            signals[0].pattern_match.instrument, "EUR_USD",
+            "emitted signal belongs to the replayed instrument"
+        );
+    }
+
+    // The ledger advances through the replay, so a crash mid-backfill (or a
+    // clean run) resumes from the last candle actually evaluated.
+    #[tokio::test]
+    async fn backfill_records_progress_in_the_ledger() {
+        use super::super::watch_state::WatchStateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = watcher(definition("scripted", Some(ALWAYS_BUY_SCRIPT)));
+        w.set_state_store(WatchStateStore::open(dir.path(), "test-watcher").unwrap());
+        w.add_instrument_with_source(
+            "EUR_USD".to_string(),
+            Box::new(NoopCandleSource),
+            Vec::new(),
+            "all".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let newest = candle_at("2026-07-15T18:00:00Z").time;
+        w.instruments.get_mut("EUR_USD").unwrap().pending_backfill = vec![
+            candle_at("2026-07-15T10:00:00Z"),
+            candle_at("2026-07-15T18:00:00Z"),
+        ];
+        w.cached_positions = Some((Instant::now(), HashMap::new()));
+
+        let sink = RecordingSink::default();
+        w.backfill_instrument(&sink, "EUR_USD").await.unwrap();
+
+        let reopened = WatchStateStore::open(dir.path(), "test-watcher").unwrap();
+        assert_eq!(reopened.last_evaluated("EUR_USD"), Some(newest));
     }
 }

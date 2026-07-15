@@ -68,6 +68,7 @@ mod multi_watcher;
 mod pattern_match;
 mod pending_store;
 mod tick_stream_source;
+mod watch_state;
 mod watcher;
 
 pub use candle_boundary::{CandleBoundaryDetector, CandleBoundaryService, CandleCloseEvent};
@@ -83,5 +84,6 @@ pub use pattern_match::{
     StrategyErrorEvent, StrategyStatusEvent, WatcherStatus, WatcherTickEvent,
     IndicatorSnapshot,
 };
+pub use watch_state::WatchStateStore;
 pub use watcher::{ExecutionMode, StrategyWatcher, WatcherConfig, WatcherInfo};
 pub use pending_store::{add_pending_match, get_pending_matches, clear_pending_matches, remove_pending_match};
