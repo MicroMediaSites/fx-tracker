@@ -1174,7 +1174,12 @@ impl MultiInstrumentWatcher {
             let is_newest = idx == last_idx;
 
             let (signal, indicator_snapshot, health_event) = {
-                let state = self.instruments.get_mut(instrument).unwrap();
+                let state = self.instruments.get_mut(instrument).ok_or_else(|| {
+                    crate::error::Error::Strategy(format!(
+                        "Instrument {} removed mid-backfill",
+                        instrument
+                    ))
+                })?;
                 let (signal, snapshot) = state.evaluate_candle(candle, position_direction);
                 let health_event = state.executor.take_health_event();
                 (signal, snapshot, health_event)
