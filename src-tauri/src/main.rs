@@ -29,6 +29,7 @@ use commands::credentials::{
 use commands::streaming::{
     subscribe_to_prices, unsubscribe_from_prices, hub_stream_status,
 };
+use commands::spread_stats::get_spread_stats;
 use commands::oanda::{
     switch_oanda_environment, get_oanda_environment,
     get_oanda_credentials, save_oanda_credentials,
@@ -402,6 +403,9 @@ async fn main() {
             subscribe_to_prices,
             unsubscribe_from_prices,
             hub_stream_status,
+            // Historical spread stats for the spread-bar coloring (read-only,
+            // sampled by the wickd CLI into ~/.wickd/spreads.db)
+            get_spread_stats,
             // Watch-daemon client surface (AGT-652)
             daemon_status,
             daemon_queue_list,

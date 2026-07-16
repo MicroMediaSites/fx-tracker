@@ -4,6 +4,7 @@ pub mod strategy_convert;
 pub mod notifications;
 pub mod event_sink;
 pub mod hub_stream;
+pub mod spread_stats;
 
 // The trading core now lives in `wickd-core`. Re-export its modules at the
 // crate root so existing `crate::oanda`, `crate::backtest`, `crate::config`,

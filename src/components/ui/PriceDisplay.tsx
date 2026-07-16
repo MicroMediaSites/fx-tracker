@@ -11,6 +11,7 @@
  */
 import { useEffect, useState } from 'react';
 import { usePriceStore } from '../../stores/priceStore';
+import { useSpreadStats } from '../../stores/spreadStatsStore';
 import { usePriceFlash } from '../../hooks/usePriceFlash';
 import type { PriceDirection } from '../../hooks/usePriceFlash';
 import { formatPriceParts, getPipMultiplier } from '../../lib/priceCalculations';
@@ -111,7 +112,7 @@ function getDefaultSpreadRange(instrument: string): { min: number; max: number }
  * @param instrument - Instrument name for fallback ranges
  * @returns HSL color string
  */
-function calculateSpreadColor(
+export function calculateSpreadColor(
   currentSpread: number,
   minSpread: number | undefined,
   maxSpread: number | undefined,
@@ -161,11 +162,10 @@ export function PriceWindow({ instrument }: PriceWindowProps) {
     (streamHealth !== null && !streamHealth.healthy) ||
     (sinceTick !== null && sinceTick > STALE_AFTER_MS);
 
-  // AGT-650: the global spread-stats table (Zero/Postgres, fed by the retired
-  // queries-service collector) is gone. Spread coloring falls back to the
-  // per-instrument DEFAULT_SPREAD_RANGES until a local spread source exists
-  // (the wickd CLI already samples spreads into ~/.wickd/spreads.db).
-  const stats = undefined as { min_spread?: string; max_spread?: string } | undefined;
+  // Historical spread stats sampled by the wickd CLI into
+  // ~/.wickd/spreads.db (read via the get_spread_stats command). Undefined
+  // until history exists, which renders the purple "no data" fallback.
+  const stats = useSpreadStats(instrument);
 
   // Price flash hooks
   const bidFlash = usePriceFlash(price?.bid);
