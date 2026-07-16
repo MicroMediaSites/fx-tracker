@@ -9,6 +9,17 @@ import { addDebugLog } from '../components/ui/DebugOverlay';
 
 const DAILY_ALIGNMENT = 2; // OANDA dailyAlignment=2 UTC (H4 at 02, 06, 10, 14, 18, 22)
 
+// Wedge detection (issue #7): ticks can keep arriving (header quote live)
+// while every one of them silently fails to advance the candle series —
+// e.g. a persistent series.update() throw, a disposed series, an emptied
+// time map, or a time map that stopped advancing business time. After this
+// many CONSECUTIVE failed ticks we force a full candle reload (the
+// programmatic equivalent of the timeframe toggle that snaps the chart back).
+const WEDGE_FAILURE_THRESHOLD = 10;
+// Never force-reload more often than this, so a genuinely broken backend
+// can't turn the recovery path into a fetch loop.
+const RESYNC_THROTTLE_MS = 60_000;
+
 // Streaming diagnostics for the in-app debug overlay (Ctrl+Shift+D).
 // Per-message rate limiting: each distinct message logs on its 1st, 25th,
 // 50th... occurrence, so per-tick messages can't flood the 100-entry buffer.
@@ -76,6 +87,12 @@ interface UsePriceStreamingOptions {
   candleSeriesRef: React.RefObject<any>;
   /** Called when streaming crosses a new candle boundary (not on every tick) */
   onNewCandle?: () => void;
+  /**
+   * Called when the candle series is wedged — ticks are arriving but
+   * persistently failing to apply. The handler should do a full candle
+   * reload (refetch + setData + time map rebuild). Throttled internally.
+   */
+  onResyncNeeded?: () => void;
 }
 
 interface UsePriceStreamingResult {
@@ -92,6 +109,7 @@ export const usePriceStreaming = ({
   timeMapStateRef,
   candleSeriesRef,
   onNewCandle,
+  onResyncNeeded,
 }: UsePriceStreamingOptions): UsePriceStreamingResult => {
   const [streaming, setStreaming] = useState(false);
   const [currentPrice, setCurrentPrice] = useState<PriceUpdate | null>(null);
@@ -104,6 +122,36 @@ export const usePriceStreaming = ({
   const updateCurrentCandleRef = useRef<UpdateCandleCallback | null>(null);
   const onNewCandleRef = useRef(onNewCandle);
   onNewCandleRef.current = onNewCandle;
+  const onResyncNeededRef = useRef(onResyncNeeded);
+  onResyncNeededRef.current = onResyncNeeded;
+
+  // Wedge detection state (issue #7): consecutive ticks that arrived for our
+  // instrument but failed to apply to the series, plus the ACTUAL (epoch)
+  // candle start of the forming candle so we can tell "business time stopped
+  // advancing" apart from normal same-candle updates.
+  const consecutiveTickFailuresRef = useRef(0);
+  const lastResyncMsRef = useRef(0);
+  const formingCandleStartRef = useRef<number | null>(null);
+
+  // Record a tick that failed to apply; after WEDGE_FAILURE_THRESHOLD
+  // consecutive failures, request a full candle reload (throttled).
+  const noteTickFailure = useCallback((message: string) => {
+    streamDebug(message);
+    consecutiveTickFailuresRef.current += 1;
+    if (consecutiveTickFailuresRef.current < WEDGE_FAILURE_THRESHOLD) return;
+
+    const now = Date.now();
+    if (now - lastResyncMsRef.current < RESYNC_THROTTLE_MS) return;
+    lastResyncMsRef.current = now;
+    consecutiveTickFailuresRef.current = 0;
+    currentCandleRef.current = null;
+    prevCloseRef.current = null;
+    formingCandleStartRef.current = null;
+
+    console.warn(`[usePriceStreaming] candle series wedged (${message}) — forcing full candle reload`);
+    addDebugLog('STREAM', `wedge detected: ${message} — resyncing candles`);
+    onResyncNeededRef.current?.();
+  }, []);
 
   // Update the current candle with streaming price
   const updateCurrentCandle = useCallback((price: PriceUpdate) => {
@@ -113,7 +161,7 @@ export const usePriceStreaming = ({
     }
 
     if (!candleSeriesRef.current) {
-      streamDebug('tick dropped: no candle series');
+      noteTickFailure('tick dropped: no candle series');
       return;
     }
 
@@ -122,12 +170,12 @@ export const usePriceStreaming = ({
     try {
       const seriesData = candleSeriesRef.current.data();
       if (!seriesData || seriesData.length === 0) {
-        streamDebug('tick dropped: series empty');
+        noteTickFailure('tick dropped: series empty');
         return;
       }
     } catch {
       // Series may be in transitional state during granularity change
-      streamDebug('tick dropped: series transitional');
+      noteTickFailure('tick dropped: series transitional');
       return;
     }
 
@@ -137,11 +185,19 @@ export const usePriceStreaming = ({
     // Guard: if time map is empty, candles haven't loaded yet for this instrument.
     // Skip the update to prevent orphan candles at wrong positions (Bug #6).
     if (timeMapState.timeMap.size === 0) {
-      streamDebug('tick dropped: time map empty');
+      noteTickFailure('tick dropped: time map empty');
       return;
     }
 
     const priceTime = new Date(price.time).getTime() / 1000;
+
+    // Guard: an unparseable tick time yields NaN, and NaN is a valid Map key —
+    // one such tick would map a permanent "candle" the series can never
+    // advance past (issue #7). Drop the tick instead.
+    if (!Number.isFinite(priceTime)) {
+      noteTickFailure(`tick dropped: unparseable time "${price.time}"`);
+      return;
+    }
 
     // Calculate current candle's start time (aligned to OANDA's dailyAlignment=3)
     const candleStartTime = alignedCandleStart(priceTime, granularity);
@@ -160,6 +216,20 @@ export const usePriceStreaming = ({
       timeMapState.reverseTimeMap.set(newBusinessTime, candleStartTime);
       timeMapState.lastBusinessTime = newBusinessTime;
       currentBusinessTime = newBusinessTime;
+    }
+
+    // Guard: real time crossed into a new candle but the time map handed back
+    // the forming candle's business time (e.g. a zero typicalInterval mapped
+    // every candle start to the same business time). Applying the tick would
+    // silently overwrite the last bar forever, so treat it as a wedge instead.
+    if (
+      currentCandleRef.current &&
+      currentCandleRef.current.time === currentBusinessTime &&
+      formingCandleStartRef.current !== null &&
+      candleStartTime > formingCandleStartRef.current
+    ) {
+      noteTickFailure('tick dropped: business time not advancing across candle boundary');
+      return;
     }
 
     const midPrice = (parseFloat(price.bid) + parseFloat(price.ask)) / 2;
@@ -188,6 +258,8 @@ export const usePriceStreaming = ({
           hollowCandleColors(candle.open as number, midPrice, prevCloseRef.current)
         );
         candleSeriesRef.current.update(candle);
+        consecutiveTickFailuresRef.current = 0;
+        formingCandleStartRef.current = candleStartTime;
         streamDebug('tick applied to forming candle');
       } else {
         // First tick for this candle period — check if historical data exists
@@ -243,6 +315,8 @@ export const usePriceStreaming = ({
         );
         currentCandleRef.current = newCandle;
         candleSeriesRef.current.update(newCandle);
+        consecutiveTickFailuresRef.current = 0;
+        formingCandleStartRef.current = candleStartTime;
         streamDebug(`candle roll -> business time ${String(newCandle.time)}`);
 
         // Notify that a new candle boundary was crossed (for indicator refresh)
@@ -254,12 +328,13 @@ export const usePriceStreaming = ({
       }
     } catch (err) {
       // Errors during chart data transitions (e.g., granularity switch) are
-      // expected and self-heal on the next tick — but surface them in the
-      // debug overlay: a PERSISTENT failure here means the chart looks live
-      // (header price ticks) while candles silently never move.
-      streamDebug(`candle update failed: ${err instanceof Error ? err.message : String(err)}`);
+      // expected and self-heal on the next tick. A PERSISTENT failure here
+      // means the chart looks live (header price ticks) while candles
+      // silently never move (issue #7) — noteTickFailure escalates that to a
+      // full candle reload once the consecutive-failure threshold is hit.
+      noteTickFailure(`candle update failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-  }, [granularity, candleSeriesRef, timeMapStateRef]);
+  }, [granularity, candleSeriesRef, timeMapStateRef, noteTickFailure]);
 
   // Keep ref in sync with the latest callback
   updateCurrentCandleRef.current = updateCurrentCandle;
@@ -270,6 +345,8 @@ export const usePriceStreaming = ({
     setCurrentPrice(null);
     currentCandleRef.current = null;
     prevCloseRef.current = null;
+    consecutiveTickFailuresRef.current = 0;
+    formingCandleStartRef.current = null;
     // Clear time maps to prevent stale data from contaminating new instrument's candles
     const timeMapState = timeMapStateRef.current;
     if (timeMapState) {

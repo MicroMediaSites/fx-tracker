@@ -457,6 +457,145 @@ describe('usePriceStreaming', () => {
       expect(refs.candleSeriesRef.current.update).not.toHaveBeenCalled();
     });
   });
+
+  // Issue #7: candle series silently stops refreshing while header quote stays
+  // live. Ticks that persistently fail to apply must trigger a full candle
+  // reload (onResyncNeeded) instead of being dropped forever.
+  describe('candle wedge self-heal (issue #7)', () => {
+    const M1 = 60;
+
+    const setupTimeMap = (refs: ReturnType<typeof createMockRefs>, candleStartTime: number) => {
+      refs.timeMapStateRef.current.timeMap.set(candleStartTime, 100);
+      refs.timeMapStateRef.current.reverseTimeMap.set(100, candleStartTime);
+      refs.timeMapStateRef.current.lastBusinessTime = 100;
+      refs.timeMapStateRef.current.typicalInterval = 1;
+    };
+
+    const renderStreamingHook = async (
+      refs: ReturnType<typeof createMockRefs>,
+      onResyncNeeded: () => void
+    ) => {
+      renderHook(() =>
+        usePriceStreaming({
+          instrument: 'EUR_USD',
+          granularity: 'M1',
+          isHistoricalView: false,
+          onResyncNeeded,
+          ...refs,
+        })
+      );
+      await waitFor(() => {
+        expect(priceListeners.length).toBeGreaterThan(0);
+      });
+    };
+
+    const emitTick = (time: string) => {
+      act(() => {
+        priceListeners[0]({
+          payload: { instrument: 'EUR_USD', bid: '1.0850', ask: '1.0852', time },
+        });
+      });
+    };
+
+    it('drops ticks with unparseable time without poisoning the time map', async () => {
+      const refs = createMockRefs();
+      const onResyncNeeded = vi.fn();
+      const candleStartTime = Math.floor(Date.now() / 1000 / M1) * M1;
+
+      await renderStreamingHook(refs, onResyncNeeded);
+      setupTimeMap(refs, candleStartTime);
+
+      emitTick('not-a-timestamp');
+
+      expect(refs.candleSeriesRef.current.update).not.toHaveBeenCalled();
+      // NaN must not have been inserted as a candle-start key
+      expect([...refs.timeMapStateRef.current.timeMap.keys()].some(Number.isNaN)).toBe(false);
+
+      // A subsequent valid tick still applies normally
+      emitTick(new Date(candleStartTime * 1000 + 1000).toISOString());
+      expect(refs.candleSeriesRef.current.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('requests a resync after persistent series.update() failures, throttled to once', async () => {
+      const refs = createMockRefs();
+      refs.candleSeriesRef.current.update = vi.fn(() => {
+        throw new Error('Cannot update oldest data');
+      });
+      const onResyncNeeded = vi.fn();
+      const candleStartTime = Math.floor(Date.now() / 1000 / M1) * M1;
+
+      await renderStreamingHook(refs, onResyncNeeded);
+      setupTimeMap(refs, candleStartTime);
+
+      // 9 consecutive failures: below the threshold, no resync yet
+      for (let i = 0; i < 9; i++) {
+        emitTick(new Date(candleStartTime * 1000 + 1000 + i).toISOString());
+      }
+      expect(onResyncNeeded).not.toHaveBeenCalled();
+
+      // 10th failure crosses the threshold
+      emitTick(new Date(candleStartTime * 1000 + 2000).toISOString());
+      expect(onResyncNeeded).toHaveBeenCalledTimes(1);
+
+      // Further failures inside the throttle window must not re-trigger
+      for (let i = 0; i < 15; i++) {
+        emitTick(new Date(candleStartTime * 1000 + 3000 + i).toISOString());
+      }
+      expect(onResyncNeeded).toHaveBeenCalledTimes(1);
+    });
+
+    it('a successful update resets the consecutive-failure count', async () => {
+      const refs = createMockRefs();
+      let failing = true;
+      refs.candleSeriesRef.current.update = vi.fn(() => {
+        if (failing) throw new Error('transient');
+      });
+      const onResyncNeeded = vi.fn();
+      const candleStartTime = Math.floor(Date.now() / 1000 / M1) * M1;
+
+      await renderStreamingHook(refs, onResyncNeeded);
+      setupTimeMap(refs, candleStartTime);
+
+      for (let i = 0; i < 9; i++) {
+        emitTick(new Date(candleStartTime * 1000 + 1000 + i).toISOString());
+      }
+      // One success in between clears the streak
+      failing = false;
+      emitTick(new Date(candleStartTime * 1000 + 2000).toISOString());
+      failing = true;
+      for (let i = 0; i < 9; i++) {
+        emitTick(new Date(candleStartTime * 1000 + 3000 + i).toISOString());
+      }
+
+      expect(onResyncNeeded).not.toHaveBeenCalled();
+    });
+
+    it('detects a time map whose business time stops advancing across candle boundaries', async () => {
+      const refs = createMockRefs();
+      const onResyncNeeded = vi.fn();
+      const minute1 = Math.floor(Date.now() / 1000 / M1) * M1;
+      const minute2 = minute1 + M1;
+
+      await renderStreamingHook(refs, onResyncNeeded);
+      // Corrupted map: two different candle starts share one business time
+      // (what a zero typicalInterval used to produce)
+      setupTimeMap(refs, minute1);
+      refs.timeMapStateRef.current.timeMap.set(minute2, 100);
+
+      // Establish the forming candle in minute1
+      emitTick(new Date(minute1 * 1000 + 1000).toISOString());
+      expect(refs.candleSeriesRef.current.update).toHaveBeenCalledTimes(1);
+
+      // Ticks in minute2 resolve to the SAME business time — each must be
+      // dropped (not silently overwrite the last bar) and counted as a failure
+      for (let i = 0; i < 10; i++) {
+        emitTick(new Date(minute2 * 1000 + 1000 + i).toISOString());
+      }
+
+      expect(refs.candleSeriesRef.current.update).toHaveBeenCalledTimes(1);
+      expect(onResyncNeeded).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 
 // BUG-079: alignedCandleStart must match OANDA's dailyAlignment=3 UTC

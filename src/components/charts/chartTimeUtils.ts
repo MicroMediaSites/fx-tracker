@@ -41,8 +41,11 @@ export const convertCandles = (
     const curr = new Date(candles[i].time).getTime() / 1000;
     const prev = new Date(candles[i - 1].time).getTime() / 1000;
     const diff = curr - prev;
-    // Only count normal intervals (not weekend gaps)
-    if (diff < 3 * 24 * 3600) { // Less than 3 days
+    // Only count normal intervals (not weekend gaps). Non-positive diffs
+    // (duplicate/out-of-order backend timestamps) are excluded — a zero
+    // typicalInterval maps every new candle to the same business time, which
+    // permanently freezes the streamed series.
+    if (diff > 0 && diff < 3 * 24 * 3600) { // Less than 3 days
       intervals.push(diff);
     }
   }
