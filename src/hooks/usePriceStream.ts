@@ -1,7 +1,7 @@
 import { useEffect, useCallback, useRef } from 'react';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import { usePriceStore, PriceUpdate, StreamError } from '../stores/priceStore';
+import { usePriceStore, PriceUpdate, StreamError, StreamHealth } from '../stores/priceStore';
 
 // Default instruments to stream
 const DEFAULT_INSTRUMENTS = [
@@ -22,7 +22,7 @@ const DEFAULT_INSTRUMENTS = [
  * @returns Object with streaming state and control functions
  */
 export const usePriceStream = (instruments: string[] = DEFAULT_INSTRUMENTS) => {
-  const { updatePrice, setStreaming, setError, streaming } = usePriceStore();
+  const { updatePrice, setStreaming, setError, setStreamHealth, streaming } = usePriceStore();
   const subscribedRef = useRef<Set<string>>(new Set());
   const instrumentsRef = useRef<string[]>(instruments);
 
@@ -69,6 +69,7 @@ export const usePriceStream = (instruments: string[] = DEFAULT_INSTRUMENTS) => {
     let cancelled = false;
     let priceUnlisten: UnlistenFn | null = null;
     let errorUnlisten: UnlistenFn | null = null;
+    let healthUnlisten: UnlistenFn | null = null;
 
     const setup = async () => {
       // Listen for price updates
@@ -87,7 +88,15 @@ export const usePriceStream = (instruments: string[] = DEFAULT_INSTRUMENTS) => {
       const errorFn = await listen<StreamError>('stream-error', (event) => {
         if (cancelled) return;
         setError(event.payload);
-        setStreaming(false);
+        // Reconnect-class errors self-heal (the backend redials forever) —
+        // subscriptions are still armed, so don't flip streaming off and
+        // strand the UI in a state startStream() would refuse to leave.
+        const selfHealing =
+          event.payload.errorType === 'reconnecting' ||
+          event.payload.errorType === 'max_reconnects_exceeded';
+        if (!selfHealing) {
+          setStreaming(false);
+        }
       });
 
       if (cancelled) {
@@ -95,6 +104,18 @@ export const usePriceStream = (instruments: string[] = DEFAULT_INSTRUMENTS) => {
         return;
       }
       errorUnlisten = errorFn;
+
+      // Listen for stream health (staleness badge + self-heal cleanup)
+      const healthFn = await listen<StreamHealth>('stream-health', (event) => {
+        if (cancelled) return;
+        setStreamHealth(event.payload);
+      });
+
+      if (cancelled) {
+        healthFn();
+        return;
+      }
+      healthUnlisten = healthFn;
     };
 
     setup();
@@ -103,8 +124,9 @@ export const usePriceStream = (instruments: string[] = DEFAULT_INSTRUMENTS) => {
       cancelled = true;
       priceUnlisten?.();
       errorUnlisten?.();
+      healthUnlisten?.();
     };
-  }, [updatePrice, setError, setStreaming]);
+  }, [updatePrice, setError, setStreaming, setStreamHealth]);
 
   // Handle instrument changes - use a stable stringified version to prevent loops
   const instrumentsKey = [...instruments].sort().join(',');

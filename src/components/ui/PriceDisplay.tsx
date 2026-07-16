@@ -9,10 +9,34 @@
  * <PriceWindow instrument="EUR_USD" />
  * ```
  */
+import { useEffect, useState } from 'react';
 import { usePriceStore } from '../../stores/priceStore';
 import { usePriceFlash } from '../../hooks/usePriceFlash';
 import type { PriceDirection } from '../../hooks/usePriceFlash';
 import { formatPriceParts, getPipMultiplier } from '../../lib/priceCalculations';
+
+/** A displayed price older than this is visibly flagged as stale. */
+const STALE_AFTER_MS = 60_000;
+
+/** Coarse clock that re-renders subscribers every `intervalMs` so the
+ *  staleness badge appears even when no events arrive at all (the freeze
+ *  case is exactly the one with no new renders). */
+function useNow(intervalMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+  return now;
+}
+
+function staleAgeLabel(ms: number): string {
+  const mins = Math.floor(ms / 60_000);
+  if (mins < 1) return '<1m';
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  return `${hours}h ${mins % 60}m`;
+}
 
 // Re-export for convenience
 export { formatPriceParts } from '../../lib/priceCalculations';
@@ -124,6 +148,18 @@ function calculateSpreadColor(
 export function PriceWindow({ instrument }: PriceWindowProps) {
   // Subscribe to just this instrument's price for render isolation
   const price = usePriceStore((state) => state.prices[instrument]);
+  const streamHealth = usePriceStore((state) => state.streamHealth);
+  const lastTickAtMs = usePriceStore((state) => state.lastTickAtMs);
+
+  // Staleness: either the backend says the stream is unhealthy, or no price
+  // has flushed in STALE_AFTER_MS (covers a silent hub with no health
+  // events). The 15s clock exists because a frozen stream produces no
+  // renders of its own.
+  const now = useNow(15_000);
+  const sinceTick = lastTickAtMs === null ? null : now - lastTickAtMs;
+  const isStale =
+    (streamHealth !== null && !streamHealth.healthy) ||
+    (sinceTick !== null && sinceTick > STALE_AFTER_MS);
 
   // AGT-650: the global spread-stats table (Zero/Postgres, fed by the retired
   // queries-service collector) is gone. Spread coloring falls back to the
@@ -178,7 +214,15 @@ export function PriceWindow({ instrument }: PriceWindowProps) {
   };
 
   return (
-    <div className="flex items-stretch relative">
+    <div className={`flex items-stretch relative ${isStale ? 'opacity-60' : ''}`}>
+      {isStale && (
+        <div
+          className="absolute top-0.5 right-0.5 z-10 text-[9px] font-mono px-1.5 py-0.5 rounded border border-amber-600/50 text-amber-600 bg-[var(--color-bg,transparent)]"
+          title={`No live data${sinceTick !== null ? ` for ${staleAgeLabel(sinceTick)}` : ''} — showing last received price`}
+        >
+          STALE{sinceTick !== null ? ` ${staleAgeLabel(sinceTick)}` : ''}
+        </div>
+      )}
       {/* Sell side */}
       <div className="flex-1 flex flex-col">
         <div className="pt-1 pb-4 px-3 rounded-tl border border-[var(--color-border)] border-b-0 flex-1">
