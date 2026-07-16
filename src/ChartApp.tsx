@@ -314,6 +314,15 @@ export const ChartApp = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instrument, granularity, candleCount, fromDate, toDate, signalDirection]);
 
+  // Wedge recovery (issue #7): when streaming detects the candle series is
+  // stuck (ticks arriving but persistently failing to apply), do a full
+  // candle reload — the same thing a manual timeframe toggle does. loadCandles
+  // is defined below; bridged via ref like the other streaming callbacks.
+  const loadCandlesRef = useRef<(() => void) | null>(null);
+  const requestCandleResync = useCallback(() => {
+    loadCandlesRef.current?.();
+  }, []);
+
   const priceStreaming = usePriceStreaming({
     instrument,
     granularity,
@@ -321,6 +330,7 @@ export const ChartApp = () => {
     timeMapStateRef,
     candleSeriesRef,
     onNewCandle: refreshIndicatorsOnNewCandle,
+    onResyncNeeded: requestCandleResync,
   });
 
   // Merge SR zone error with local error
@@ -500,6 +510,9 @@ export const ChartApp = () => {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instrument, granularity, candleCount, fromDate, toDate, entryPrice, stopLoss, takeProfit]);
+
+  // Keep the streaming wedge-recovery bridge pointing at the latest loadCandles
+  loadCandlesRef.current = loadCandles;
 
   // Initialize chart
   useEffect(() => {
