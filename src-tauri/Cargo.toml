@@ -1,4 +1,11 @@
 # CandleSight Desktop Application
+
+# src-tauri is intentionally standalone (the root workspace `exclude`s it).
+# The empty [workspace] table makes that explicit so cargo never walks up
+# past this manifest — without it, builds from a git worktree under
+# .claude/worktrees/ mis-associate with the primary checkout's workspace.
+[workspace]
+
 [package]
 name = "candlesight"
 version = "0.1.0"

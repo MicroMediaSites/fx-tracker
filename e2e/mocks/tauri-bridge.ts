@@ -38,6 +38,8 @@ export function getTauriBridgeScript() {
     window.__E2E_DAEMON_QUEUE__ = window.__E2E_DAEMON_QUEUE__ || [];
     window.__E2E_DAEMON_PENDING__ = window.__E2E_DAEMON_PENDING__ || [];
     window.__E2E_HUB_STREAM__ = window.__E2E_HUB_STREAM__ || null;
+    // Historical spread stats rows (~/.wickd/spreads.db, read-only).
+    window.__E2E_SPREAD_STATS__ = window.__E2E_SPREAD_STATS__ || [];
 
     // Zero-removal sweep datasets (AGT-650).
     window.__E2E_LOCAL_LABELS__ = window.__E2E_LOCAL_LABELS__ || [];
@@ -299,6 +301,9 @@ export function getTauriBridgeScript() {
           .reverse(),
       'hub_stream_status': () =>
         window.__E2E_HUB_STREAM__ ?? { mode: 'idle', observed: [], direct: [], last_line_ms: null },
+      // Historical spread stats (~/.wickd/spreads.db, read-only). Empty by
+      // default = the purple "no history" spread-bar fallback.
+      'get_spread_stats': () => window.__E2E_SPREAD_STATS__ ?? [],
     };
 
     // Set up the invoke handler

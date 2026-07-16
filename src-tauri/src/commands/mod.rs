@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod data;
 pub mod local_store;
 pub mod oanda;
+pub mod spread_stats;
 pub mod strategy_store;
 pub mod streaming;
 pub mod trading;
