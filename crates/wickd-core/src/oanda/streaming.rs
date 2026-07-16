@@ -22,8 +22,37 @@ const STREAM_HEALTH_TIMEOUT_SECS: u64 = 30;
 /// How often to check stream health
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
 
-/// Maximum number of reconnection attempts before giving up
+/// How long a blocking read may go without ANY line (tick or heartbeat)
+/// before the connection is declared wedged and torn down. OANDA heartbeats
+/// every ~5s even with markets closed, so 30s of silence is six missed
+/// heartbeats — a half-open TCP connection (sleep/wake, network change),
+/// not a quiet market. Without this, `next_line().await` can block forever
+/// and the reconnect loop never runs (the 2026-07-15 UI wedge).
+const STREAM_READ_TIMEOUT_SECS: u64 = 30;
+
+/// Reconnection attempts before escalating to a `MaxReconnectsExceeded`
+/// stream error. NOT a stop condition: the stream keeps redialing at the
+/// capped delay forever — a stream that gives up permanently freezes the
+/// last price on every consumer while looking alive (the 2026-07-15
+/// failure), which is strictly worse than retrying into a dead network.
 const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+/// Past the escalation threshold, emit a `Reconnecting` event only every
+/// this-many attempts so an hours-long outage doesn't spam consumers (one
+/// attempt per minute at the capped delay → one event every ~10 minutes).
+const RECONNECT_EVENT_EVERY: u32 = 10;
+
+/// Which events attempt number `attempts` emits:
+/// `(max_reconnects_exceeded, reconnecting)`. The escalation fires exactly
+/// once per outage (attempt == threshold; the counter resets on a successful
+/// connect), and Reconnecting events throttle after it. Pure so the
+/// never-give-up pacing is unit-testable.
+fn attempt_event_plan(attempts: u32) -> (bool, bool) {
+    let exceeded = attempts == MAX_RECONNECT_ATTEMPTS;
+    let reconnecting =
+        attempts < MAX_RECONNECT_ATTEMPTS || attempts % RECONNECT_EVENT_EVERY == 0;
+    (exceeded, reconnecting)
+}
 
 /// Initial delay between reconnection attempts (in seconds)
 const INITIAL_RECONNECT_DELAY_SECS: u64 = 1;
@@ -446,6 +475,39 @@ impl PriceStreamManager {
             let mut reconnect_attempts: u32 = 0;
             let mut current_delay = INITIAL_RECONNECT_DELAY_SECS;
 
+            // Report a failed attempt: one-time MaxReconnectsExceeded
+            // escalation at the threshold, throttled Reconnecting events past
+            // it. Never a stop signal — the loop redials forever (see the
+            // MAX_RECONNECT_ATTEMPTS doc for why giving up is the worse bug).
+            let note_failed_attempt =
+                |attempts: u32, delay: u64, reason: &str, sink: &Arc<dyn EventSink>| {
+                    let (exceeded, reconnecting) = attempt_event_plan(attempts);
+                    if exceeded {
+                        sink.stream_error(&StreamError {
+                            error_type: StreamErrorType::MaxReconnectsExceeded,
+                            message: format!(
+                                "{} reconnect attempts failed ({}) — not giving up; retrying every {}s",
+                                attempts, reason, MAX_RECONNECT_DELAY_SECS
+                            ),
+                        });
+                    }
+                    if reconnecting {
+                        sink.stream_error(&StreamError {
+                            error_type: StreamErrorType::Reconnecting,
+                            message: format!(
+                                "{} — reconnecting in {} seconds (attempt {})",
+                                reason, delay, attempts
+                            ),
+                        });
+                    }
+                    tracing::warn!(
+                        "[StreamManager] {} — retry in {}s (attempt {})",
+                        reason,
+                        delay,
+                        attempts
+                    );
+                };
+
             // Main reconnection loop
             'reconnect: loop {
                 if !running.load(Ordering::SeqCst) {
@@ -463,27 +525,13 @@ impl PriceStreamManager {
                 {
                     Ok(resp) => resp,
                     Err(e) => {
-                        tracing::error!("[StreamManager] HTTP request failed: {}", e);
                         reconnect_attempts += 1;
-
-                        if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
-                            tracing::error!("[StreamManager] Max reconnection attempts ({}) exceeded", MAX_RECONNECT_ATTEMPTS);
-                            let error = StreamError {
-                                error_type: StreamErrorType::MaxReconnectsExceeded,
-                                message: format!("Failed to reconnect after {} attempts", MAX_RECONNECT_ATTEMPTS),
-                            };
-                            sink.stream_error(&error);
-                            break 'reconnect;
-                        }
-
-                        // Emit reconnection event
-                        let error = StreamError {
-                            error_type: StreamErrorType::Reconnecting,
-                            message: format!("Reconnecting in {} seconds (attempt {}/{})", current_delay, reconnect_attempts, MAX_RECONNECT_ATTEMPTS),
-                        };
-                        sink.stream_error(&error);
-                        tracing::warn!("[StreamManager] Will retry in {} seconds (attempt {}/{})", current_delay, reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
-
+                        note_failed_attempt(
+                            reconnect_attempts,
+                            current_delay,
+                            &format!("HTTP request failed: {}", e),
+                            &sink,
+                        );
                         tokio::time::sleep(Duration::from_secs(current_delay)).await;
                         current_delay = std::cmp::min(current_delay * 2, MAX_RECONNECT_DELAY_SECS);
                         continue 'reconnect;
@@ -491,25 +539,13 @@ impl PriceStreamManager {
                 };
 
                 if !response.status().is_success() {
-                    tracing::error!("[StreamManager] Stream connection failed: {}", response.status());
                     reconnect_attempts += 1;
-
-                    if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
-                        tracing::error!("[StreamManager] Max reconnection attempts exceeded");
-                        let error = StreamError {
-                            error_type: StreamErrorType::MaxReconnectsExceeded,
-                            message: format!("Failed to reconnect after {} attempts", MAX_RECONNECT_ATTEMPTS),
-                        };
-                        sink.stream_error(&error);
-                        break 'reconnect;
-                    }
-
-                    let error = StreamError {
-                        error_type: StreamErrorType::Reconnecting,
-                        message: format!("Server returned {}, reconnecting in {} seconds", response.status(), current_delay),
-                    };
-                    sink.stream_error(&error);
-
+                    note_failed_attempt(
+                        reconnect_attempts,
+                        current_delay,
+                        &format!("Stream connection failed: {}", response.status()),
+                        &sink,
+                    );
                     tokio::time::sleep(Duration::from_secs(current_delay)).await;
                     current_delay = std::cmp::min(current_delay * 2, MAX_RECONNECT_DELAY_SECS);
                     continue 'reconnect;
@@ -546,7 +582,28 @@ impl PriceStreamManager {
                         break None; // Graceful shutdown
                     }
 
-                    match lines.next_line().await {
+                    // Bound the read: OANDA heartbeats every ~5s even with
+                    // markets closed, so a silent read past the timeout is a
+                    // wedged (half-open) connection — tear down and redial.
+                    // An unbounded next_line() here blocks forever on
+                    // sleep/wake-orphaned connections and no reconnect logic
+                    // ever runs.
+                    let next = match tokio::time::timeout(
+                        Duration::from_secs(STREAM_READ_TIMEOUT_SECS),
+                        lines.next_line(),
+                    )
+                    .await
+                    {
+                        Ok(read) => read,
+                        Err(_elapsed) => {
+                            break Some(format!(
+                                "no data or heartbeat for {}s — connection wedged",
+                                STREAM_READ_TIMEOUT_SECS
+                            ));
+                        }
+                    };
+
+                    match next {
                         Ok(Some(line)) => {
                             if line.trim().is_empty() {
                                 continue;
@@ -595,23 +652,7 @@ impl PriceStreamManager {
                     }
 
                     reconnect_attempts += 1;
-                    tracing::warn!("[StreamManager] Disconnected: {}. Attempt {}/{}", reason, reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
-
-                    if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
-                        let error = StreamError {
-                            error_type: StreamErrorType::MaxReconnectsExceeded,
-                            message: format!("Failed to reconnect after {} attempts: {}", MAX_RECONNECT_ATTEMPTS, reason),
-                        };
-                        sink.stream_error(&error);
-                        break 'reconnect;
-                    }
-
-                    let error = StreamError {
-                        error_type: StreamErrorType::Reconnecting,
-                        message: format!("{} - reconnecting in {} seconds", reason, current_delay),
-                    };
-                    sink.stream_error(&error);
-
+                    note_failed_attempt(reconnect_attempts, current_delay, &reason, &sink);
                     tokio::time::sleep(Duration::from_secs(current_delay)).await;
                     current_delay = std::cmp::min(current_delay * 2, MAX_RECONNECT_DELAY_SECS);
                     continue 'reconnect;
@@ -672,6 +713,40 @@ mod tests {
             close_out_bid: Some("1.08495".to_string()),
             close_out_ask: Some("1.08525".to_string()),
         }
+    }
+
+    // The never-give-up pacing (2026-07-15 wedge fix): early attempts emit
+    // Reconnecting; the threshold attempt ALSO emits the one-time
+    // MaxReconnectsExceeded escalation; past it, Reconnecting throttles to
+    // every RECONNECT_EVENT_EVERY attempts — and no attempt count ever maps
+    // to "stop trying" (there is no such output).
+    #[test]
+    fn attempt_plan_escalates_once_and_throttles_forever() {
+        for a in 1..MAX_RECONNECT_ATTEMPTS {
+            assert_eq!(attempt_event_plan(a), (false, true), "attempt {}", a);
+        }
+        assert_eq!(attempt_event_plan(MAX_RECONNECT_ATTEMPTS), (true, true));
+        // Past the threshold: escalation never repeats; events throttle.
+        for a in (MAX_RECONNECT_ATTEMPTS + 1)..(MAX_RECONNECT_ATTEMPTS + 25) {
+            let (exceeded, reconnecting) = attempt_event_plan(a);
+            assert!(!exceeded, "escalation must be one-time (attempt {})", a);
+            assert_eq!(
+                reconnecting,
+                a % RECONNECT_EVENT_EVERY == 0,
+                "throttle mismatch at attempt {}",
+                a
+            );
+        }
+    }
+
+    #[test]
+    fn read_timeout_is_a_multiple_of_heartbeat_cadence() {
+        // OANDA heartbeats every ~5s; the wedge timeout must tolerate several
+        // missed heartbeats (no false-positive teardown on jitter) while
+        // still detecting a dead connection well under the watchers' own
+        // failover thresholds.
+        assert!(STREAM_READ_TIMEOUT_SECS >= 20);
+        assert!(STREAM_READ_TIMEOUT_SECS <= 120);
     }
 
     #[test]
