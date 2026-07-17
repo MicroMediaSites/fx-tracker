@@ -79,4 +79,22 @@ test.describe('Feed overlay drawer', () => {
     await expect(appPage.page.getByTestId('feed-empty')).toBeVisible();
     await expect(appPage.page.getByTestId('feed-empty')).toContainText('every 15 minutes');
   });
+
+  test('follow-up input asks via feed_ask and renders the transcript', async ({ appPage }) => {
+    await appPage.mockTauriCommand('feed_list', FEED_ITEMS);
+    await appPage.mockTauriCommand('feed_ask', 'GBP softness is a UK data story.');
+    await appPage.goto('watcher');
+
+    await openDrawer(appPage);
+
+    const input = appPage.page.getByTestId('feed-ask-input');
+    await expect(input).toBeVisible();
+    await input.fill('why is sterling soft?');
+    await input.press('Enter');
+
+    const lines = appPage.page.getByTestId('feed-ask-line');
+    await expect(lines).toHaveCount(2);
+    await expect(lines.first()).toContainText('> why is sterling soft?');
+    await expect(lines.nth(1)).toContainText('← GBP softness is a UK data story.');
+  });
 });
