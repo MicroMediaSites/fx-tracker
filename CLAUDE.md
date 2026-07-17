@@ -96,9 +96,23 @@ ones; versioned via `PRAGMA user_version`). See `docs/local-store.md`.
 ## NEVER Touch
 
 - **Environment files**: NEVER read, write, edit, copy, move, or modify any `.env*` files
-- **Builds**: NEVER run `npm run tauri build` or any production build script
 - **Railway**: NEVER run `railway` CLI commands (the remaining Railway project is being torn down)
 - **The running daemon**: never disturb `com.openthink.wickd-*` launchd jobs or `~/.wickd` state
+
+## Production builds (allowed — Matt, 2026-07-16)
+
+Claude may run `npm run tauri build` and other production builds without
+asking. Conventions for a rebuild + reinstall of the desktop app:
+
+- Sign updater artifacts with `TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/wickd.key`
+  (passwordless; local builds keep the placeholder updater endpoint — that is
+  expected, release.yml swaps the real one on release builds only).
+- Back up the current bundle first
+  (`/Applications/wickd.app` → `wickd.app.bak-pre-<reason>`), then install
+  and relaunch. Quit the running app before replacing the bundle; the stream
+  hub is owned by the `com.openthink.wickd-stream` daemon, so quitting the
+  app does not disturb the watchers.
+- Publishing a GitHub RELEASE stays out of scope — that is release.yml's job.
 
 <!-- stamp:begin (managed by `stamp init` — do not edit between markers) -->
 
