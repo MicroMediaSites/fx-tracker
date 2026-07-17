@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod error;
 pub mod event_sink;
 pub mod events;
+pub mod feed;
 pub mod hub_client;
 pub mod models;
 pub mod ndjson;
