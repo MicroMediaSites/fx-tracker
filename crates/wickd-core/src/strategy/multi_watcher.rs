@@ -108,6 +108,13 @@ struct InstrumentState {
     /// (never fed to `warmup_candle` — each candle advances the executor
     /// exactly once).
     pending_backfill: Vec<Candle>,
+    /// Broker position observed on the previous tick cycle — the memory
+    /// that lets the watcher notice a position VANISHING at the broker
+    /// (stop-loss/TP fill, manual close in the OANDA UI) and fire the
+    /// script's position-closed resync hook promptly, instead of the
+    /// script "managing" a dead position until its own exit signal errors
+    /// with "position does not exist" (observed all night 2026-07-17).
+    last_broker_position: Option<PositionDirection>,
     /// The position the SCRIPT believes it holds after the warmup replay
     /// (folded from the discarded warmup signals — a suppressed Entry still
     /// mutates script state even though no order was placed). `None` for
@@ -180,6 +187,7 @@ impl InstrumentState {
             executor,
             pending_signals: Vec::new(),
             pending_backfill: Vec::new(),
+            last_broker_position: None,
             warmup_implied_position: None,
             initialized: false,
             consecutive_errors: 0,
@@ -749,6 +757,26 @@ impl MultiInstrumentWatcher {
         }
     }
 
+    /// Notice a position that vanished at the broker since the last tick
+    /// (SL/TP fill, manual close) and resync the script immediately via its
+    /// position-closed hook — the same hook a script-initiated close path
+    /// uses, and idempotent under the ABI's "position is gone" contract, so
+    /// firing it after ANY observed open→flat transition is safe regardless
+    /// of who closed the position.
+    fn reconcile_external_close(&mut self, instrument: &str, current: Option<PositionDirection>) {
+        let Some(state) = self.instruments.get_mut(instrument) else {
+            return;
+        };
+        if state.last_broker_position.is_some() && current.is_none() {
+            info!(
+                "[MultiWatcher {}] {} position closed at the broker (stop/TP/manual) — firing the position-closed resync hook",
+                self.watcher_id, instrument
+            );
+            state.executor.notify_position_closed();
+        }
+        state.last_broker_position = current;
+    }
+
     /// Check if an error is transient
     fn is_transient_error(error_msg: &str) -> bool {
         let transient_patterns = [
@@ -1140,6 +1168,7 @@ impl MultiInstrumentWatcher {
         // Check position direction using cached data (1 API call per cycle, not per instrument)
         self.refresh_position_cache().await?;
         let position_direction = self.get_cached_position(instrument);
+        self.reconcile_external_close(instrument, position_direction);
 
         // Evaluate rules (uses &mut instrument state). A scripted strategy that
         // just hit its consecutive-error abort threshold reports it via
@@ -1243,6 +1272,7 @@ impl MultiInstrumentWatcher {
         // regular tick path uses.
         self.refresh_position_cache().await?;
         let position_direction = self.get_cached_position(instrument);
+        self.reconcile_external_close(instrument, position_direction);
 
         let last_idx = candles.len() - 1;
         for (idx, candle) in candles.iter().enumerate() {
@@ -1372,6 +1402,7 @@ impl MultiInstrumentWatcher {
         // Check position direction using cached data (1 API call per cycle, not per instrument)
         self.refresh_position_cache().await?;
         let position_direction = self.get_cached_position(instrument);
+        self.reconcile_external_close(instrument, position_direction);
         info!(
             "[MultiWatcher {}] {} position_direction={:?}",
             self.watcher_id, instrument, position_direction
@@ -2569,6 +2600,75 @@ fn on_position_closed() {
         assert!(
             matches!(signal, RulesSignal::Hold),
             "the script keeps managing its real position — got {:?}",
+            signal
+        );
+    }
+
+    // ---- external-close reconcile (broker SL/TP fill detection) ----
+
+    // The script entered and self-tracks a position; the broker then stops
+    // it out (position vanishes between tick cycles). The watcher must fire
+    // the position-closed hook so the script resyncs flat immediately —
+    // otherwise it "manages" a dead position until its own exit errors.
+    #[tokio::test]
+    async fn broker_close_between_ticks_resyncs_the_script() {
+        let mut w = watcher(definition("scripted", Some(SELF_POSITION_SCRIPT)));
+        w.add_instrument_with_source(
+            "EUR_USD".to_string(),
+            Box::new(NoopCandleSource),
+            Vec::new(),
+            "all".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Candle 1: the script enters (self-tracked position = 1).
+        let state = w.instruments.get_mut("EUR_USD").unwrap();
+        let (signal, _) = state.evaluate_candle(&candle_at("2026-07-17T00:00:00Z"), None);
+        assert!(matches!(signal, RulesSignal::Entry { .. }));
+
+        // Tick cycle observes the live position, then the broker fills the
+        // stop: next cycle observes flat.
+        w.reconcile_external_close("EUR_USD", Some(PositionDirection::Long));
+        w.reconcile_external_close("EUR_USD", None);
+
+        // The hook resynced the script: next candle is a fresh Entry, not a
+        // Hold on a phantom position.
+        let state = w.instruments.get_mut("EUR_USD").unwrap();
+        let (signal, _) = state.evaluate_candle(&candle_at("2026-07-17T01:00:00Z"), None);
+        assert!(
+            matches!(signal, RulesSignal::Entry { .. }),
+            "expected a fresh Entry after the broker-close resync, got {:?}",
+            signal
+        );
+    }
+
+    // While the broker still holds the position, the hook must NOT fire —
+    // the script keeps managing its live trade.
+    #[tokio::test]
+    async fn open_position_is_left_alone_by_the_reconcile() {
+        let mut w = watcher(definition("scripted", Some(SELF_POSITION_SCRIPT)));
+        w.add_instrument_with_source(
+            "EUR_USD".to_string(),
+            Box::new(NoopCandleSource),
+            Vec::new(),
+            "all".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let state = w.instruments.get_mut("EUR_USD").unwrap();
+        let (signal, _) = state.evaluate_candle(&candle_at("2026-07-17T00:00:00Z"), None);
+        assert!(matches!(signal, RulesSignal::Entry { .. }));
+
+        w.reconcile_external_close("EUR_USD", Some(PositionDirection::Long));
+        w.reconcile_external_close("EUR_USD", Some(PositionDirection::Long));
+
+        let state = w.instruments.get_mut("EUR_USD").unwrap();
+        let (signal, _) = state.evaluate_candle(&candle_at("2026-07-17T01:00:00Z"), None);
+        assert!(
+            matches!(signal, RulesSignal::Hold),
+            "the script keeps managing its live position — got {:?}",
             signal
         );
     }
