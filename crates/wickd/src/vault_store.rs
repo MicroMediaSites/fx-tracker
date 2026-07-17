@@ -65,6 +65,13 @@ pub struct Config {
     /// Which environment the user last logged into ("practice" | "live").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active: Option<String>,
+    /// Claude Code config directory (subscription auth) used by headless
+    /// `claude -p` runs (`wickd feed tick|ask`) when `CLAUDE_CONFIG_DIR` is
+    /// not already in the environment — GUI-spawned processes have no shell
+    /// env, so this is how the desktop app's follow-up path picks the right
+    /// account. Absent = claude's own default (`~/.claude`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_config_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -416,6 +423,7 @@ mod tests {
             practice: Some(practice),
             live: None,
             active: Some("practice".into()),
+            claude_config_dir: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         // The on-disk config carries only the non-secret account ids + active
@@ -538,6 +546,7 @@ mod tests {
             practice: Some(EnvConfig { account_id: Some("id".into()), ..Default::default() }),
             live: None,
             active: Some("practice".into()),
+            claude_config_dir: None,
         };
         assert_eq!(config_version(&cfg), 1);
         named(cfg.practice.as_mut().unwrap(), "h004", "id-4");

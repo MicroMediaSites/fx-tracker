@@ -1,18 +1,19 @@
 /**
- * FeedOverlay — the pull-down market-awareness feed.
+ * FeedOverlay — the pull-down market-awareness terminal.
  *
  * Renders inside the WindowHeader / ModalTerminalDrawer drawer shell (which
- * owns drag/resize/⌘K). Content is produced out-of-process: the launchd
- * `wickd feed tick` job appends AI analysis items to `~/.wickd/feed.ndjson`
- * every 15 minutes, and this component polls the read-only `feed_list`
- * command — no network, no AI calls from the app.
+ * owns drag/resize/⌘K), styled as a terminal: monospace text lines, no cards.
+ * Feed items are produced out-of-process (the launchd `wickd feed tick` job
+ * appends to `~/.wickd/feed.ndjson` every 15 minutes) and read via the
+ * offline `feed_list` command. The `>` input row asks follow-up questions via
+ * `feed_ask` (which shells `wickd feed ask` — the AI path stays in the CLI);
+ * the Q/A transcript is session-local and never persisted.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 
-// The producer appends at most every 15 minutes, so a 1-minute poll is
-// already generous — this is not a live tick feed like SignalFeed's 5s.
 const POLL_INTERVAL_MS = 60_000;
+const MAX_QUESTION_LENGTH = 2000;
 
 export type FeedSeverity = 'info' | 'watch' | 'urgent';
 
@@ -66,43 +67,38 @@ export const formatAge = (ts: string, now: Date = new Date()): string => {
   return date.toLocaleString();
 };
 
-const SEVERITY_CHIP: Record<FeedSeverity, string> = {
-  urgent: 'bg-[var(--color-sell)]/15 text-[var(--color-sell)]',
-  watch: 'bg-[var(--color-info)]/15 text-[var(--color-info)]',
-  info: 'bg-gray-500/15 text-[var(--color-text-muted)]',
+const SEVERITY_TEXT: Record<FeedSeverity, string> = {
+  urgent: 'text-red-400',
+  watch: 'text-cyan-400',
+  info: 'text-gray-500',
 };
 
-const FeedRow = ({ item }: { item: FeedItem }) => (
-  <div
-    data-testid="feed-item-row"
-    className="flex flex-wrap items-start gap-x-3 gap-y-1 px-3 py-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)]"
-  >
-    <span
-      className={`px-1.5 py-0.5 text-xs font-semibold rounded uppercase ${SEVERITY_CHIP[item.severity] ?? SEVERITY_CHIP.info}`}
-    >
-      {item.severity}
-    </span>
-    <div className="flex-1 min-w-0">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-semibold text-gray-100">{item.headline}</span>
-        {item.pairs.map((pair) => (
-          <span
-            key={pair}
-            className="px-1.5 py-0.5 text-xs rounded border border-[var(--color-border)] text-[var(--color-text-secondary)]"
-          >
-            {pair}
-          </span>
-        ))}
-      </div>
-      {item.body && (
-        <p className="mt-0.5 text-xs text-[var(--color-text-secondary)] leading-relaxed">{item.body}</p>
+/** One feed item as terminal lines: a tagged headline row, dim body below. */
+const FeedLine = ({ item }: { item: FeedItem }) => (
+  <div data-testid="feed-item-row" className="px-1 py-0.5">
+    <div className="leading-relaxed">
+      <span className={`${SEVERITY_TEXT[item.severity] ?? SEVERITY_TEXT.info}`}>
+        [{item.severity}]
+      </span>
+      {item.pairs.length > 0 && (
+        <span className="text-gray-400"> {item.pairs.join(',')}</span>
       )}
+      <span className="text-gray-100"> {item.headline}</span>
+      <span className="text-gray-600" title={item.ts}>
+        {'  '}· {formatAge(item.ts)}
+      </span>
     </div>
-    <span className="text-xs text-[var(--color-text-muted)] whitespace-nowrap" title={item.ts}>
-      {formatAge(item.ts)}
-    </span>
+    {item.body && (
+      <div className="pl-4 text-gray-500 leading-relaxed whitespace-pre-wrap">{item.body}</div>
+    )}
   </div>
 );
+
+/** A session-local Q or A line in the transcript. */
+interface AskLine {
+  role: 'user' | 'assistant' | 'error';
+  text: string;
+}
 
 interface FeedOverlayProps {
   /** Current drawer height in px; 0 = closed (render nothing). */
@@ -113,24 +109,87 @@ interface FeedOverlayProps {
 
 export const FeedOverlay = ({ height }: FeedOverlayProps) => {
   const items = useFeed();
+  const [askLines, setAskLines] = useState<AskLine[]>([]);
+  const [input, setInput] = useState('');
+  const [asking, setAsking] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Keep the newest output visible as answers stream in.
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [askLines, asking]);
+
+  const send = async () => {
+    const question = input.trim();
+    if (!question || asking) return;
+    setInput('');
+    setAskLines((l) => [...l, { role: 'user', text: question }]);
+    setAsking(true);
+    try {
+      const answer = await invoke<string>('feed_ask', { question });
+      setAskLines((l) => [...l, { role: 'assistant', text: answer }]);
+    } catch (err) {
+      setAskLines((l) => [...l, { role: 'error', text: String(err) }]);
+    } finally {
+      setAsking(false);
+      inputRef.current?.focus();
+    }
+  };
 
   if (height === 0) return null;
 
   return (
-    <div className="h-full flex flex-col font-mono text-sm" data-testid="feed-overlay">
-      <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
+    <div
+      className="h-full flex flex-col font-mono text-xs sm:text-sm"
+      data-testid="feed-overlay"
+    >
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-2 py-1">
         {items.length === 0 ? (
-          <p data-testid="feed-empty" className="text-xs text-[var(--color-text-muted)] px-1 py-2">
-            No feed items yet — the market-awareness feed refreshes every 15 minutes while
-            markets are open.
+          <p data-testid="feed-empty" className="px-1 py-1 text-gray-600">
+            no feed items yet — the market-awareness feed refreshes every 15 minutes while
+            markets are open
           </p>
         ) : (
-          items.map((item) => <FeedRow key={item.id} item={item} />)
+          items.map((item) => <FeedLine key={item.id} item={item} />)
+        )}
+
+        {askLines.map((line, i) => (
+          <div key={i} data-testid="feed-ask-line" className="px-1 py-0.5 leading-relaxed whitespace-pre-wrap">
+            {line.role === 'user' ? (
+              <span className="text-cyan-400">{'> '}{line.text}</span>
+            ) : line.role === 'assistant' ? (
+              <span className="text-emerald-400">{'← '}{line.text}</span>
+            ) : (
+              <span className="text-red-400">{'! '}{line.text}</span>
+            )}
+          </div>
+        ))}
+        {asking && (
+          <div className="px-1 py-0.5 text-gray-500 animate-pulse" data-testid="feed-ask-pending">
+            thinking...
+          </div>
         )}
       </div>
-      {/* TODO(feed-followup): an "ask a follow-up" input row lands here once a
-          local chat path exists again — the drawer shell already reserves the
-          interaction pattern (⌘K, resize). */}
+
+      {/* Follow-up input — asks about the feed via `wickd feed ask` */}
+      <div className="flex items-center gap-1 px-2 py-1 border-t border-gray-800/80">
+        <span className="text-cyan-400 select-none">{'>'}</span>
+        <input
+          ref={inputRef}
+          data-testid="feed-ask-input"
+          type="text"
+          value={input}
+          maxLength={MAX_QUESTION_LENGTH}
+          disabled={asking}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') void send();
+          }}
+          placeholder="ask about the feed…"
+          className="flex-1 bg-transparent outline-none text-gray-100 placeholder-gray-600 disabled:opacity-50"
+        />
+      </div>
     </div>
   );
 };

@@ -91,7 +91,7 @@ const BUILTIN_STRATEGIES: &[&str] = &["ma-crossover", "rsi"];
 
 /// Locate the wickd CLI binary. GUI apps don't inherit a login-shell PATH, so
 /// probe the conventional install locations before falling back to PATH.
-fn find_wickd_binary() -> Option<std::path::PathBuf> {
+pub(crate) fn find_wickd_binary() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(home) = &home {
