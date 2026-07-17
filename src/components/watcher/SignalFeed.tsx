@@ -41,8 +41,25 @@ export const QueueAlertRow = ({ alert, granularity }: { alert: QueuedAlert; gran
             {payload.signal}
           </span>
           <span className="font-semibold">{payload.instrument}</span>
-          <OpenChartButton instrument={payload.instrument} granularity={granularity} />
+          {payload.granularity && (
+            <span
+              data-testid="signal-granularity"
+              className="px-1.5 py-0.5 text-xs rounded border border-[var(--color-border)] text-[var(--color-text-secondary)]"
+            >
+              {payload.granularity}
+            </span>
+          )}
+          <OpenChartButton instrument={payload.instrument} granularity={payload.granularity ?? granularity} />
           <span className="text-sm text-[var(--color-text-secondary)]">{payload.proposal.strategy}</span>
+          {payload.account && (
+            <span
+              data-testid="signal-account"
+              className="text-xs text-[var(--color-text-muted)]"
+              title="Watcher account"
+            >
+              {payload.account}
+            </span>
+          )}
           <span className="flex-1 min-w-0 text-xs text-[var(--color-text-muted)] truncate" title={payload.proposal.reason}>
             {payload.proposal.reason}
           </span>

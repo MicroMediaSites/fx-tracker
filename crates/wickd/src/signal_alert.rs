@@ -143,11 +143,15 @@ pub struct AlertSink<P: RearmPolicy> {
     /// poll it — and, later, promote it into a pending proposal. `None` (the
     /// plain `new` constructor) keeps the sink queue-free, e.g. in unit tests.
     queue: Option<PathBuf>,
+    /// The watcher's `--account`, stamped onto queued entries (issue #8) so
+    /// same-strategy/same-pair watchers on different accounts stay
+    /// distinguishable in the queue. `None` = unattributed (unit tests).
+    account: Option<String>,
 }
 
 impl<P: RearmPolicy> AlertSink<P> {
     pub fn new(inner: Arc<dyn EventSink>, policy: P, format: Format) -> Self {
-        Self { inner, policy, format, queue: None }
+        Self { inner, policy, format, queue: None, account: None }
     }
 
     /// Builder: also durably append every fired strategy-signal alert to the
@@ -155,6 +159,12 @@ impl<P: RearmPolicy> AlertSink<P> {
     /// unit tests).
     pub fn with_queue(mut self, queue: PathBuf) -> Self {
         self.queue = Some(queue);
+        self
+    }
+
+    /// Builder: stamp queued entries with the watcher's `--account` (issue #8).
+    pub fn with_account(mut self, account: String) -> Self {
+        self.account = Some(account);
         self
     }
 
@@ -221,6 +231,8 @@ impl<P: RearmPolicy> EventSink for AlertSink<P> {
                         event.pattern_match.created_at.to_rfc3339(),
                         signal,
                         proposal,
+                        self.account.clone(),
+                        Some(event.timeframe.clone()),
                     );
                     if let Err(e) = crate::alert_queue::append_at(queue, &entry) {
                         eprintln!("warning: alert queue write failed: {e:#}");
@@ -435,6 +447,44 @@ mod tests {
         }
 
         assert_eq!(fired, vec![AlertSignal::Buy, AlertSignal::Sell, AlertSignal::Buy]);
+    }
+
+    // --- queue writes (AGT-620 / issue #8) ---
+
+    // A fired strategy-signal lands in the queue stamped with the watcher's
+    // account (with_account) and the event's timeframe as granularity, so
+    // same-strategy/same-pair watchers on different accounts/timeframes stay
+    // distinguishable (issue #8).
+    #[test]
+    fn queued_entries_carry_account_and_granularity() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "wickd-signal-alert-test-{}-{}.ndjson",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let sink = AlertSink::new(Arc::new(Noop), ChangeDedupPolicy::new(), Format::Ndjson)
+            .with_queue(path.clone())
+            .with_account("tf-m5".to_string());
+
+        sink.pattern_matched(&entry_event("EUR_USD", "rahagod", PositionDirection::Long));
+
+        let entries = crate::alert_queue::list_at(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].payload {
+            crate::alert_queue::QueuedPayload::StrategySignal { account, granularity, .. } => {
+                assert_eq!(account.as_deref(), Some("tf-m5"));
+                // entry_event's timeframe
+                assert_eq!(granularity.as_deref(), Some("H1"));
+            }
+            other => panic!("expected strategy-signal, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 
     // --- passthrough: every event still reaches `inner` unchanged ---

@@ -372,7 +372,8 @@ async fn watch(args: WatchArgs) -> Result<()> {
     // alert queue so an agent can poll it and later `wickd queue promote <id>`.
     let sink: Arc<dyn EventSink> = Arc::new(
         AlertSink::new(base_sink, ChangeDedupPolicy::new(), args.format)
-            .with_queue(crate::alert_queue::queue_path()?),
+            .with_queue(crate::alert_queue::queue_path()?)
+            .with_account(args.account.clone()),
     );
 
     // Install a SIGTERM handler in addition to SIGINT (Ctrl-C) — AC4.

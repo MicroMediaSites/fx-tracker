@@ -140,6 +140,17 @@ pub enum QueuedPayload {
         /// Boxed: the proposal dwarfs the price-level variant
         /// (clippy::large_enum_variant); serde is transparent to the Box.
         proposal: Box<PendingSignal>,
+        /// The watcher's `--account` (issue #8). Distinguishes otherwise
+        /// identical rows when several watchers run the same strategy/pair on
+        /// different accounts. `Option` + `default` so rows queued before this
+        /// field existed still parse; `skip_serializing_if` keeps new rows
+        /// readable by pre-field consumers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+        /// The watcher's candle granularity, e.g. `M5` (issue #8). Same
+        /// backward-compatibility contract as `account`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        granularity: Option<String>,
     },
 }
 
@@ -178,7 +189,15 @@ impl QueuedAlert {
 
     /// Build a queued strategy-signal alert from the fire's [`PendingSignal`]
     /// proposal (promotable). `signal` is the typed Buy/Sell classification.
-    pub fn strategy_signal(ts: String, signal: AlertSignal, proposal: PendingSignal) -> Self {
+    /// `account` / `granularity` identify WHICH watcher fired (issue #8) —
+    /// pass them when known; `None` only for legacy/unknown-origin fires.
+    pub fn strategy_signal(
+        ts: String,
+        signal: AlertSignal,
+        proposal: PendingSignal,
+        account: Option<String>,
+        granularity: Option<String>,
+    ) -> Self {
         Self {
             id: Self::new_id(),
             ts,
@@ -186,6 +205,8 @@ impl QueuedAlert {
                 instrument: proposal.instrument.clone(),
                 signal,
                 proposal: Box::new(proposal),
+                account,
+                granularity,
             },
         }
     }
@@ -302,6 +323,8 @@ mod tests {
             "2026-06-30T00:00:00Z".to_string(),
             AlertSignal::Buy,
             sample_proposal("match-1", "long", 1000),
+            Some("h004".to_string()),
+            Some("M5".to_string()),
         );
         let b = QueuedAlert::price_level(
             "2026-06-30T00:00:05Z".to_string(),
@@ -335,6 +358,8 @@ mod tests {
             "2026-06-30T00:00:00Z".to_string(),
             AlertSignal::Sell,
             sample_proposal("match-2", "short", -1000),
+            None,
+            None,
         );
         let proposal = strat.promotable_proposal().expect("strategy-signal is promotable");
         assert_eq!(proposal.id, "match-2");
@@ -360,6 +385,49 @@ mod tests {
         let path = temp_queue();
         assert!(list_at(&path).unwrap().is_empty());
         assert!(get_at(&path, "anything").unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Issue #8 backward compatibility: rows queued BEFORE the account /
+    // granularity fields existed must still parse (as None), and a full
+    // round-trip preserves the new fields.
+    #[test]
+    fn strategy_signal_fields_are_backward_compatible() {
+        // A verbatim pre-#8 line: no account, no granularity.
+        let legacy = r#"{"id":"q-1","ts":"2026-06-30T00:00:00Z","payload":{"kind":"strategy-signal","instrument":"EUR_USD","signal":"buy","proposal":{"id":"match-1","ts":"2026-06-30T00:00:00+00:00","instrument":"EUR_USD","side":"long","units":1000,"strategy":"ma-crossover","reason":"fast SMA crossed above slow","sl":"1.0800","tp":"1.0950","entry_price":"1.0850","status":"pending"}}}"#;
+        let entry: QueuedAlert = serde_json::from_str(legacy).expect("legacy row parses");
+        match &entry.payload {
+            QueuedPayload::StrategySignal { account, granularity, .. } => {
+                assert_eq!(account, &None);
+                assert_eq!(granularity, &None);
+            }
+            other => panic!("expected strategy-signal, got {other:?}"),
+        }
+
+        // None fields are omitted on the wire (old readers see the old shape).
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("\"account\""));
+        assert!(!json.contains("\"granularity\""));
+
+        // Round-trip with the fields set preserves them.
+        let path = temp_queue();
+        let tagged = QueuedAlert::strategy_signal(
+            "2026-06-30T00:00:00Z".to_string(),
+            AlertSignal::Buy,
+            sample_proposal("match-3", "long", 1000),
+            Some("tf-m5".to_string()),
+            Some("M5".to_string()),
+        );
+        append_at(&path, &tagged).unwrap();
+        let listed = list_at(&path).unwrap();
+        assert_eq!(listed.len(), 1);
+        match &listed[0].payload {
+            QueuedPayload::StrategySignal { account, granularity, .. } => {
+                assert_eq!(account.as_deref(), Some("tf-m5"));
+                assert_eq!(granularity.as_deref(), Some("M5"));
+            }
+            other => panic!("expected strategy-signal, got {other:?}"),
+        }
         let _ = std::fs::remove_file(&path);
     }
 

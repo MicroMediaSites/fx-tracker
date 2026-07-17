@@ -279,6 +279,8 @@ mod tests {
             "2026-06-30T00:00:00Z".to_string(),
             AlertSignal::Buy,
             proposal("match-1", "long", 1000),
+            None,
+            None,
         );
         alert_queue::append_at(&qpath, &alert).unwrap();
 
@@ -350,6 +352,8 @@ mod tests {
             "2026-06-30T00:00:00Z".to_string(),
             AlertSignal::Sell,
             proposal("match-2", "short", -1000),
+            None,
+            None,
         );
         alert_queue::append_at(&qpath, &alert).unwrap();
 
@@ -378,6 +382,8 @@ mod tests {
             "2026-06-30T00:00:00Z".to_string(),
             AlertSignal::Buy,
             sig.clone(),
+            None,
+            None,
         );
         alert_queue::append_at(&qpath, &alert).unwrap();
         // Simulate the semi-auto sink: the pending exists, but no promote ran.
@@ -408,6 +414,8 @@ mod tests {
             "2026-06-30T00:00:00Z".to_string(),
             AlertSignal::Sell,
             sig.clone(),
+            None,
+            None,
         );
         alert_queue::append_at(&qpath, &alert).unwrap();
         pending::append_at(&ppath, &sig).unwrap();

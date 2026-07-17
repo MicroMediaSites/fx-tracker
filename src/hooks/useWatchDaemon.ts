@@ -58,6 +58,10 @@ export type QueuedPayload =
       instrument: string;
       signal: 'buy' | 'sell';
       proposal: PendingSignal;
+      /** Watcher's --account (issue #8). Absent on rows queued before the field existed. */
+      account?: string;
+      /** Watcher's candle granularity, e.g. "M5" (issue #8). Absent on legacy rows. */
+      granularity?: string;
     };
 
 export interface QueuedAlert {
