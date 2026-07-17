@@ -21,6 +21,7 @@ automatically, restart on crash, and survive reboots (AGT-629).
 | **Autonomous watcher** (one per strategy) | `com.openthink.wickd-watch.<slug>` | `wickd watch <strategy> <instruments> --granularity <g> --env practice --account <a> --units <n> --auto` |
 | **Books collector** (singleton, periodic one-shot) | `com.openthink.wickd-books` | `wickd books <instruments> --store --env <e> --account <a>` every `StartInterval` seconds |
 | **Calendar sync** (singleton, periodic one-shot) | `com.openthink.wickd-calendar` | `wickd calendar sync` every `StartInterval` seconds |
+| **Feed producer** (singleton, periodic one-shot) | `com.openthink.wickd-feed` | `wickd feed tick --model <m>` every `StartInterval` seconds |
 | **Candle watchdog** (singleton, periodic one-shot) | `com.openthink.wickd-watchdog` | `python3 wickd-candle-watchdog.py --grace <s> --realert <s>` every `StartInterval` seconds |
 
 **Calendar sync** keeps `~/.wickd/calendar/` (the economic-calendar CSV store
@@ -33,6 +34,19 @@ directory-fingerprint refresh never sees a torn file. No OANDA credentials:
 the only network call is a public GET. Install:
 `install.sh calendar [--interval 21600]`; logs:
 `~/Library/Logs/wickd/calendar.{out,err}.log`.
+
+**Feed producer** appends AI market-awareness items to `~/.wickd/feed.ndjson`
+(rendered by the desktop app's pull-down feed drawer via the offline
+`feed_list` command). Each tick pre-assembles context in Rust — watchlist
+pairs, running watchers, pending proposals, recent alerts, calendar events on
+watched-pair legs, recent H1 closes (OANDA, login keychain), live hub mids,
+`think recall` priorities — and runs ONE headless `claude -p` analysis
+(no tools) on the logged-in Claude **subscription**, selected by
+`CLAUDE_CONFIG_DIR` in the plist. Default interval 900s (15m); weekend ticks
+short-circuit before any network/AI call, diff-aware prompting makes quiet
+markets append nothing, and the store is pruned to its newest 500 items.
+Install: `install.sh feed [--interval 900] [--model sonnet]
+[--claude-config-dir DIR]`; logs: `~/Library/Logs/wickd/feed.{out,err}.log`.
 
 **The books collector is not a daemon.** launchd fires it on an interval
 (default 1200s — OANDA's 20-minute book-snapshot cadence), it appends any new

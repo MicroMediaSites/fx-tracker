@@ -2,7 +2,7 @@
 #
 # Install a wickd LaunchAgent (macOS) — AGT-629.
 #
-# Four job kinds:
+# Job kinds:
 #
 #   install.sh stream [INSTRUMENTS] [--env ENV] [--account NAME] [--wickd PATH] [--dry-run]
 #       Supervise the `wickd stream` socket hub — one OANDA subscription fanned
@@ -21,6 +21,15 @@
 #       weekly feed into ~/.wickd/calendar/. Singleton: label
 #       com.openthink.wickd-calendar. Default interval 21600s (6h). No
 #       OANDA credentials involved.
+#
+#   install.sh feed [--interval SECS] [--model M] [--claude PATH] \
+#                   [--claude-config-dir DIR] [--wickd PATH] [--dry-run]
+#       Periodic one-shot `wickd feed tick` producing the AI market-awareness
+#       feed (~/.wickd/feed.ndjson) via one headless `claude -p` run per tick
+#       on the logged-in Claude subscription. Singleton: label
+#       com.openthink.wickd-feed. Default interval 900s (15m). Weekend ticks
+#       and "nothing new" runs are quiet no-ops. PATH in the plist gains the
+#       claude binary's directory; CLAUDE_CONFIG_DIR selects the account.
 #
 #   install.sh books [INSTRUMENTS] [--interval SECS] [--env ENV] \
 #                    [--account NAME] [--wickd PATH] [--dry-run]
@@ -57,7 +66,7 @@ LOG_DIR="${HOME}/Library/Logs/wickd"
 die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,49p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,58p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
@@ -275,6 +284,62 @@ install_calendar() {
         "__INTERVAL__=${interval}"
 }
 
+# --- feed sub-command -----------------------------------------------------------
+install_feed() {
+    local interval="900" model="" wickd="" claude="" claude_config_dir="" dry="0"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interval)          interval="$2"; shift 2 ;;
+            --model)             model="$2"; shift 2 ;;
+            --wickd)             wickd="$2"; shift 2 ;;
+            --claude)            claude="$2"; shift 2 ;;
+            --claude-config-dir) claude_config_dir="$2"; shift 2 ;;
+            --dry-run)           dry="1"; shift ;;
+            -h|--help)           usage 0 ;;
+            --*)                 die "unknown option: $1" ;;
+            *)                   die "unexpected argument: $1" ;;
+        esac
+    done
+    [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -gt 0 ]] \
+        || die "--interval must be a positive integer (seconds)"
+
+    # Resolve the claude binary so the plist PATH can carry its directory
+    # (launchd's default PATH misses ~/.local/bin, where claude usually lives).
+    if [[ -z "${claude}" ]]; then
+        claude="$(command -v claude)" \
+            || die "could not find 'claude' on PATH; pass --claude /abs/path/to/claude"
+    fi
+    [[ -x "${claude}" ]] || die "'${claude}' is not an executable file"
+    local claude_dir
+    claude_dir="$(cd "$(dirname "${claude}")" && pwd)"
+
+    # Which Claude Code account the tick bills to. Defaults to the caller's
+    # CLAUDE_CONFIG_DIR, then the stock ~/.claude.
+    if [[ -z "${claude_config_dir}" ]]; then
+        claude_config_dir="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
+    fi
+    [[ -d "${claude_config_dir}" ]] \
+        || die "claude config dir '${claude_config_dir}' does not exist (pass --claude-config-dir)"
+
+    local bin label dest template
+    bin="$(resolve_wickd "${wickd}")"
+    label="com.openthink.wickd-feed"
+    dest="${LA_DIR}/${label}.plist"
+    template="${SCRIPT_DIR}/${label}.plist"
+
+    echo "feed producer: ${bin} feed tick --model ${model:-sonnet}"
+    echo "  every ${interval}s; claude: ${claude} (config: ${claude_config_dir})"
+    echo "  logs: ${LOG_DIR}/feed.{out,err}.log; store: ~/.wickd/feed.ndjson"
+    render_and_install "${template}" "${dest}" "${label}" "${dry}" \
+        "__WICKD_BIN__=${bin}" \
+        "__HOME__=${HOME}" \
+        "__LOG_DIR__=${LOG_DIR}" \
+        "__INTERVAL__=${interval}" \
+        "__MODEL__=${model:-sonnet}" \
+        "__CLAUDE_DIR__=${claude_dir}" \
+        "__CLAUDE_CONFIG_DIR__=${claude_config_dir}"
+}
+
 # --- watchdog sub-command -------------------------------------------------------
 install_watchdog() {
     local interval="300" grace="1200" realert="3600" dry="0"
@@ -326,7 +391,8 @@ case "$1" in
     watch)    shift; install_watch "$@" ;;
     books)    shift; install_books "$@" ;;
     calendar) shift; install_calendar "$@" ;;
+    feed)    shift; install_feed "$@" ;;
     watchdog) shift; install_watchdog "$@" ;;
     -h|--help) usage 0 ;;
-    *)      die "unknown job kind '$1' (expected 'stream', 'watch', 'books', 'calendar', or 'watchdog')" ;;
+    *)      die "unknown job kind '$1' (expected 'stream', 'watch', 'books', 'calendar', 'feed', or 'watchdog')" ;;
 esac

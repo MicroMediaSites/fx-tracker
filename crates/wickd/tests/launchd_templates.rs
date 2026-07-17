@@ -253,3 +253,53 @@ fn install_and_uninstall_scripts_cover_the_watchdog() {
         assert!(mode & 0o111 != 0, "wickd-candle-watchdog.py is not executable (mode {mode:o})");
     }
 }
+
+#[test]
+fn feed_template_is_a_subscription_authed_periodic_oneshot() {
+    let t = read("com.openthink.wickd-feed.plist");
+
+    assert!(
+        t.contains("<string>com.openthink.wickd-feed</string>"),
+        "feed label"
+    );
+    assert!(t.contains("<string>feed</string>") && t.contains("<string>tick</string>"), "runs wickd feed tick");
+    assert!(t.contains("<string>--model</string>") && t.contains("<string>__MODEL__</string>"), "threads --model");
+
+    // Periodic one-shot like calendar/books: interval + run-at-load, NO
+    // KeepAlive — a failed tick just waits for the next firing (and the
+    // command's own feed.lock makes an overlapping fire a clean no-op).
+    assert!(t.contains("<key>StartInterval</key>"), "fires on an interval");
+    assert!(t.contains("<key>RunAtLoad</key>"), "ticks once at login");
+    assert!(!t.contains("<key>KeepAlive</key>"), "one-shot must not be kept alive");
+
+    // Subscription auth plumbing: claude's directory joins PATH and the
+    // Claude Code account is pinned via CLAUDE_CONFIG_DIR.
+    assert!(t.contains("__CLAUDE_DIR__:"), "claude binary dir leads PATH");
+    assert!(t.contains("<key>CLAUDE_CONFIG_DIR</key>"), "account pinned via CLAUDE_CONFIG_DIR");
+
+    assert!(t.contains("feed.out.log") && t.contains("feed.err.log"), "log filenames");
+
+    let rendered = render(
+        &t,
+        &[
+            ("__WICKD_BIN__", "/usr/local/bin/wickd"),
+            ("__HOME__", "/Users/tester"),
+            ("__LOG_DIR__", "/Users/tester/Library/Logs/wickd"),
+            ("__INTERVAL__", "900"),
+            ("__MODEL__", "sonnet"),
+            ("__CLAUDE_DIR__", "/Users/tester/.local/bin"),
+            ("__CLAUDE_CONFIG_DIR__", "/Users/tester/.claude"),
+        ],
+    );
+    assert_plutil_valid(&rendered, "feed");
+}
+
+#[test]
+fn install_and_uninstall_scripts_cover_the_feed_producer() {
+    let i = read("install.sh");
+    assert!(i.contains("install_feed"), "install.sh has a feed installer");
+    assert!(i.contains("__CLAUDE_CONFIG_DIR__="), "install.sh renders the claude config dir");
+
+    let u = read("uninstall.sh");
+    assert!(u.contains("com.openthink.wickd-feed"), "uninstall.sh removes the feed producer");
+}
