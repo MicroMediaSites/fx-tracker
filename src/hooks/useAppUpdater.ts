@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { check, Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 
@@ -9,7 +10,18 @@ export type UpdateStatus =
   | 'downloading'
   | 'ready'
   | 'error'
+  | 'local-build'
   | 'up-to-date';
+
+/**
+ * True when this binary cannot self-update: local builds keep the
+ * placeholder updater endpoint in tauri.conf.json (release.yml swaps in the
+ * real GitHub endpoint at release-build time), so check() against them can
+ * only ever produce a connection error. Fails open (false) so a release
+ * build never gets stuck on this probe.
+ */
+export const isLocalBuild = (): Promise<boolean> =>
+  invoke<boolean>('updater_is_placeholder').catch(() => false);
 
 export type BuildMode = 'development' | 'staging' | 'production';
 
@@ -52,6 +64,13 @@ export function useAppUpdater() {
     }
 
     setState(prev => ({ ...prev, status: 'checking', error: null }));
+
+    // Local builds can't self-update — report that instead of the raw
+    // connection error from the placeholder endpoint.
+    if (await isLocalBuild()) {
+      setState(prev => ({ ...prev, status: 'local-build' }));
+      return false;
+    }
 
     try {
       const update = await check();

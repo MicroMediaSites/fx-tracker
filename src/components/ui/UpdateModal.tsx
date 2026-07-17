@@ -48,9 +48,14 @@ export const UpdateModal = ({
     }
   }, [isOpen, autoCheck, status, checkForUpdates]);
 
-  // Auto-close if up-to-date or errored and not manually triggered
+  // Auto-close if up-to-date, a non-updatable local build, or errored and
+  // not manually triggered
   useEffect(() => {
-    if (isOpen && !triggeredManually && (status === 'up-to-date' || status === 'error')) {
+    if (
+      isOpen &&
+      !triggeredManually &&
+      (status === 'up-to-date' || status === 'error' || status === 'local-build')
+    ) {
       onClose();
     }
   }, [isOpen, status, triggeredManually, onClose]);
@@ -256,6 +261,37 @@ function renderContent(status: UpdateStatus, props: ContentProps) {
               className="px-4 py-2 bg-green-600 rounded hover:bg-green-500 transition-colors"
             >
               Restart Now
+            </button>
+          </div>
+        </div>
+      );
+
+    case 'local-build':
+      return (
+        <div className="space-y-4" data-testid="update-local-build">
+          <div className="flex items-start gap-4">
+            <div className="w-12 h-12 rounded-full bg-gray-600/20 flex items-center justify-center flex-shrink-0">
+              <svg className="w-6 h-6 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+              </svg>
+            </div>
+            <div>
+              <p className="text-gray-300">
+                This is a local build — self-update is disabled
+              </p>
+              <p className="text-gray-500 text-sm mt-1">
+                Version {props.currentVersion}, built from source. Updates are
+                installed by rebuilding and reinstalling; release builds check
+                GitHub Releases automatically.
+              </p>
+            </div>
+          </div>
+          <div className="flex justify-end pt-2">
+            <button
+              onClick={props.onLater}
+              className="px-4 py-2 bg-gray-600 rounded hover:bg-gray-500 transition-colors"
+            >
+              Close
             </button>
           </div>
         </div>
