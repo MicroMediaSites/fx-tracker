@@ -5,13 +5,12 @@
  * - Subset metrics (P&L, win rate, avg win/loss)
  * - Indicator conflict patterns (computed via batch analysis)
  * - Individual trades with Open in Chart
- * - AI terminal overlay (unified pattern)
+ * - Market feed drawer (unified pattern)
  */
-import { useEffect, useMemo, useState, useCallback } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { ModalTerminalDrawer } from '../ui/ModalTerminalDrawer';
 import { TradeData, DataRange } from './BacktestResultsPanel';
-import type { ChatContext } from '../../hooks/useTerminalChat';
 
 type TradeSubset = 'worst' | 'best' | 'direction';
 
@@ -71,7 +70,6 @@ export const TradeSubsetModal = ({
   dataRange,
   onClose,
   strategyId,
-  strategyName,
 }: TradeSubsetModalProps) => {
   const [conflictPatterns, setConflictPatterns] = useState<ConflictPattern[]>([]);
   const [conflictsLoading, setConflictsLoading] = useState(false);
@@ -214,66 +212,6 @@ export const TradeSubsetModal = ({
   };
 
   const title = subset === 'worst' ? 'Worst Trades' : subset === 'best' ? 'Best Trades' : 'Longs vs Shorts';
-
-  // Build context for AI terminal
-  const buildTerminalContext = useCallback((): ChatContext => {
-    const subsetLabel = subset === 'worst' ? 'worst performing'
-      : subset === 'best' ? 'best performing'
-      : 'direction comparison';
-
-    // Format trades as summary for context
-    const tradeSummaries = trades.slice(0, 10).map((trade, idx) => {
-      const pnl = parseFloat(trade.pnl);
-      const duration = formatDuration(trade.entryTime, trade.exitTime);
-      return {
-        num: idx + 1,
-        direction: trade.direction,
-        pnl: pnl.toFixed(2),
-        duration,
-        entryTime: formatTradeTime(trade.entryTime),
-      };
-    });
-
-    // Format conflict patterns
-    const conflicts = conflictPatterns.map(p => ({
-      indicator: p.indicatorName,
-      count: p.count,
-      total: p.totalTrades,
-      percentage: Math.round((p.count / p.totalTrades) * 100),
-      reason: p.reason,
-    }));
-
-    return {
-      type: 'backtesting',
-      strategy_name: strategyName,
-      methodology: 'simple_historical',
-      has_results: true,
-      // Subset-specific context
-      subset_type: subset,
-      subset_description: `${trades.length} ${subsetLabel} trades`,
-      instrument,
-      granularity,
-      trade_count: trades.length,
-      total_pnl: metrics?.totalPnl.toFixed(2),
-      win_rate: metrics?.winRate.toFixed(1),
-      winners: metrics?.winners,
-      losers: metrics?.losers,
-      avg_win: metrics?.avgWin.toFixed(2),
-      avg_loss: metrics?.avgLoss.toFixed(2),
-      long_win_rate: directionMetrics?.longWinRate.toFixed(1),
-      short_win_rate: directionMetrics?.shortWinRate.toFixed(1),
-      long_count: tradeSubsets.longs.count,
-      short_count: tradeSubsets.shorts.count,
-      indicator_conflicts: conflicts.length > 0 ? conflicts : undefined,
-      sample_trades: tradeSummaries,
-      data_range: {
-        start: dataRange.startTime,
-        end: dataRange.endTime,
-        candles: dataRange.totalCandles,
-      },
-      parameters: [],
-    };
-  }, [subset, trades, metrics, directionMetrics, conflictPatterns, instrument, granularity, strategyName, tradeSubsets, dataRange]);
 
   const isProfitable = metrics ? metrics.totalPnl >= 0 : false;
 
@@ -510,32 +448,10 @@ export const TradeSubsetModal = ({
           </div>
         </div>
 
-        {/* AI Terminal Overlay */}
+        {/* Market feed drawer */}
         <ModalTerminalDrawer
           modalId={`backtest-subset:${strategyId || 'unknown'}:${subset}`}
-          contextProvider={buildTerminalContext}
           topOffset={73}
-          header={`Ask about ${subset === 'direction' ? 'direction bias' : `${subset} trades`}`}
-          headerDescription={
-            subset === 'worst' ? 'What patterns do the worst trades share?'
-              : subset === 'best' ? 'What made these trades successful?'
-              : 'How do longs compare to shorts?'
-          }
-          welcomeContent={
-            subset === 'worst' ? [
-              'Try: "What do these losing trades have in common?"',
-              'Try: "Was there a market condition that hurt these trades?"',
-              'Try: "Should I have exited earlier on any of these?"',
-            ] : subset === 'best' ? [
-              'Try: "What made these trades successful?"',
-              'Try: "Can I replicate this success?"',
-              'Try: "What entry conditions led to winners?"',
-            ] : [
-              'Try: "Am I better at longs or shorts?"',
-              'Try: "Should I focus on one direction?"',
-              'Try: "What market conditions favor each direction?"',
-            ]
-          }
         />
       </div>
     </div>

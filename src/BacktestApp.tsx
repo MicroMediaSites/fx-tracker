@@ -25,14 +25,6 @@ import { useStrategyMutations } from './components/backtest/useStrategyMutations
 import { useStrategyPromotion } from './components/backtest/useStrategyPromotion';
 import { FirstRunTour } from './components/onboarding/FirstRunTour';
 import { backtestTourSteps } from './lib/tourSteps';
-import { buildBacktestingContext } from './lib/chatContextBuilder';
-import { getTerminalWelcome } from './lib/terminalWelcome';
-import {
-  serializeStrategyRules,
-  serializeParameterDefinitions,
-  serializeWindowSummary,
-  serializeSelectedWindow,
-} from './lib/strategyContextSerializer';
 import type { WalkForwardResult, WalkForwardPeriod } from './types/strategy';
 
 /** Convert a Strategy object to JSON string for backend validation */
@@ -127,16 +119,16 @@ export const BacktestApp = () => {
   const [useDefaultParams, setUseDefaultParams] = useState<UseDefaultParams>({});
   // Test zones for backtesting (separate from chart zones to avoid look-ahead bias)
   const [testZones, setTestZones] = useState<TestZone[]>([]);
-  // Holdout results summary for AI context
-  const [holdoutSummary, setHoldoutSummary] = useState<string | null>(null);
-  // Current backtest job info for AI context (walk-forward tests)
-  const [currentJobInfo, setCurrentJobInfo] = useState<{
+  // Holdout results summary (children still report it; consumer removed with the chat terminal)
+  const [, setHoldoutSummary] = useState<string | null>(null);
+  // Current backtest job info (children still report it; consumer removed with the chat terminal)
+  const [, setCurrentJobInfo] = useState<{
     jobId: string;
     hasResults: boolean;
     metricsSummary?: string;
   } | null>(null);
-  // Walk-forward context for AI (results + selected window)
-  const [wfContext, setWfContext] = useState<{
+  // Walk-forward context (children still report it; consumer removed with the chat terminal)
+  const [, setWfContext] = useState<{
     wfResult: WalkForwardResult | null;
     selectedWindow: WalkForwardPeriod | null;
   }>({ wfResult: null, selectedWindow: null });
@@ -428,31 +420,6 @@ export const BacktestApp = () => {
     return initializeVersions(strategy);
   };
 
-  // Build AI context fields from strategy and WF state
-  const buildAiContextFields = useCallback((strategy: Strategy | null | undefined) => {
-    if (!strategy) return {};
-    const isScripted = strategy.strategy_type === 'scripted';
-    return {
-      strategyRules: !isScripted ? serializeStrategyRules(
-        strategy.entry_rules || [],
-        strategy.exit_rules || [],
-        strategy.indicators || [],
-        strategy.parameters || [],
-        strategy.risk_settings,
-        strategy.variables,
-      ) : undefined,
-      parameterDefinitions: (strategy.parameters?.length ?? 0) > 0
-        ? serializeParameterDefinitions(strategy.parameters || [])
-        : undefined,
-      windowSummary: wfContext.wfResult
-        ? serializeWindowSummary(wfContext.wfResult)
-        : undefined,
-      selectedWindow: wfContext.selectedWindow
-        ? serializeSelectedWindow(wfContext.selectedWindow, strategy.parameters || [])
-        : undefined,
-    };
-  }, [wfContext]);
-
   return (
     <div className="min-h-screen bg-[var(--color-bg-page)] text-[var(--color-text-primary)]">
       <WindowHeader
@@ -460,33 +427,6 @@ export const BacktestApp = () => {
         currentWindow="backtesting"
         settingsOpen={settingsOpen}
         onSettingsChange={setSettingsOpen}
-        terminalContextProvider={() => {
-          const activeStrategy = workingCopy ?? selectedStrategy;
-          return buildBacktestingContext({
-            strategyId: activeStrategy?.id,
-            strategyName: activeStrategy?.name,
-            strategyDescription: activeStrategy?.description,
-            strategyRiskSettings: activeStrategy?.risk_settings
-              ? { ...activeStrategy.risk_settings }
-              : undefined,
-            strategyType: activeStrategy?.strategy_type,
-            scriptContent: activeStrategy?.script_content ?? undefined,
-            methodology: methodology ?? undefined,
-            parameters: (activeStrategy?.parameters || []).map(p => ({
-              name: p.id,
-              currentValue: String(testingValues[p.id] ?? p.default),
-              defaultValue: String(p.default),
-            })),
-            hasResults: !!currentJobInfo?.hasResults || !!holdoutSummary,
-            backtestJobId: currentJobInfo?.jobId,
-            metricsSummary: currentJobInfo?.metricsSummary,
-            holdoutSummary: holdoutSummary ?? undefined,
-            ...buildAiContextFields(activeStrategy),
-          });
-        }}
-        terminalHeader={getTerminalWelcome('backtesting', { strategyName: workingCopy?.name ?? selectedStrategy?.name }).header}
-        terminalHeaderDescription={getTerminalWelcome('backtesting', { strategyName: workingCopy?.name ?? selectedStrategy?.name }).description}
-        terminalWelcomeContent={getTerminalWelcome('backtesting', { strategyName: workingCopy?.name ?? selectedStrategy?.name }).content}
       />
 
       <FirstRunTour windowType="backtest" steps={backtestTourSteps} />

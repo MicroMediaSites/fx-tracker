@@ -7,6 +7,7 @@ pub mod chat;
 pub mod credentials;
 pub mod daemon;
 pub mod economic_calendar;
+pub mod feed;
 pub mod data;
 pub mod local_store;
 pub mod oanda;

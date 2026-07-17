@@ -27,8 +27,8 @@ export const accountTourSteps: TourStep[] = [
   },
   {
     target: '[data-tour="ai-overlay"]',
-    title: 'AI Assistant',
-    description: 'Need help? Ask the AI assistant anything about this window.',
+    title: 'Market Feed',
+    description: 'Pull down for the AI market-awareness feed — what to care about right now, refreshed every 15 minutes.',
     position: 'top',
   },
 ];
@@ -54,8 +54,8 @@ export const chartTourSteps: TourStep[] = [
   },
   {
     target: '[data-tour="ai-overlay"]',
-    title: 'AI Assistant',
-    description: 'Need help? Ask the AI assistant anything about this window.',
+    title: 'Market Feed',
+    description: 'Pull down for the AI market-awareness feed — what to care about right now, refreshed every 15 minutes.',
     position: 'top',
   },
 ];
@@ -75,8 +75,8 @@ export const backtestTourSteps: TourStep[] = [
   },
   {
     target: '[data-tour="ai-overlay"]',
-    title: 'AI Assistant',
-    description: 'Need help? Ask the AI assistant anything about this window.',
+    title: 'Market Feed',
+    description: 'Pull down for the AI market-awareness feed — what to care about right now, refreshed every 15 minutes.',
     position: 'top',
   },
 ];
@@ -96,8 +96,8 @@ export const watcherTourSteps: TourStep[] = [
   },
   {
     target: '[data-tour="ai-overlay"]',
-    title: 'AI Assistant',
-    description: 'Need help? Ask the AI assistant anything about this window.',
+    title: 'Market Feed',
+    description: 'Pull down for the AI market-awareness feed — what to care about right now, refreshed every 15 minutes.',
     position: 'top',
   },
 ];
@@ -117,8 +117,8 @@ export const tradeAnalysisTourSteps: TourStep[] = [
   },
   {
     target: '[data-tour="ai-overlay"]',
-    title: 'AI Assistant',
-    description: 'Need help? Ask the AI assistant anything about this window.',
+    title: 'Market Feed',
+    description: 'Pull down for the AI market-awareness feed — what to care about right now, refreshed every 15 minutes.',
     position: 'top',
   },
 ];

@@ -1,13 +1,11 @@
-import { useState, useEffect, useRef, useCallback, useMemo, ReactNode } from 'react';
+import { useState, useEffect, useRef, useCallback, ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { SettingsModal } from '../settings/SettingsModal';
-import { TerminalOverlay } from './TerminalOverlay';
-import { getSuggestedPrompts } from '../../lib/suggestedPrompts';
-import type { ChatContext } from '../../hooks/useTerminalChat';
+import { FeedOverlay } from './FeedOverlay';
 import logo from '../../assets/logo_crop_bw.png';
 
 type WindowType = 'account' | 'charting' | 'backtesting' | 'ticket' | 'watcher' | 'tradeanalysis';
@@ -32,14 +30,6 @@ interface WindowHeaderProps {
   settingsOpen?: boolean;
   /** Callback when settings should open/close - required if settingsOpen is provided */
   onSettingsChange?: (open: boolean) => void;
-  /** Optional function to build context for AI terminal. Called on each message. */
-  terminalContextProvider?: () => ChatContext;
-  /** AI terminal header (cyan) */
-  terminalHeader?: string;
-  /** AI terminal description (gray) */
-  terminalHeaderDescription?: string;
-  /** AI terminal welcome content lines */
-  terminalWelcomeContent?: string[];
 }
 
 /**
@@ -56,31 +46,15 @@ export const WindowHeader = ({
   fullWidth = false,
   settingsOpen: externalSettingsOpen,
   onSettingsChange,
-  terminalContextProvider,
-  terminalHeader,
-  terminalHeaderDescription,
-  terminalWelcomeContent,
 }: WindowHeaderProps) => {
   const dataSource = useSettingsStore((s) => s.dataSource);
-  // The AI terminal is always available; the backend command reports
-  // clearly if local AI is not configured.
-  const hasAiTerminal = true;
+  // The feed drawer is always available; it renders its own empty state when
+  // the launchd producer hasn't written anything yet.
+  const hasFeedDrawer = true;
   const [credentials, setCredentials] = useState<OandaCredentials | null>(null);
   const [internalSettingsOpen, setInternalSettingsOpen] = useState(false);
   // Flame states: 'hidden' (initial), 'animating-rays', 'animating-ignition', 'steady'
   const [flameState, setFlameState] = useState<'hidden' | 'animating-rays' | 'animating-ignition' | 'steady'>('hidden');
-
-  // Compute contextual suggested prompts for the AI terminal.
-  // Uses the context provider if available to determine state (empty vs active).
-  const suggestedPrompts = useMemo(() => {
-    try {
-      const context = terminalContextProvider?.() ?? { type: currentWindow };
-      return getSuggestedPrompts(currentWindow, context as Record<string, unknown>);
-    } catch {
-      // Context provider may throw if data isn't ready yet - fall back to window-type-only prompts
-      return getSuggestedPrompts(currentWindow, { type: currentWindow });
-    }
-  }, [currentWindow, terminalContextProvider]);
 
   // Header collapse state - persisted per window type
   const headerCollapseKey = `header-collapsed:${currentWindow}`;
@@ -105,12 +79,12 @@ export const WindowHeader = ({
   // Set CSS variable for header height (used by sticky elements)
   useEffect(() => {
     // Collapsed header is 24px (h-6), expanded is ~60px (py-3 padding + content)
-    // Terminal handle adds 12px when AI terminal is available
+    // Feed-drawer handle adds 12px when available
     const baseHeight = headerCollapsed ? 24 : 60;
-    const handleHeight = hasAiTerminal && !headerCollapsed ? 12 : 0;
+    const handleHeight = hasFeedDrawer && !headerCollapsed ? 12 : 0;
     const headerHeight = baseHeight + handleHeight;
     document.documentElement.style.setProperty('--header-height', `${headerHeight}px`);
-  }, [headerCollapsed, hasAiTerminal]);
+  }, [headerCollapsed, hasFeedDrawer]);
 
   // Use external state if provided, otherwise use internal state
   const isSettingsOpen = externalSettingsOpen ?? internalSettingsOpen;
@@ -120,7 +94,6 @@ export const WindowHeader = ({
   const [terminalHeight, setTerminalHeight] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
   const [isAnimating, setIsAnimating] = useState(false);
-  const [hasManuallyResized, setHasManuallyResized] = useState(false);
   const dragStartRef = useRef({ y: 0, height: 0 });
   // Ref to track current terminal height for mouseUp handler (avoids stale closure)
   const terminalHeightRef = useRef(terminalHeight);
@@ -130,7 +103,6 @@ export const WindowHeader = ({
 
   const MIN_HEIGHT = 30;
   const DEFAULT_OPEN_HEIGHT = 36; // Minimal height when opening via handle click
-  const DEFAULT_EXPANDED_HEIGHT = 200;
   const MAX_HEIGHT = typeof window !== 'undefined' ? window.innerHeight * 0.8 : 500;
 
   // Persist terminal height per window type
@@ -179,7 +151,6 @@ export const WindowHeader = ({
       const currentHeight = terminalHeightRef.current;
       if (currentHeight > MIN_HEIGHT) {
         persistHeight(currentHeight);
-        setHasManuallyResized(true);
       }
     };
 
@@ -198,17 +169,9 @@ export const WindowHeader = ({
     dragStartRef.current = { y: e.clientY, height: terminalHeight };
   };
 
-  // Called by TerminalOverlay when user sends a message - expand if at minimal height
-  const handleRequestExpand = () => {
-    if (!hasManuallyResized && terminalHeight <= 50) {
-      setIsAnimating(true);
-      setTerminalHeight(DEFAULT_EXPANDED_HEIGHT);
-    }
-  };
-
-  // Keyboard shortcut (Cmd+K) - toggle with animation (only if user has AI access)
+  // Keyboard shortcut (Cmd+K) - toggle with animation
   useEffect(() => {
-    if (!hasAiTerminal) return; // Don't register shortcut if user doesn't have access
+    if (!hasFeedDrawer) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
@@ -220,7 +183,6 @@ export const WindowHeader = ({
             persistHeight(terminalHeight);
           }
           setTerminalHeight(0);
-          setHasManuallyResized(false);
         } else {
           // Open to persisted height
           setTerminalHeight(getPersistedHeight());
@@ -229,7 +191,7 @@ export const WindowHeader = ({
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [terminalHeight, persistHeight, getPersistedHeight, hasAiTerminal]);
+  }, [terminalHeight, persistHeight, getPersistedHeight, hasFeedDrawer]);
 
   // Fetch credentials initially and when dataSource changes
   useEffect(() => {
@@ -413,9 +375,9 @@ export const WindowHeader = ({
         )}
         {/* Terminal container - handle + content, handle drags down revealing content above */}
       </header>
-      {/* Terminal rendered via portal to body for correct fixed positioning.
-          z-index scale: content (z-10/z-20) < terminal (z-35) < dropdowns (z-50) < modals (z-[150]) */}
-      {hasAiTerminal && createPortal(
+      {/* Feed drawer rendered via portal to body for correct fixed positioning.
+          z-index scale: content (z-10/z-20) < drawer (z-35) < dropdowns (z-50) < modals (z-[150]) */}
+      {hasFeedDrawer && createPortal(
         <div
           className="fixed left-0 right-0 z-[35] flex flex-col pointer-events-none"
           data-testid="terminal-portal"
@@ -425,21 +387,12 @@ export const WindowHeader = ({
             transition: isAnimating && !isDragging ? 'height 0.3s ease-out' : 'none',
           }}
         >
-          {/* Terminal content - above the handle */}
+          {/* Feed content - above the handle */}
           <div
             className="flex-1 bg-gray-950/[0.87] overflow-hidden shadow-lg pointer-events-auto"
             style={{ height: terminalHeight }}
           >
-            <TerminalOverlay
-              height={terminalHeight}
-              currentWindow={currentWindow}
-              contextProvider={terminalContextProvider}
-              onRequestExpand={handleRequestExpand}
-              header={terminalHeader}
-              headerDescription={terminalHeaderDescription}
-              welcomeContent={terminalWelcomeContent}
-              suggestedPrompts={suggestedPrompts}
-            />
+            <FeedOverlay height={terminalHeight} currentWindow={currentWindow} />
           </div>
 
           {/* Drag handle - at bottom, moves with terminal */}
@@ -454,7 +407,7 @@ export const WindowHeader = ({
             <div
               className="group/icon relative h-full flex items-center justify-center px-4 cursor-pointer"
               onMouseDown={(e) => e.stopPropagation()}
-              title={terminalHeight > 0 ? 'Close terminal (⌘K)' : 'Open terminal (⌘K)'}
+              title={terminalHeight > 0 ? 'Close feed (⌘K)' : 'Open feed (⌘K)'}
               onClick={() => {
                 setIsAnimating(true);
                 if (terminalHeight > 0) {
@@ -463,7 +416,6 @@ export const WindowHeader = ({
                     persistHeight(terminalHeight);
                   }
                   setTerminalHeight(0);
-                  setHasManuallyResized(false);
                 } else {
                   // Open via handle click - reset to minimal height and clear persisted
                   try {
@@ -472,7 +424,6 @@ export const WindowHeader = ({
                     // localStorage not available
                   }
                   setTerminalHeight(DEFAULT_OPEN_HEIGHT);
-                  setHasManuallyResized(false);
                 }
               }}
             >

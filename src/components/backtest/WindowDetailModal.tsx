@@ -5,15 +5,14 @@
  * - Window timing and optimized parameters
  * - OOS performance metrics
  * - Individual trades
- * - AI terminal overlay (unified pattern)
+ * - Market feed drawer (unified pattern)
  */
-import { useEffect, useCallback } from 'react';
+import { useEffect } from 'react';
 import { WalkForwardPeriod, Strategy, SimulatedTrade } from '../../types/strategy';
 import { ModalTerminalDrawer } from '../ui/ModalTerminalDrawer';
 import { openChartWindow } from '../../utils/windows';
 import { formatParamValue } from '../../utils/formatters';
 import { CHART_PARAMS_OVERRIDES_KEY } from '../../hooks/useChartParams';
-import type { ChatContext } from '../../hooks/useTerminalChat';
 
 interface WindowDetailModalProps {
   period: WalkForwardPeriod;
@@ -137,56 +136,6 @@ export const WindowDetailModal = ({
       trades: JSON.stringify(tradeData),
     });
   };
-
-  // Build context for AI terminal
-  const buildTerminalContext = useCallback((): ChatContext => {
-    const totalPnl = parseFloat(period.out_of_sample_metrics.total_pnl);
-    const winningTrades = period.oos_trades.filter(t => parseFloat(t.pnl) > 0).length;
-    const losingTrades = period.oos_trades.filter(t => parseFloat(t.pnl) <= 0).length;
-
-    // Format sample trades for context
-    const tradeSummaries = period.oos_trades.slice(0, 10).map((trade, idx) => {
-      const pnl = parseFloat(trade.pnl);
-      const duration = formatDuration(trade.entryTime, trade.exitTime);
-      return {
-        num: idx + 1,
-        direction: trade.isLong ? 'Long' : 'Short',
-        pnl: pnl.toFixed(2),
-        duration,
-        entryTime: formatTradeTime(trade.entryTime),
-      };
-    });
-
-    return {
-      type: 'backtesting',
-      strategy_name: strategy.name,
-      strategy_description: strategy.description,
-      methodology: 'walk_forward',
-      has_results: true,
-      // Window-specific context
-      window_num: period.window.window_num,
-      train_period: `${formatDate(period.window.train_start)} to ${formatDate(period.window.train_end)}`,
-      test_period: `${formatDate(period.window.test_start)} to ${formatDate(period.window.test_end)}`,
-      instrument,
-      granularity,
-      optimized_params: period.optimized_params,
-      in_sample_sharpe: period.in_sample_sharpe.toFixed(2),
-      out_of_sample_sharpe: period.out_of_sample_sharpe.toFixed(2),
-      sharpe_efficiency: period.in_sample_sharpe > 0
-        ? `${((period.out_of_sample_sharpe / period.in_sample_sharpe) * 100).toFixed(0)}%`
-        : 'N/A',
-      total_pnl: totalPnl.toFixed(2),
-      total_return_pct: period.out_of_sample_metrics.total_return_pct,
-      trade_count: period.oos_trade_count,
-      winners: winningTrades,
-      losers: losingTrades,
-      win_rate: period.out_of_sample_metrics.win_rate,
-      profit_factor: period.out_of_sample_metrics.profit_factor,
-      max_drawdown_pct: period.out_of_sample_metrics.max_drawdown_pct,
-      sample_trades: tradeSummaries,
-      parameters: [],
-    };
-  }, [period, instrument, granularity, strategy]);
 
   const totalPnl = parseFloat(period.out_of_sample_metrics.total_pnl);
   const isProfitable = totalPnl >= 0;
@@ -392,18 +341,10 @@ export const WindowDetailModal = ({
           </div>
         </div>
 
-        {/* AI Terminal Overlay */}
+        {/* Market feed drawer */}
         <ModalTerminalDrawer
           modalId={`wf-window:${strategy.id}:${period.window.window_num}`}
-          contextProvider={buildTerminalContext}
           topOffset={73}
-          header="AI Analysis"
-          headerDescription={`Window ${period.window.window_num} - ${period.oos_trade_count} trades, ${period.oos_profitable ? 'profitable' : 'loss'}`}
-          welcomeContent={[
-            'Try: "Why did this window underperform?"',
-            'Try: "Were the optimized parameters reasonable?"',
-            'Try: "What market conditions affected this period?"',
-          ]}
         />
       </div>
     </div>
