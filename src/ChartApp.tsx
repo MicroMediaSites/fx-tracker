@@ -1358,7 +1358,13 @@ export const ChartApp = () => {
   }, [srZones]);
 
   return (
-    <div className="min-h-screen bg-[var(--color-bg-page)] text-[var(--color-text-primary)] flex flex-col relative">
+    // h-screen + overflow-hidden (not min-h-screen): the chart window must
+    // FIT the viewport at every webview zoom level — with min-h the column
+    // could exceed the window and silently push the time axis (always at
+    // the container's bottom edge) past the visible edge. min-h-0 on the
+    // chart column lets it shrink below its content size so the axis stays
+    // on screen; the header rows keep their intrinsic heights.
+    <div className="h-screen overflow-hidden bg-[var(--color-bg-page)] text-[var(--color-text-primary)] flex flex-col relative">
       <WindowHeader
         title="Charting"
         currentWindow="charting"
@@ -1423,11 +1429,11 @@ export const ChartApp = () => {
       )}
 
       {/* Chart and legends container */}
-      <div className="flex-1 flex flex-col overflow-hidden">
+      <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
         <div
           ref={chartContainerRef}
           data-tour="chart-canvas"
-          className={`flex-1 overflow-hidden relative ${
+          className={`flex-1 min-h-0 overflow-hidden relative ${
             srZones.srEditingMode ? 'cursor-crosshair' :
             (hoveredEdge || srZones.resizingEdge) ? 'cursor-ns-resize' : ''
           }`}
