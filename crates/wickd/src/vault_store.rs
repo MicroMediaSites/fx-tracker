@@ -38,6 +38,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -227,11 +228,48 @@ fn keyring_entry(env: OandaEnvironment, account: &str) -> Result<keyring::Entry>
         .map_err(|e| anyhow!("could not open the keychain entry for {key}: {e}"))
 }
 
+/// Upper bound on a keychain read. Reads normally complete in milliseconds;
+/// one that blocks this long is stuck on a keychain AUTHORIZATION that will
+/// never be answered from a CLI context — classically, the item's ACL no
+/// longer trusts this binary because it was rebuilt (new code signature).
+/// Observed 2026-07-17: `wickd trade report` parked for 80+ minutes inside
+/// SecKeychainFindGenericPassword. Failing with a pointer beats hanging.
+const KEYCHAIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `get_password` with a hard time bound. The read runs on a detached
+/// thread (Security.framework calls are blocking and uncancellable); on
+/// timeout the thread is abandoned — it parks harmlessly until process
+/// exit — and the caller gets an actionable error instead of a hang.
+fn get_password_bounded(
+    entry: keyring::Entry,
+    key: &str,
+) -> Result<std::result::Result<String, keyring::Error>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(entry.get_password());
+    });
+    match rx.recv_timeout(KEYCHAIN_READ_TIMEOUT) {
+        Ok(res) => Ok(res),
+        Err(_) => bail!(
+            "keychain read for '{key}' timed out after {}s — the item is \
+             probably waiting on a keychain authorization this process can't \
+             answer (common cause: the wickd binary was rebuilt, so the \
+             item's ACL no longer trusts its code signature). Fix: re-store \
+             the key with `wickd login`, or open Keychain Access, find the \
+             '{key}' item under service '{service}', and update its Access \
+             Control to allow wickd.",
+            KEYCHAIN_READ_TIMEOUT.as_secs(),
+            service = KEYRING_SERVICE,
+        ),
+    }
+}
+
 /// Read the environment-level (shared) API key, if one is stored. Used by
 /// `login --account <name>` to reuse the shared token instead of demanding the
 /// key be pasted again for every sub-account.
 pub fn shared_api_key(env: OandaEnvironment) -> Result<Option<String>> {
-    match keyring_entry(env, DEFAULT_ACCOUNT)?.get_password() {
+    let key = keyring_account_key(env, DEFAULT_ACCOUNT);
+    match get_password_bounded(keyring_entry(env, DEFAULT_ACCOUNT)?, &key)? {
         Ok(k) => Ok(Some(k)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(other) => Err(anyhow!("could not read the API key from the keychain: {other}")),
@@ -321,7 +359,8 @@ pub fn credentials(env: OandaEnvironment, account: &str) -> Result<(String, Stri
 
     // Dedicated item first; a named account without one falls back to the
     // shared environment-level token.
-    let api_key = match keyring_entry(env, account)?.get_password() {
+    let key = keyring_account_key(env, account);
+    let api_key = match get_password_bounded(keyring_entry(env, account)?, &key)? {
         Ok(k) => k,
         Err(keyring::Error::NoEntry) if account != DEFAULT_ACCOUNT => {
             shared_api_key(env)?.ok_or_else(|| {
