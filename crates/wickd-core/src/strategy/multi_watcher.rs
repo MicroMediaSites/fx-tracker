@@ -22,6 +22,7 @@ use tracing::{info, warn};
 
 use crate::backtest::rules_engine::{PositionDirection, RulesEngine, RulesSignal, SRZone, StrategyDefinition};
 use crate::backtest::scripted_strategy::ScriptedStrategy;
+use crate::backtest::strategy::Signal;
 use crate::backtest::surprise::SurpriseCalendar;
 use crate::error::Result;
 use crate::models::Candle;
@@ -107,6 +108,13 @@ struct InstrumentState {
     /// (never fed to `warmup_candle` — each candle advances the executor
     /// exactly once).
     pending_backfill: Vec<Candle>,
+    /// The position the SCRIPT believes it holds after the warmup replay
+    /// (folded from the discarded warmup signals — a suppressed Entry still
+    /// mutates script state even though no order was placed). `None` for
+    /// rules engines and for scripts that ended warmup flat. One-shot input
+    /// to the post-warmup account reconcile, which consumes it on entry;
+    /// it is never valid to read as live position state.
+    warmup_implied_position: Option<PositionDirection>,
     /// Whether this instrument has been initialized (warmup complete)
     initialized: bool,
     /// Consecutive error count for this instrument
@@ -172,6 +180,7 @@ impl InstrumentState {
             executor,
             pending_signals: Vec::new(),
             pending_backfill: Vec::new(),
+            warmup_implied_position: None,
             initialized: false,
             consecutive_errors: 0,
             signal_filter,
@@ -217,8 +226,23 @@ impl InstrumentState {
             candles.extend(missed.drain(..overflow));
         }
 
+        // Replay warmup through the executor, folding the position the
+        // script believes it holds as its discarded signals enter/exit
+        // (issue #9 follow-up): a suppressed Entry still set script-internal
+        // position state, so the belief must be reconciled against the real
+        // account once warmup completes. PartialExit keeps the position.
+        self.warmup_implied_position = None;
         for candle in &candles {
-            self.executor.warmup_candle(candle);
+            match self.executor.warmup_candle(candle) {
+                Some(Signal::Buy) => {
+                    self.warmup_implied_position = Some(PositionDirection::Long)
+                }
+                Some(Signal::Sell) => {
+                    self.warmup_implied_position = Some(PositionDirection::Short)
+                }
+                Some(Signal::ClosePosition) => self.warmup_implied_position = None,
+                Some(Signal::Hold) | None => {}
+            }
         }
 
         // Prime the candle source. A candle that closed between the warmup
@@ -678,6 +702,53 @@ impl MultiInstrumentWatcher {
         self.cached_positions = None;
     }
 
+    /// Post-warmup reconcile of the script's position belief against the
+    /// real account (issue #9 follow-up).
+    ///
+    /// The warmup replay feeds the script every historical candle, so a
+    /// script that entered during the replay believes it is in a trade —
+    /// but the suppressed signal never placed an order. Left alone, the
+    /// script would "manage" that phantom position (holding real setups at
+    /// bay) until its own exit logic cleared it. If the account is actually
+    /// flat, fire the strategy's position-closed hook — the same resync
+    /// path an engine-side stop-loss close uses — so the script starts the
+    /// live session flat, matching reality.
+    ///
+    /// When the account DOES hold a position, the replayed belief is left
+    /// alone: it is the best available estimate of the script state that
+    /// produced the real trade, and position adoption owns engine-side
+    /// tracking. A cache refresh failure also leaves state untouched (fail
+    /// open — the next tick's position fetch governs actual execution).
+    async fn reconcile_script_position(&mut self, instrument: &str) {
+        // One-shot input: consume the belief up front so it can't be
+        // mistaken for live state later, whatever branch we take below.
+        let Some(implied) = self
+            .instruments
+            .get_mut(instrument)
+            .and_then(|s| s.warmup_implied_position.take())
+        else {
+            return;
+        };
+
+        if let Err(e) = self.refresh_position_cache().await {
+            warn!(
+                "[MultiWatcher {}] {} position fetch failed during post-warmup reconcile ({}) — leaving replayed script state as-is",
+                self.watcher_id, instrument, e
+            );
+            return;
+        }
+
+        if self.get_cached_position(instrument).is_none() {
+            info!(
+                "[MultiWatcher {}] {} warmup replay left the script believing it holds a {:?} position the account doesn't have — firing the position-closed resync hook",
+                self.watcher_id, instrument, implied
+            );
+            if let Some(state) = self.instruments.get_mut(instrument) {
+                state.executor.notify_position_closed();
+            }
+        }
+    }
+
     /// Check if an error is transient
     fn is_transient_error(error_msg: &str) -> bool {
         let transient_patterns = [
@@ -912,6 +983,8 @@ impl MultiInstrumentWatcher {
                     // Emit error after releasing the mutable borrow
                     if let Some(error_msg) = warmup_error {
                         self.emit_instrument_error(sink, &instrument, "warmup_failed", &error_msg);
+                    } else {
+                        self.reconcile_script_position(&instrument).await;
                     }
                 }
                 None => {
@@ -966,6 +1039,8 @@ impl MultiInstrumentWatcher {
         // Emit error after releasing the mutable borrow
         if let Some(error_msg) = warmup_error {
             self.emit_instrument_error(sink, instrument, "warmup_failed", &error_msg);
+        } else {
+            self.reconcile_script_position(instrument).await;
         }
 
         // An instrument added mid-run replays any gap right away — its
@@ -2404,6 +2479,97 @@ fn on_candle() {
             1,
             "the armed script's Buy on the replayed newest candle must be emitted — \
              a cold script state machine would Hold here (issue #9)"
+        );
+    }
+
+    // ---- issue #9 follow-up: post-warmup position reconcile ----
+
+    // A self-position-tracking script in the rahagod shape: enters once,
+    // then holds until its position-closed hook resyncs it flat.
+    const SELF_POSITION_SCRIPT: &str = r#"
+let position = 0;
+fn on_candle() {
+    if position == 1 { return "hold"; }
+    position = 1;
+    "buy"
+}
+fn on_position_closed() {
+    position = 0;
+}
+"#;
+
+    // Warmup replays an entry the account never took (the signal was
+    // discarded). With the account flat, the reconcile must fire the
+    // position-closed hook so the script starts live flat instead of
+    // "managing" a phantom position and holding real setups at bay.
+    #[tokio::test]
+    async fn reconcile_clears_phantom_position_when_account_is_flat() {
+        let mut w = watcher(definition("scripted", Some(SELF_POSITION_SCRIPT)));
+        w.add_instrument_with_source(
+            "EUR_USD".to_string(),
+            Box::new(FixedHistorySource { history: hourly_candles(1) }),
+            Vec::new(),
+            "all".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Account flat; fresh cache so the reconcile never touches the network.
+        w.cached_positions = Some((Instant::now(), HashMap::new()));
+        let sink = RecordingSink::default();
+        w.warmup_single(&sink, "EUR_USD").await;
+
+        let state = w.instruments.get_mut("EUR_USD").unwrap();
+        assert!(
+            state.warmup_implied_position.is_none(),
+            "the implied position is consumed by the reconcile"
+        );
+
+        // The next live candle must be a fresh Entry: the hook reset the
+        // script's internal position. Without the reconcile this Holds.
+        let (signal, _) = state.evaluate_candle(&candle_at("2026-07-14T05:00:00Z"), None);
+        assert!(
+            matches!(signal, RulesSignal::Entry { direction: PositionDirection::Long, .. }),
+            "expected a fresh Entry after the phantom-position resync, got {:?}",
+            signal
+        );
+    }
+
+    // When the account genuinely holds the position the script replayed
+    // into, the belief is correct — the hook must NOT fire, and the script
+    // keeps managing the (real) position.
+    #[tokio::test]
+    async fn reconcile_keeps_script_position_when_account_holds_it() {
+        let mut w = watcher(definition("scripted", Some(SELF_POSITION_SCRIPT)));
+        w.add_instrument_with_source(
+            "EUR_USD".to_string(),
+            Box::new(FixedHistorySource { history: hourly_candles(1) }),
+            Vec::new(),
+            "all".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Account holds the long the script believes it entered.
+        let mut positions = HashMap::new();
+        positions.insert("EUR_USD".to_string(), PositionDirection::Long);
+        w.cached_positions = Some((Instant::now(), positions));
+        let sink = RecordingSink::default();
+        w.warmup_single(&sink, "EUR_USD").await;
+
+        let state = w.instruments.get_mut("EUR_USD").unwrap();
+        assert!(
+            state.warmup_implied_position.is_none(),
+            "the one-shot implied position is consumed by the reconcile in every branch"
+        );
+
+        // The Hold is the proof the hook did NOT fire: a resync would have
+        // reset the script's position and produced a fresh Entry here.
+        let (signal, _) = state.evaluate_candle(&candle_at("2026-07-14T05:00:00Z"), None);
+        assert!(
+            matches!(signal, RulesSignal::Hold),
+            "the script keeps managing its real position — got {:?}",
+            signal
         );
     }
 }
