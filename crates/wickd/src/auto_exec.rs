@@ -469,6 +469,20 @@ fn opened_position(result: &serde_json::Value) -> bool {
     )
 }
 
+/// A close that fails because the position DOESN'T EXIST is definitive
+/// broker truth: we are flat (the stop/TP filled, or someone closed it in
+/// the OANDA UI). Clearing tracked state on this error is what stops a
+/// corpse from vetoing future entries (2026-07-17 poisoning). Any other
+/// close error keeps state — a transient failure may leave a real position
+/// open, and a phantom "open" is recoverable (the skip path revalidates)
+/// while a phantom "flat" could double-enter.
+fn close_error_means_flat(error_msg: &str) -> bool {
+    // Deliberately narrow: OANDA's closeout refusal phrasing, not a generic
+    // "does not exist" (which a DNS/proxy error could also contain — and a
+    // spurious match here clears state for a position that is still open).
+    error_msg.contains("requested to be closed out does not exist")
+}
+
 /// NDJSON line for an autonomous execution event, emitted so the `--auto` daemon
 /// stays observable on stdout alongside the raw signal stream. Line-atomic via
 /// the stdout lock (`println!`), matching the sinks' convention.
@@ -504,6 +518,12 @@ fn emit_auto_result(event: &str, mut result: serde_json::Value) {
 /// instrument flat so a later signal can retry.
 pub async fn run_executor(mut exec: AutoExecutor, mut rx: UnboundedReceiver<AutoIntent>) {
     while let Some(intent) = rx.recv().await {
+        // At most one re-decide per intent: a SkipDuplicateEntry whose tracked
+        // position turns out to be a broker-side corpse (stop/TP filled while
+        // we weren't looking) clears the state and decides again — which is
+        // guaranteed to Place, so the loop runs at most twice.
+        let mut revalidated = false;
+        loop {
         match exec.decide(&intent) {
             ExecDecision::Place {
                 instrument,
@@ -546,16 +566,50 @@ pub async fn run_executor(mut exec: AutoExecutor, mut rx: UnboundedReceiver<Auto
                         exec.record_close(&instrument);
                         emit_auto_result("auto-position-closed", result);
                     }
-                    Err(e) => emit_auto_line(&serde_json::json!({
-                        "event": "auto-close-error",
-                        "action": "close",
-                        "instrument": instrument,
-                        "side": side,
-                        "error": format!("{e:#}"),
-                    })),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        let definitively_flat = close_error_means_flat(&msg);
+                        if definitively_flat {
+                            exec.record_close(&instrument);
+                        }
+                        emit_auto_line(&serde_json::json!({
+                            "event": "auto-close-error",
+                            "action": "close",
+                            "instrument": instrument,
+                            "side": side,
+                            "error": msg,
+                            "state_cleared": definitively_flat,
+                        }));
+                    }
                 }
             }
             ExecDecision::SkipDuplicateEntry { instrument } => {
+                // Trust-but-verify (2026-07-17): the tracked position may be a
+                // corpse — the broker filled its stop/TP and our map never
+                // learned. Verify against the broker ONLY on this conflict
+                // path; if actually flat, clear the corpse and re-decide (the
+                // entry then places). Verification failure keeps the skip —
+                // fail closed, never double-enter on uncertainty.
+                if !revalidated {
+                    revalidated = true;
+                    match trade::position_open_at_broker(exec.env, &exec.account, &instrument).await {
+                        Ok(false) => {
+                            exec.record_close(&instrument);
+                            emit_auto_line(&serde_json::json!({
+                                "event": "auto-skip-revalidated",
+                                "reason": "tracked position no longer exists at the broker — state cleared, re-deciding",
+                                "instrument": instrument,
+                            }));
+                            continue;
+                        }
+                        Ok(true) => {}
+                        Err(e) => emit_auto_line(&serde_json::json!({
+                            "event": "auto-skip-verify-error",
+                            "instrument": instrument,
+                            "error": format!("{e:#}"),
+                        })),
+                    }
+                }
                 emit_auto_line(&serde_json::json!({
                     "event": "auto-skip",
                     "reason": "position already open on instrument",
@@ -569,6 +623,8 @@ pub async fn run_executor(mut exec: AutoExecutor, mut rx: UnboundedReceiver<Auto
                     "instrument": instrument,
                 }));
             }
+        }
+        break;
         }
     }
 }
@@ -1063,5 +1119,32 @@ mod tests {
         assert!(!e.is_open("EUR_USD"));
         // No audit db was even created (record_decision_at only opens on write).
         assert!(!db.exists());
+    }
+
+    // ---- broker-corpse recovery (2026-07-17 entry poisoning) ----
+
+    #[test]
+    fn close_error_means_flat_matches_the_oanda_message() {
+        assert!(close_error_means_flat(
+            "OANDA position close failed: OANDA API error: The Position requested to be closed out does not exist"
+        ));
+        assert!(!close_error_means_flat("connection timed out"));
+        assert!(!close_error_means_flat("rate limited"));
+        // The wide match this replaced would have cleared state on these:
+        assert!(!close_error_means_flat("proxy host does not exist"));
+        assert!(!close_error_means_flat("DNS: name does not exist"));
+    }
+
+    #[test]
+    fn clearing_a_corpse_lets_the_next_entry_place() {
+        let mut e = AutoExecutor::new(OandaEnvironment::Practice, "tf-m1".into(), UNITS);
+        e.record_open("USD_JPY", e.signed_units(PositionDirection::Long));
+        let intent = intent_from_match(&entry_event("USD_JPY", PositionDirection::Long)).unwrap();
+        // Broker stop-fills; the map still holds the corpse and vetoes entries.
+        assert!(matches!(e.decide(&intent), ExecDecision::SkipDuplicateEntry { .. }));
+        // The revalidation/definitive-close paths clear it via record_close…
+        e.record_close("USD_JPY");
+        // …after which the same intent places: the retry loop terminates.
+        assert!(matches!(e.decide(&intent), ExecDecision::Place { .. }));
     }
 }

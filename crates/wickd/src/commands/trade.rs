@@ -752,6 +752,22 @@ pub(crate) async fn execute_place(
 /// (see [`arm_auto_practice`]), so autonomy can never place a live order. It runs
 /// the exact same guarded sequence, so it inherits the full audit + caps
 /// contract for free — the only relaxation is the arming gate.
+/// Broker-truth check for the auto path's duplicate-entry guard: does the
+/// account ACTUALLY hold an open position on `instrument`? The executor's
+/// in-memory map can hold a corpse — a position the broker already closed
+/// via stop-loss/take-profit — and a corpse must not veto real entries
+/// (observed 2026-07-17: every stopped-out M1 instrument was entry-poisoned
+/// until restart). One targeted fetch on the conflict path only.
+pub(crate) async fn position_open_at_broker(
+    env: OandaEnvironment,
+    account: &str,
+    instrument: &str,
+) -> Result<bool> {
+    let (_, client) = client::resolve(crate::vault_store::env_str(env), account)?;
+    let positions = wickd_core::oanda::endpoints::get_open_positions(&client).await?;
+    Ok(positions.iter().any(|p| p.instrument == instrument && !p.is_flat()))
+}
+
 pub(crate) async fn execute_place_auto(
     env: OandaEnvironment,
     account: &str,
