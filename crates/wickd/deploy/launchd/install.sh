@@ -16,6 +16,12 @@
 #       com.openthink.wickd-watch.<slug> (slug defaults to <strategy>-<account>),
 #       so many strategies coexist as independent jobs.
 #
+#   install.sh calendar [--interval SECS] [--wickd PATH] [--dry-run]
+#       Periodic one-shot `wickd calendar sync` merging the ForexFactory
+#       weekly feed into ~/.wickd/calendar/. Singleton: label
+#       com.openthink.wickd-calendar. Default interval 21600s (6h). No
+#       OANDA credentials involved.
+#
 #   install.sh books [INSTRUMENTS] [--interval SECS] [--env ENV] \
 #                    [--account NAME] [--wickd PATH] [--dry-run]
 #       Periodic one-shot `wickd books <instruments> --store` collecting
@@ -51,7 +57,7 @@ LOG_DIR="${HOME}/Library/Logs/wickd"
 die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,43p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,49p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
@@ -238,6 +244,37 @@ install_books() {
         "__ACCOUNT__=${account}"
 }
 
+# --- calendar sub-command -------------------------------------------------------
+install_calendar() {
+    local interval="21600" wickd="" dry="0"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interval) interval="$2"; shift 2 ;;
+            --wickd)    wickd="$2"; shift 2 ;;
+            --dry-run)  dry="1"; shift ;;
+            -h|--help)  usage 0 ;;
+            --*)        die "unknown option: $1" ;;
+            *)          die "unexpected argument: $1" ;;
+        esac
+    done
+    [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -gt 0 ]] \
+        || die "--interval must be a positive integer (seconds)"
+
+    local bin label dest template
+    bin="$(resolve_wickd "${wickd}")"
+    label="com.openthink.wickd-calendar"
+    dest="${LA_DIR}/${label}.plist"
+    template="${SCRIPT_DIR}/${label}.plist"
+
+    echo "calendar sync: ${bin} calendar sync"
+    echo "  every ${interval}s; logs: ${LOG_DIR}/calendar.{out,err}.log; store: ~/.wickd/calendar/"
+    render_and_install "${template}" "${dest}" "${label}" "${dry}" \
+        "__WICKD_BIN__=${bin}" \
+        "__HOME__=${HOME}" \
+        "__LOG_DIR__=${LOG_DIR}" \
+        "__INTERVAL__=${interval}"
+}
+
 # --- watchdog sub-command -------------------------------------------------------
 install_watchdog() {
     local interval="300" grace="1200" realert="3600" dry="0"
@@ -288,7 +325,8 @@ case "$1" in
     stream)   shift; install_stream "$@" ;;
     watch)    shift; install_watch "$@" ;;
     books)    shift; install_books "$@" ;;
+    calendar) shift; install_calendar "$@" ;;
     watchdog) shift; install_watchdog "$@" ;;
     -h|--help) usage 0 ;;
-    *)      die "unknown job kind '$1' (expected 'stream', 'watch', 'books', or 'watchdog')" ;;
+    *)      die "unknown job kind '$1' (expected 'stream', 'watch', 'books', 'calendar', or 'watchdog')" ;;
 esac

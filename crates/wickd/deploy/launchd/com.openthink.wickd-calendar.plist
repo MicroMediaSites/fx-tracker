@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent that keeps the economic-calendar store current
+  (~/.wickd/calendar/YYYY-MM.csv). Like the books collector this is NOT a
+  daemon: launchd fires `wickd calendar sync` every StartInterval seconds,
+  the command fetches the ForexFactory weekly feed, merges this week's
+  events into the monthly CSVs (preserving any stored `actual` values —
+  the weekly feed never carries them), and exits.
+
+  Singleton: label com.openthink.wickd-calendar. The merge is idempotent
+  and atomic (tmp + rename per monthly file), so any cadence only changes
+  fetch traffic. FF revises forecasts and re-times events through the
+  week and rolls the feed to the new week on Sunday ET; the default
+  6-hour interval tracks both without hammering the feed.
+
+  NO OANDA ACCESS and no credentials: the only network call is a public
+  GET of the FF feed. This job exists so the DESKTOP APP never has to
+  fetch — the app reads the store offline, same as the strategy engine
+  (surprise accessors ABI v4 pick up merged rows via their directory
+  fingerprint refresh, no restart needed).
+
+  See README.md in this directory ("Calendar sync") for install / verify /
+  uninstall steps.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openthink.wickd-calendar</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__WICKD_BIN__</string>
+        <string>calendar</string>
+        <string>sync</string>
+    </array>
+
+    <!-- Sync once at load (login), then every __INTERVAL__ seconds. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>__INTERVAL__</integer>
+
+    <!-- Background one-shot: no KeepAlive — launchd re-fires it on the
+         interval; a failed fetch simply waits for the next tick. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- One JSON merge-stats line per run on stdout; errors on stderr. -->
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/calendar.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/calendar.err.log</string>
+
+    <!-- Run from the user's home so ~/.wickd/calendar resolves. -->
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
