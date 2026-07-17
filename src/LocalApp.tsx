@@ -28,6 +28,7 @@ import {
 import { LocalBacktestsSection } from './components/local/LocalBacktestsSection';
 import { UpdateModal } from './components/ui/UpdateModal';
 import { SignalsSection } from './components/watcher/SignalFeed';
+import { EconomicCalendarSection } from './components/local/EconomicCalendarSection';
 import { useSettingsStore } from './stores/settingsStore';
 import { openBacktestWindow, openChartWindow, openWatcherWindow } from './utils/windows';
 
@@ -290,6 +291,12 @@ export const LocalApp = () => {
             Live Monitor stays reserved for actionable state. */}
         <div className="mt-6">
           <SignalsSection />
+        </div>
+
+        {/* Upcoming economic releases from ~/.wickd/calendar (read-only,
+            offline; the wickd CLI's launchd sync job owns freshness). */}
+        <div className="mt-6">
+          <EconomicCalendarSection />
         </div>
       </main>
 

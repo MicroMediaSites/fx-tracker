@@ -40,6 +40,8 @@ export function getTauriBridgeScript() {
     window.__E2E_HUB_STREAM__ = window.__E2E_HUB_STREAM__ || null;
     // Historical spread stats rows (~/.wickd/spreads.db, read-only).
     window.__E2E_SPREAD_STATS__ = window.__E2E_SPREAD_STATS__ || [];
+    // Economic-calendar rows (~/.wickd/calendar, read-only).
+    window.__E2E_ECONOMIC_CALENDAR__ = window.__E2E_ECONOMIC_CALENDAR__ || [];
 
     // Zero-removal sweep datasets (AGT-650).
     window.__E2E_LOCAL_LABELS__ = window.__E2E_LOCAL_LABELS__ || [];
@@ -304,6 +306,9 @@ export function getTauriBridgeScript() {
       // Historical spread stats (~/.wickd/spreads.db, read-only). Empty by
       // default = the purple "no history" spread-bar fallback.
       'get_spread_stats': () => window.__E2E_SPREAD_STATS__ ?? [],
+      // Economic-calendar store (~/.wickd/calendar, read-only). Empty by
+      // default = the section's "no upcoming events" state.
+      'get_economic_calendar': () => window.__E2E_ECONOMIC_CALENDAR__ ?? [],
     };
 
     // Set up the invoke handler

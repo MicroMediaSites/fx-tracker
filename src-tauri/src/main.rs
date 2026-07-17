@@ -31,6 +31,7 @@ use commands::streaming::{
     subscribe_to_prices, unsubscribe_from_prices, hub_stream_status,
 };
 use commands::spread_stats::get_spread_stats;
+use commands::economic_calendar::get_economic_calendar;
 use commands::oanda::{
     switch_oanda_environment, get_oanda_environment,
     get_oanda_credentials, save_oanda_credentials,
@@ -407,6 +408,9 @@ async fn main() {
             // Historical spread stats for the spread-bar coloring (read-only,
             // sampled by the wickd CLI into ~/.wickd/spreads.db)
             get_spread_stats,
+            // Economic-calendar store reader (read-only, offline; the wickd
+            // CLI + launchd sync job own freshness)
+            get_economic_calendar,
             // Local-build detection for the update modal (placeholder endpoint)
             updater_is_placeholder,
             // Watch-daemon client surface (AGT-652)
