@@ -4,8 +4,6 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { WindowHeader } from './components/ui/WindowHeader';
 import { useEnvironmentSync } from './hooks/useEnvironmentSync';
 import { useEconomicEvents } from './hooks/useEconomicEvents';
-import { buildChartingContext } from './lib/chatContextBuilder';
-import { getTerminalWelcome } from './lib/terminalWelcome';
 import {
   createChart,
   CandlestickSeries,
@@ -1367,49 +1365,6 @@ export const ChartApp = () => {
         fullWidth
         settingsOpen={settingsOpen}
         onSettingsChange={setSettingsOpen}
-        terminalContextProvider={() => {
-          // Get last 50 candles for potential chart analysis
-          const recentCandles = candlesDataRef.current.slice(-50).map(c => ({
-            time: c.time,
-            open: c.open,
-            high: c.high,
-            low: c.low,
-            close: c.close,
-          }));
-          // Extract current (latest) indicator values from loaded data
-          const indicatorValues: Record<string, string> = {};
-          for (const series of indicatorDataRef.current) {
-            const lastPoint = series.data[series.data.length - 1];
-            if (lastPoint) {
-              for (const [output, value] of Object.entries(lastPoint.values)) {
-                const key = series.type === output ? output : `${series.type}_${output}`;
-                indicatorValues[key] = value;
-              }
-            }
-          }
-          // Parse strategy risk settings if available
-          let riskSettings: Record<string, unknown> | undefined;
-          if (strategy?.risk_settings) {
-            try {
-              riskSettings = JSON.parse(strategy.risk_settings);
-            } catch (e) { console.warn('[ChartApp] Failed to parse strategy risk_settings:', e); }
-          }
-          return buildChartingContext({
-            instrument,
-            granularity,
-            strategyName: strategy?.name,
-            strategyId: strategy?.id,
-            strategyRiskSettings: riskSettings,
-            indicators: chartIndicators.map((ind) => formatIndicatorLabel(ind)),
-            indicatorValues: Object.keys(indicatorValues).length > 0 ? indicatorValues : undefined,
-            currentPrice: priceStreaming.currentPrice?.bid,
-            signalDirection: signalDirection ?? undefined,
-            recentCandles,
-          });
-        }}
-        terminalHeader={getTerminalWelcome('charting', { instrument }).header}
-        terminalHeaderDescription={getTerminalWelcome('charting', { instrument }).description}
-        terminalWelcomeContent={getTerminalWelcome('charting', { instrument }).content}
         subHeader={
           <ChartHeader
           instrument={instrument}

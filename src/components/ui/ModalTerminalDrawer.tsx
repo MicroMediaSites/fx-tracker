@@ -1,46 +1,31 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { TerminalOverlay } from './TerminalOverlay';
-import type { ChatContext } from '../../hooks/useTerminalChat';
+import { FeedOverlay } from './FeedOverlay';
 
 interface ModalTerminalDrawerProps {
-  /** Unique identifier for this modal (used for height persistence and session) */
+  /** Unique identifier for this modal (used for height persistence) */
   modalId: string;
-  /** Function to build context for AI. Called on each message. */
-  contextProvider: () => ChatContext;
-  /** Header shown in empty state (cyan) */
-  header?: string;
-  /** Description shown below header (gray) */
-  headerDescription?: string;
-  /** Welcome content lines shown when empty */
-  welcomeContent?: string[];
   /** Top offset from modal container (header height) */
   topOffset?: number;
 }
 
 const MIN_HEIGHT = 30;
 const DEFAULT_OPEN_HEIGHT = 36;
-const DEFAULT_EXPANDED_HEIGHT = 200;
 const HANDLE_HEIGHT = 12;
 
 /**
- * Terminal drawer component for modals.
- * Provides the same terminal experience as WindowHeader but decoupled from window context.
- * Context is passed via props when the modal mounts.
+ * Feed drawer for modals.
+ * Provides the same pull-down feed experience as WindowHeader but positioned
+ * inside a modal container.
  *
  * This component is absolutely positioned and overlays modal content (doesn't push it down).
  */
 export const ModalTerminalDrawer = ({
   modalId,
-  contextProvider,
-  header,
-  headerDescription,
-  welcomeContent,
   topOffset = 73, // Default header height (py-4 = 16*2 + content ~41)
 }: ModalTerminalDrawerProps) => {
   const [terminalHeight, setTerminalHeight] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
   const [isAnimating, setIsAnimating] = useState(false);
-  const [hasManuallyResized, setHasManuallyResized] = useState(false);
   const dragStartRef = useRef({ y: 0, height: 0 });
   // Ref to track current terminal height for mouseUp handler (avoids stale closure)
   const terminalHeightRef = useRef(terminalHeight);
@@ -94,7 +79,6 @@ export const ModalTerminalDrawer = ({
       const currentHeight = terminalHeightRef.current;
       if (currentHeight > MIN_HEIGHT) {
         persistHeight(currentHeight);
-        setHasManuallyResized(true);
       }
     };
 
@@ -113,13 +97,6 @@ export const ModalTerminalDrawer = ({
     dragStartRef.current = { y: e.clientY, height: terminalHeight };
   };
 
-  const handleRequestExpand = useCallback(() => {
-    if (!hasManuallyResized && terminalHeight <= 50) {
-      setIsAnimating(true);
-      setTerminalHeight(DEFAULT_EXPANDED_HEIGHT);
-    }
-  }, [hasManuallyResized, terminalHeight]);
-
   const handleToggle = useCallback(() => {
     setIsAnimating(true);
     if (terminalHeight > 0) {
@@ -127,7 +104,6 @@ export const ModalTerminalDrawer = ({
         persistHeight(terminalHeight);
       }
       setTerminalHeight(0);
-      setHasManuallyResized(false);
     } else {
       setTerminalHeight(getPersistedHeight());
     }
@@ -158,20 +134,12 @@ export const ModalTerminalDrawer = ({
         transition: isAnimating && !isDragging ? 'height 0.3s ease-out' : 'none',
       }}
     >
-      {/* Terminal content - above the handle */}
+      {/* Feed content - above the handle */}
       <div
         className="flex-1 bg-gray-950/[0.87] overflow-hidden shadow-lg"
         style={{ height: terminalHeight }}
       >
-        <TerminalOverlay
-          height={terminalHeight}
-          currentWindow={`modal:${modalId}`}
-          contextProvider={contextProvider}
-          onRequestExpand={handleRequestExpand}
-          header={header}
-          headerDescription={headerDescription}
-          welcomeContent={welcomeContent}
-        />
+        <FeedOverlay height={terminalHeight} currentWindow={`modal:${modalId}`} />
       </div>
 
       {/* Drag handle - at bottom, moves with terminal */}
@@ -186,7 +154,7 @@ export const ModalTerminalDrawer = ({
         <div
           className="group/icon relative h-full flex items-center justify-center px-4 cursor-pointer"
           onMouseDown={(e) => e.stopPropagation()}
-          title={terminalHeight > 0 ? 'Close terminal (⌘K)' : 'Open terminal (⌘K)'}
+          title={terminalHeight > 0 ? 'Close feed (⌘K)' : 'Open feed (⌘K)'}
           onClick={handleToggle}
         >
           {/* Two-part line that bends into chevron - direction depends on terminal state */}

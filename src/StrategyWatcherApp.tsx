@@ -20,8 +20,6 @@ import { useEnvironmentSync } from './hooks/useEnvironmentSync';
 import { WindowHeader } from './components/ui/WindowHeader';
 import { CollapsibleSection } from './components/ui/CollapsibleSection';
 import { PriceWindow } from './components/ui/PriceDisplay';
-import { buildWatcherContext } from './lib/chatContextBuilder';
-import { getTerminalWelcome } from './lib/terminalWelcome';
 
 import {
   StrategyRow,
@@ -575,25 +573,6 @@ export const StrategyWatcherApp = () => {
         currentWindow="watcher"
         settingsOpen={settingsOpen}
         onSettingsChange={setSettingsOpen}
-        terminalContextProvider={() =>
-          buildWatcherContext({
-            runningStrategies: (status?.watchers ?? []).map((w) => ({
-              strategyName: w.strategy ?? 'unknown',
-              instruments: w.instruments,
-              timeframe: '',
-            })),
-            pendingSignals: pending.map((p) => ({
-              instrument: p.instrument,
-              direction: p.side,
-              strategyName: p.strategy,
-              entryPrice: p.entry_price,
-            })),
-            availableInstruments: watchedInstruments,
-          })
-        }
-        terminalHeader={getTerminalWelcome('watcher').header}
-        terminalHeaderDescription={getTerminalWelcome('watcher').description}
-        terminalWelcomeContent={getTerminalWelcome('watcher').content}
       />
 
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 space-y-4">

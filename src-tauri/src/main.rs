@@ -32,6 +32,7 @@ use commands::streaming::{
 };
 use commands::spread_stats::get_spread_stats;
 use commands::economic_calendar::{get_economic_calendar, get_economic_event_history};
+use commands::feed::feed_list;
 use commands::oanda::{
     switch_oanda_environment, get_oanda_environment,
     get_oanda_credentials, save_oanda_credentials,
@@ -412,6 +413,9 @@ async fn main() {
             // CLI + launchd sync job own freshness)
             get_economic_calendar,
             get_economic_event_history,
+            // AI market-awareness feed reader (read-only, offline; the wickd
+            // CLI + launchd feed job own freshness)
+            feed_list,
             // Local-build detection for the update modal (placeholder endpoint)
             updater_is_placeholder,
             // Watch-daemon client surface (AGT-652)

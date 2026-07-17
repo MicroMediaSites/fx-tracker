@@ -293,6 +293,9 @@ export function getTauriBridgeScript() {
           pending_count: window.__E2E_DAEMON_PENDING__?.length ?? 0,
           queue_len: window.__E2E_DAEMON_QUEUE__?.length ?? 0,
         },
+      // Market-awareness feed reader (FeedOverlay). Seed per-test via
+      // appPage.mockTauriCommand('feed_list', [...]).
+      'feed_list': [],
       'daemon_queue_list': (args) => {
         const queue = [...(window.__E2E_DAEMON_QUEUE__ ?? [])].reverse();
         return queue.slice(0, args?.limit ?? 100);
