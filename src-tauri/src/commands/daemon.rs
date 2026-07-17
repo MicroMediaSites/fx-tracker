@@ -407,6 +407,8 @@ mod tests {
             proposal.ts.clone(),
             wickd_core::alert_queue::AlertSignal::Buy,
             proposal,
+            Some("h004".to_string()),
+            Some("H4".to_string()),
         );
         alert_queue::append_at(&queue_path, &alert).unwrap();
         let listed = alert_queue::list_at(&queue_path).unwrap();
