@@ -225,6 +225,48 @@ pub fn read_range(dir: &Path, from: NaiveDate, to: NaiveDate) -> Result<Vec<Cale
     Ok(out)
 }
 
+/// Past releases of one event series (same currency + exact title), newest
+/// first, scanning monthly files backward from `before` until `limit` rows
+/// are found or `max_months` months have been searched. FF titles are
+/// stable across occurrences ("Core CPI m/m" every month), so exact title
+/// match IS the series identity — the same key the merge uses.
+pub fn read_series_history(
+    dir: &Path,
+    currency: &str,
+    event: &str,
+    before: NaiveDate,
+    limit: usize,
+    max_months: u32,
+) -> Result<Vec<CalendarEvent>, String> {
+    let mut out: Vec<CalendarEvent> = Vec::new();
+    if !dir.is_dir() || limit == 0 {
+        return Ok(out);
+    }
+    let before_str = before.format("%Y-%m-%d").to_string();
+    let (mut y, mut m) = (before.year(), before.month());
+    for _ in 0..max_months {
+        let path = dir.join(format!("{y:04}-{m:02}.csv"));
+        if let Ok(contents) = fs::read_to_string(&path) {
+            let mut rows: Vec<CalendarEvent> = parse_month(&contents, &path)?
+                .into_iter()
+                .filter(|r| r.currency == currency && r.event == event && r.date < before_str)
+                .collect();
+            rows.sort_by(|a, b| b.date.cmp(&a.date).then(b.time.cmp(&a.time)));
+            out.extend(rows);
+            if out.len() >= limit {
+                out.truncate(limit);
+                break;
+            }
+        }
+        m -= 1;
+        if m == 0 {
+            m = 12;
+            y -= 1;
+        }
+    }
+    Ok(out)
+}
+
 /// `YYYY-MM` labels for every month whose file could hold rows in range.
 fn months_in_range(from: NaiveDate, to: NaiveDate) -> Vec<String> {
     let mut months = Vec::new();
@@ -550,6 +592,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows[0].event, "MPC Member Pill, Ramsden Speak");
+    }
+
+    #[test]
+    fn series_history_walks_backward_across_months_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        merge_into_store(
+            dir.path(),
+            vec![
+                ev("2026-05-13", "12:30", "USD", "Core CPI m/m", "high", "0.2%", "0.3%"),
+                ev("2026-06-10", "12:30", "USD", "Core CPI m/m", "high", "0.3%", "0.3%"),
+                ev("2026-06-10", "12:30", "USD", "CPI m/m", "high", "0.2%", "0.2%"), // different series
+                ev("2026-07-14", "12:30", "USD", "Core CPI m/m", "high", "0.4%", "0.2%"),
+            ],
+        )
+        .unwrap();
+        let hist = read_series_history(
+            dir.path(),
+            "USD",
+            "Core CPI m/m",
+            NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+            10,
+            12,
+        )
+        .unwrap();
+        let dates: Vec<&str> = hist.iter().map(|r| r.date.as_str()).collect();
+        assert_eq!(dates, vec!["2026-07-14", "2026-06-10", "2026-05-13"]);
+        assert!(hist.iter().all(|r| r.event == "Core CPI m/m"));
+    }
+
+    #[test]
+    fn series_history_respects_limit_and_excludes_the_before_date_row() {
+        let dir = tempfile::tempdir().unwrap();
+        merge_into_store(
+            dir.path(),
+            vec![
+                ev("2026-07-01", "12:30", "USD", "Core CPI m/m", "high", "0.2%", "0.2%"),
+                ev("2026-07-14", "12:30", "USD", "Core CPI m/m", "high", "0.4%", "0.2%"),
+                ev("2026-07-17", "12:30", "USD", "Core CPI m/m", "high", "", "0.3%"), // "today": excluded
+            ],
+        )
+        .unwrap();
+        let hist = read_series_history(
+            dir.path(),
+            "USD",
+            "Core CPI m/m",
+            NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+            1,
+            12,
+        )
+        .unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].date, "2026-07-14");
     }
 
     #[test]

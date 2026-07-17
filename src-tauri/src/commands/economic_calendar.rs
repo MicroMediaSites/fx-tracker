@@ -7,7 +7,7 @@
 //! stale store degrades to an empty/partial list, never an error dialog.
 
 use serde::Serialize;
-use wickd_core::calendar_store::{read_range, CalendarEvent};
+use wickd_core::calendar_store::{read_range, read_series_history, CalendarEvent};
 use wickd_core::events::calendar_dir;
 
 /// One event row for the UI: the stored CSV row plus the parsed release
@@ -55,5 +55,21 @@ pub fn get_economic_calendar(days_back: u32, days_ahead: u32) -> Result<Vec<Econ
     let from = (now - chrono::Duration::days(days_back as i64)).date_naive();
     let to = (now + chrono::Duration::days(days_ahead as i64)).date_naive();
     let rows = read_range(&dir, from, to)?;
+    Ok(rows.into_iter().filter_map(EconomicCalendarEvent::from_row).collect())
+}
+
+/// Past releases of one event series (exact currency + title), newest
+/// first — the drill-in history for a calendar row. Scans up to 36 months
+/// of the store, so the 2022+ backfill's actual/forecast pairs are the
+/// data source; no network involved.
+#[tauri::command]
+pub fn get_economic_event_history(
+    currency: String,
+    event: String,
+    limit: u32,
+) -> Result<Vec<EconomicCalendarEvent>, String> {
+    let dir = calendar_dir()?;
+    let today = chrono::Utc::now().date_naive();
+    let rows = read_series_history(&dir, &currency, &event, today, limit.min(48) as usize, 36)?;
     Ok(rows.into_iter().filter_map(EconomicCalendarEvent::from_row).collect())
 }
