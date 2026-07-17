@@ -71,7 +71,9 @@ mod tick_stream_source;
 mod watch_state;
 mod watcher;
 
-pub use candle_boundary::{CandleBoundaryDetector, CandleBoundaryService, CandleCloseEvent};
+pub use candle_boundary::{
+    is_forex_market_closed, CandleBoundaryDetector, CandleBoundaryService, CandleCloseEvent,
+};
 pub use candle_source::{CandleSource, OandaPollingSource, StreamingCandleSource};
 pub use tick_stream_source::{Tick, TickCandleAggregator, TickStreamSource};
 pub use multi_watcher::{MultiInstrumentWatcher, MultiWatcherHandle, WatcherCommand};

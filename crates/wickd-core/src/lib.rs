@@ -25,6 +25,7 @@ pub mod pending;
 pub mod strategy;
 pub mod strategy_store;
 pub mod stream_hub;
+pub mod watchers;
 
 pub use event_sink::EventSink;
 pub use shared;
