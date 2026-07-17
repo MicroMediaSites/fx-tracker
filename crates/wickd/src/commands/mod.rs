@@ -9,6 +9,7 @@ pub mod calendar;
 pub mod candles;
 pub mod client;
 pub mod dashboard;
+pub mod feed;
 pub mod instruments;
 pub mod login;
 pub mod pending;
