@@ -5,6 +5,8 @@
 #   uninstall.sh stream                    stop + remove the stream-hub job
 #   uninstall.sh watch SLUG                stop + remove one watcher job
 #   uninstall.sh books                     stop + remove the books collector
+#   uninstall.sh calendar                  stop + remove the calendar sync
+#   uninstall.sh feed                      stop + remove the feed producer
 #   uninstall.sh watchdog                  stop + remove the candle watchdog
 #   uninstall.sh --all [--purge-logs]      stop + remove EVERY wickd job
 #
@@ -68,6 +70,14 @@ case "$1" in
         remove_label "com.openthink.wickd-books"
         purge_logs_if_asked "${2:-}"
         ;;
+    calendar)
+        remove_label "com.openthink.wickd-calendar"
+        purge_logs_if_asked "${2:-}"
+        ;;
+    feed)
+        remove_label "com.openthink.wickd-feed"
+        purge_logs_if_asked "${2:-}"
+        ;;
     watchdog)
         remove_label "com.openthink.wickd-watchdog"
         rm -rf "${HOME}/Library/Application Support/wickd-watchdog"
@@ -93,5 +103,5 @@ case "$1" in
         purge_logs_if_asked "${2:-}"
         ;;
     -h|--help) usage 0 ;;
-    *) die "unknown target '$1' (expected 'stream', 'watch SLUG', 'books', 'watchdog', or '--all')" ;;
+    *) die "unknown target '$1' (expected 'stream', 'watch SLUG', 'books', 'calendar', 'feed', 'watchdog', or '--all')" ;;
 esac

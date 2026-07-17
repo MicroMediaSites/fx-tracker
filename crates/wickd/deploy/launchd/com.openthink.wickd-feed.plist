@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent that produces the AI market-awareness feed
+  (~/.wickd/feed.ndjson). Like the calendar sync this is NOT a daemon:
+  launchd fires `wickd feed tick` every StartInterval seconds; the command
+  assembles market context (watchlist, running watchers, pending proposals,
+  calendar events, recent candles, trader priorities), runs ONE headless
+  `claude -p` analysis on the logged-in Claude subscription, appends the
+  validated items, and exits. The desktop app's feed drawer reads the store
+  offline via `feed_list`.
+
+  Singleton: label com.openthink.wickd-feed, plus the command's own
+  feed.lock re-entry guard (stale-broken by age), so an overlapping fire is
+  a clean no-op. Weekend ticks short-circuit before any network or AI call
+  (is_forex_market_closed), and a "nothing new" analysis appends nothing —
+  quiet runs exit 0.
+
+  AUTH: OANDA candles come from the login keychain (LaunchAgents run in the
+  GUI session); `claude` resolves its subscription login from
+  CLAUDE_CONFIG_DIR + the login keychain. PATH must include the directory
+  holding the `claude` binary (rendered in by install.sh).
+
+  See README.md in this directory ("Feed producer") for install / verify /
+  uninstall steps.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openthink.wickd-feed</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__WICKD_BIN__</string>
+        <string>feed</string>
+        <string>tick</string>
+        <string>--model</string>
+        <string>__MODEL__</string>
+    </array>
+
+    <!-- Tick once at load (login), then every __INTERVAL__ seconds. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>__INTERVAL__</integer>
+
+    <!-- Background one-shot: no KeepAlive — launchd re-fires it on the
+         interval; a failed tick simply waits for the next one. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- One JSON summary line per run on stdout; errors on stderr. -->
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/feed.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/feed.err.log</string>
+
+    <!-- Run from the user's home so ~/.wickd resolves. -->
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <!-- __CLAUDE_DIR__ is the directory containing the `claude` binary. -->
+        <key>PATH</key>
+        <string>__CLAUDE_DIR__:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Which Claude Code account the tick bills to (subscription auth). -->
+        <key>CLAUDE_CONFIG_DIR</key>
+        <string>__CLAUDE_CONFIG_DIR__</string>
+    </dict>
+</dict>
+</plist>
