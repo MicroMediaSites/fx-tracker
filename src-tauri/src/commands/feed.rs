@@ -5,9 +5,20 @@
 //! read-only and offline, same contract as the calendar and daemon commands
 //! (the offline-boot e2e specs stay green).
 
+use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
+
 use wickd_core::feed::{self, FeedItem};
 
 use super::daemon::find_wickd_binary;
+
+/// One prior turn of the drawer's ask transcript, threaded back to `wickd feed
+/// ask` so a follow-up sees what was already discussed.
+#[derive(Debug, Deserialize)]
+pub struct AskTurn {
+    pub role: String,
+    pub text: String,
+}
 
 /// Feed items, newest first, capped at `limit` (default 100).
 #[tauri::command]
@@ -25,7 +36,7 @@ pub async fn feed_list(limit: Option<usize>) -> Result<Vec<FeedItem>, String> {
 /// relays the question and renders the answer. User-triggered, never on the
 /// boot path.
 #[tauri::command]
-pub async fn feed_ask(question: String) -> Result<String, String> {
+pub async fn feed_ask(question: String, history: Option<Vec<AskTurn>>) -> Result<String, String> {
     let question = question.trim().to_string();
     if question.is_empty() {
         return Err("question is empty".to_string());
@@ -36,16 +47,42 @@ pub async fn feed_ask(question: String) -> Result<String, String> {
     let wickd = find_wickd_binary()
         .ok_or_else(|| "wickd CLI not found — install it (cargo install) to use the feed".to_string())?;
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(150),
-        tokio::process::Command::new(&wickd)
-            .args(["feed", "ask", &question])
-            .stdin(std::process::Stdio::null())
-            .output(),
+    // Thread the prior transcript through the CLI's `--history -` stdin path
+    // (avoids argv length limits). Only user/assistant turns are relayed; the
+    // CLI fences + neutralizes them, same trust boundary as every ask input.
+    let history: Vec<AskTurn> = history
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| t.role == "user" || t.role == "assistant")
+        .collect();
+    let history_json = serde_json::to_string(
+        &history
+            .iter()
+            .map(|t| serde_json::json!({ "role": t.role, "text": t.text }))
+            .collect::<Vec<_>>(),
     )
-    .await
-    .map_err(|_| "the answer timed out".to_string())?
-    .map_err(|e| format!("running wickd feed ask: {e}"))?;
+    .map_err(|e| format!("serializing ask history: {e}"))?;
+
+    let mut child = tokio::process::Command::new(&wickd)
+        .args(["feed", "ask", &question, "--history", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("running wickd feed ask: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(history_json.as_bytes())
+            .await
+            .map_err(|e| format!("sending ask history: {e}"))?;
+        // Drop closes stdin so the CLI's read_to_string returns.
+    }
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(150), child.wait_with_output())
+        .await
+        .map_err(|_| "the answer timed out".to_string())?
+        .map_err(|e| format!("running wickd feed ask: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let value: serde_json::Value = serde_json::from_str(stdout.trim())
