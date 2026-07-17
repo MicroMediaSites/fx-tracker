@@ -63,11 +63,12 @@ test.describe('Feed overlay drawer', () => {
 
     const rows = appPage.page.getByTestId('feed-item-row');
     await expect(rows).toHaveCount(2);
-    await expect(rows.first()).toContainText('US Core CPI in 45 minutes');
-    await expect(rows.first()).toContainText('urgent');
-    await expect(rows.first()).toContainText('EUR_USD');
-    await expect(rows.nth(1)).toContainText('Sterling softening across pairs');
-    await expect(rows.nth(1)).toContainText('EUR_GBP');
+    // Terminal order: oldest at top, newest at the bottom.
+    await expect(rows.first()).toContainText('Sterling softening across pairs');
+    await expect(rows.first()).toContainText('EUR_GBP');
+    await expect(rows.nth(1)).toContainText('US Core CPI in 45 minutes');
+    await expect(rows.nth(1)).toContainText('urgent');
+    await expect(rows.nth(1)).toContainText('EUR_USD');
   });
 
   test('shows the empty state when the producer has not written yet', async ({ appPage }) => {

@@ -9,7 +9,7 @@
  * `feed_ask` (which shells `wickd feed ask` — the AI path stays in the CLI);
  * the Q/A transcript is session-local and never persisted.
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 
 const POLL_INTERVAL_MS = 60_000;
@@ -114,20 +114,51 @@ export const FeedOverlay = ({ height }: FeedOverlayProps) => {
   const [asking, setAsking] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Whether the viewport is pinned to the bottom — updated on scroll so new
+  // content only auto-follows when the user hasn't scrolled up to read history.
+  const atBottomRef = useRef(true);
+  const isOpen = height > 0;
 
-  // Keep the newest output visible as answers stream in.
+  // Terminal order: oldest at top, newest at the bottom.
+  const orderedItems = useMemo(() => [...items].reverse(), [items]);
+
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+
+  // Stick to the bottom as content grows — but only if the user was already
+  // there (don't yank them mid-read when a 15-minute tick or an answer lands).
+  useLayoutEffect(() => {
+    if (atBottomRef.current) {
+      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+    }
+  }, [orderedItems, askLines, asking]);
+
+  // On open, land the user at the bottom (newest item + the input), not the top.
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [askLines, asking]);
+    if (!isOpen) return;
+    atBottomRef.current = true;
+    requestAnimationFrame(() => {
+      const el = scrollRef.current;
+      if (el) el.scrollTo({ top: el.scrollHeight });
+    });
+  }, [isOpen]);
 
   const send = async () => {
     const question = input.trim();
     if (!question || asking) return;
     setInput('');
+    // Snapshot the transcript BEFORE appending the new question so the CLI
+    // sees only prior turns as history.
+    const history = askLines
+      .filter((l) => l.role === 'user' || l.role === 'assistant')
+      .map((l) => ({ role: l.role, text: l.text }));
     setAskLines((l) => [...l, { role: 'user', text: question }]);
     setAsking(true);
     try {
-      const answer = await invoke<string>('feed_ask', { question });
+      const answer = await invoke<string>('feed_ask', { question, history });
       setAskLines((l) => [...l, { role: 'assistant', text: answer }]);
     } catch (err) {
       setAskLines((l) => [...l, { role: 'error', text: String(err) }]);
@@ -137,21 +168,21 @@ export const FeedOverlay = ({ height }: FeedOverlayProps) => {
     }
   };
 
-  if (height === 0) return null;
+  if (!isOpen) return null;
 
   return (
     <div
       className="h-full flex flex-col font-mono text-xs sm:text-sm"
       data-testid="feed-overlay"
     >
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-2 py-1">
-        {items.length === 0 ? (
+      <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-2 py-1">
+        {orderedItems.length === 0 ? (
           <p data-testid="feed-empty" className="px-1 py-1 text-gray-600">
             no feed items yet — the market-awareness feed refreshes every 15 minutes while
             markets are open
           </p>
         ) : (
-          items.map((item) => <FeedLine key={item.id} item={item} />)
+          orderedItems.map((item) => <FeedLine key={item.id} item={item} />)
         )}
 
         {askLines.map((line, i) => (
