@@ -13,6 +13,7 @@ use candlesight_lib::{Config, CompileTimeConfig, ClaudeClient, focus_watcher_win
 mod commands;
 mod tray;
 
+use commands::updater::updater_is_placeholder;
 use commands::window::{
     LOCALHOST_PORT, create_webview_url, disable_magnification,
     open_backtest_window, open_backtest_window_with_strategy, open_chart_window,
@@ -406,6 +407,8 @@ async fn main() {
             // Historical spread stats for the spread-bar coloring (read-only,
             // sampled by the wickd CLI into ~/.wickd/spreads.db)
             get_spread_stats,
+            // Local-build detection for the update modal (placeholder endpoint)
+            updater_is_placeholder,
             // Watch-daemon client surface (AGT-652)
             daemon_status,
             daemon_queue_list,

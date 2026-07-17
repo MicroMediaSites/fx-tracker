@@ -18,6 +18,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
 import { check, Update } from '@tauri-apps/plugin-updater';
+import { isLocalBuild } from './hooks/useAppUpdater';
 import {
   LocalStrategy,
   deleteStrategy,
@@ -115,6 +116,9 @@ export const LocalApp = () => {
     const timer = setTimeout(async () => {
       updateCheckDoneRef.current = true;
       try {
+        // Local builds keep the placeholder updater endpoint — skip the
+        // doomed request instead of logging a connection error every launch.
+        if (await isLocalBuild()) return;
         const update = await check();
         if (update) {
           setPendingUpdate(update);

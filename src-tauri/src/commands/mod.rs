@@ -13,4 +13,5 @@ pub mod spread_stats;
 pub mod strategy_store;
 pub mod streaming;
 pub mod trading;
+pub mod updater;
 pub mod window;
