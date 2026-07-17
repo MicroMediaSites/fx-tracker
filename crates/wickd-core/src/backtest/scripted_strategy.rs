@@ -722,15 +722,23 @@ impl ScriptedStrategy {
 }
 
 impl ScriptedStrategy {
-    /// Feed a candle to advance indicators and price history without running the Rhai script.
-    /// Used by the watcher during warmup to avoid mutating user script state.
+    /// Feed a warmup candle through the FULL evaluation path — indicators,
+    /// price history, and the script's `on_candle()` — discarding the signal.
+    ///
+    /// Issue #9: this used to advance indicators/price history only,
+    /// deliberately skipping the Rhai script "to avoid mutating user script
+    /// state". That was exactly backwards for stateful scripts: every
+    /// script-local state machine (setup references, breakout ranges, the
+    /// script's own `position` var) started cold after a watcher (re)start,
+    /// so any signal whose setup formed on warmup candles was missed live
+    /// while `wickd strategy run` over identical candles fired. Replaying
+    /// through [`Strategy::on_candle_extended`] keeps one source of truth
+    /// for state evolution and matches backtest semantics exactly — and
+    /// cannot double-advance indicators, since the full path is the only
+    /// feed. Discarding the returned signal is the suppression: warmup
+    /// candles are historical, never tradeable.
     pub fn warmup_candle(&mut self, candle: &Candle) {
-        self.indicator_engine.on_candle(candle);
-        self.price_history.push_back(candle.clone());
-        if self.price_history.len() > self.max_price_history {
-            self.price_history.pop_front();
-        }
-        self.bar_count += 1;
+        let _ = self.on_candle_extended(candle);
     }
 }
 
@@ -1923,6 +1931,70 @@ fn on_candle() {
         let candle = create_test_candle(dec!(1.1000), 0);
         let signal = strategy.on_candle(&candle);
         assert_eq!(signal, Signal::Buy);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #9: warmup must replay the script's state machine
+    // -----------------------------------------------------------------------
+    // A minimal stateful script in the rahagod shape: top-level `let` state
+    // mutated by on_candle(). It arms on the first candle and only signals on
+    // a later one — the signal exists ONLY if the arming candle ran through
+    // the script.
+    const ARMING_SCRIPT: &str = r#"
+let armed = false;
+fn on_candle() {
+    if armed { "buy" } else { armed = true; "hold" }
+}
+"#;
+
+    #[test]
+    fn script_state_persists_across_candles() {
+        // Sanity baseline for the warmup test below: the live path
+        // accumulates script state across calls.
+        let mut live = ScriptedStrategy::from_script(ARMING_SCRIPT, "state_live").unwrap();
+        assert_eq!(live.on_candle(&create_test_candle(dec!(1.1000), 0)), Signal::Hold);
+        assert_eq!(live.on_candle(&create_test_candle(dec!(1.1000), 1)), Signal::Buy);
+    }
+
+    #[test]
+    fn warmup_replays_script_state() {
+        // Issue #9 regression: the arming candle lands in warmup (a watcher
+        // restart), and the signal candle is evaluated live. Before the fix
+        // warmup skipped on_candle(), the script stayed cold, and this
+        // returned Hold while `wickd strategy run` over the same candles
+        // said Buy.
+        let mut warmed = ScriptedStrategy::from_script(ARMING_SCRIPT, "state_warm").unwrap();
+        warmed.warmup_candle(&create_test_candle(dec!(1.1000), 0));
+        assert_eq!(warmed.on_candle(&create_test_candle(dec!(1.1000), 1)), Signal::Buy);
+    }
+
+    #[test]
+    fn warmup_discards_signals_but_advances_everything_once() {
+        // Warmup on a signal-producing candle must not surface the signal
+        // anywhere (the discard IS the suppression) — but bar_count, price
+        // history, and indicators must advance exactly once per candle,
+        // identical to the live path over the same candles.
+        let script = r#"
+fn on_candle() {
+    "buy"
+}
+"#;
+        let mut warmed = ScriptedStrategy::from_script(script, "warm").unwrap();
+        let mut live = ScriptedStrategy::from_script(script, "live").unwrap();
+
+        for i in 0..3 {
+            let c = create_test_candle(dec!(1.1000) + Decimal::from(i), i as i64);
+            warmed.warmup_candle(&c);
+            live.on_candle(&c);
+        }
+
+        assert_eq!(warmed.bar_count, 3);
+        assert_eq!(warmed.bar_count, live.bar_count);
+        assert_eq!(warmed.price_history.len(), live.price_history.len());
+        assert_eq!(
+            warmed.indicator_engine.get_snapshot(),
+            live.indicator_engine.get_snapshot()
+        );
     }
 
     // -----------------------------------------------------------------------

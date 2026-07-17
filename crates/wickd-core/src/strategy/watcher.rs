@@ -94,7 +94,10 @@ impl StrategyExecutor {
         }
     }
 
-    /// Warm up indicators with a historical candle (no rule evaluation).
+    /// Warm up with a historical candle. Rules: indicators only (no rule
+    /// evaluation). Scripted: the full `on_candle()` path with the signal
+    /// discarded, so script-local state machines are warm after a restart
+    /// (issue #9).
     pub fn warmup_candle(&mut self, candle: &Candle) {
         match self {
             Self::Rules(engine) => engine.warmup_candle(candle),

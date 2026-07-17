@@ -2359,4 +2359,51 @@ fn on_candle() {
         let reopened = WatchStateStore::open(dir.path(), "test-watcher").unwrap();
         assert_eq!(reopened.last_evaluated("EUR_USD"), Some(newest));
     }
+
+    // Issue #9 end-to-end: script state formed on WARMUP candles must carry
+    // into the backfill replay. A minimal stateful script in the rahagod
+    // shape — arms on one candle, signals on a later one.
+    const WARMUP_ARMING_SCRIPT: &str = r#"
+let armed = false;
+fn on_candle() {
+    if armed { "buy" } else { armed = true; "hold" }
+}
+"#;
+
+    // The restart shape from the 2026-07-16 GBP_USD miss: the arming candle
+    // is warmup material (evaluated by the previous process), the signal
+    // candle closed while the process was down and is replayed as backfill.
+    // Before the fix, warmup skipped on_candle(), the script state machine
+    // was cold, and the replay Held — while `wickd strategy run` over the
+    // identical candles said Buy.
+    #[tokio::test]
+    async fn backfill_sees_script_state_formed_during_warmup() {
+        let mut w = watcher(definition("scripted", Some(WARMUP_ARMING_SCRIPT)));
+        w.add_instrument_with_source(
+            "EUR_USD".to_string(),
+            Box::new(FixedHistorySource { history: hourly_candles(2) }),
+            Vec::new(),
+            "all".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let cutoff = candle_at("2026-07-14T00:00:00Z").time;
+        let state = w.instruments.get_mut("EUR_USD").unwrap();
+        state.warmup(100, Some(cutoff)).await.unwrap();
+        assert_eq!(state.pending_backfill.len(), 1, "the signal candle is stashed for replay");
+
+        // Seed the position cache so the replay never touches the network.
+        w.cached_positions = Some((Instant::now(), HashMap::new()));
+        let sink = RecordingSink::default();
+        w.backfill_instrument(&sink, "EUR_USD").await.unwrap();
+
+        let signals = sink.signals.lock().unwrap();
+        assert_eq!(
+            signals.len(),
+            1,
+            "the armed script's Buy on the replayed newest candle must be emitted — \
+             a cold script state machine would Hold here (issue #9)"
+        );
+    }
 }
