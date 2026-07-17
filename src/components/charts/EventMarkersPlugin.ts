@@ -1,23 +1,24 @@
 /**
  * Economic-event markers as a custom series primitive.
  *
- * Replaces the v1 `createSeriesMarkers` dots for two reasons (Matt's
- * 2026-07-16 chart feedback):
+ * Placement contract (learned the hard way — see the 2026-07-16 misplot):
  *
- * 1. FUTURE events: scheduled releases must render in the empty right
- *    margin where the next candles will appear. That margin is a
- *    `rightOffset` — pure visual space with no data points — so series
- *    markers (keyed by bar time) cannot reach it. This primitive places
- *    markers by LOGICAL index (`logicalToCoordinate`), which extends
- *    seamlessly past the last bar.
- * 2. Hover detail lives outside this file: ChartApp keys events by the
- *    same logical index and resolves crosshair moves against that map —
- *    the primitive only draws.
+ * - PAST releases are keyed by their candle's BUSINESS TIME and resolved
+ *   with `timeToCoordinate`. Never by raw bar index: the time scale's
+ *   logical 0 is its earliest point across ALL series, and indicator
+ *   series fetch deeper history than the candles (SMA warmup etc.), so
+ *   candle index ≠ logical index.
+ * - FUTURE (scheduled) releases render in the right-offset margin, which
+ *   has no data points, so time keys can't reach it. They are placed as
+ *   logical offsets from the LAST BAR, whose true logical position is
+ *   derived from the time scale itself:
+ *   `coordinateToLogical(timeToCoordinate(anchorBusinessTime))`.
  *
  * Visual language: filled dot = released (past), hollow ring = scheduled
  * (future); red = the slot contains a high-impact event, neutral gray =
  * medium only. Currency letters render under the dot in a small muted
- * label, matching the muted-palette rule for working UIs.
+ * label. Hover detail lives in ChartApp (crosshair-driven tooltip); the
+ * primitive only draws.
  */
 import {
   ISeriesPrimitive,
@@ -30,13 +31,14 @@ import {
 import { CanvasRenderingTarget2D } from 'fancy-canvas';
 
 export interface EventMarker {
-  /** Logical bar index — past events snap to their candle's index; future
-   * events continue past the last bar into the right offset. */
-  logical: number;
+  /** Business time of the candle containing a PAST release. Mutually
+   * exclusive with `futureSlots`. */
+  businessTime?: number;
+  /** Whole granularity-slots ahead of the last bar for a SCHEDULED
+   * release. Mutually exclusive with `businessTime`. */
+  futureSlots?: number;
   /** Any event in this slot is high impact. */
   high: boolean;
-  /** The slot holds scheduled (not yet released) events. */
-  upcoming: boolean;
   /** Space-joined currency legs, e.g. "GBP USD". */
   label: string;
 }
@@ -95,6 +97,7 @@ class EventMarkersRenderer implements IPrimitivePaneRenderer {
 
 class EventMarkersPaneView implements IPrimitivePaneView {
   private _markers: EventMarker[] = [];
+  private _anchorBusinessTime: number | null = null;
   private _chart: SeriesAttachedParameter<Time>['chart'] | null = null;
   private _renderer = new EventMarkersRenderer();
 
@@ -102,20 +105,41 @@ class EventMarkersPaneView implements IPrimitivePaneView {
     this._chart = chart;
   }
 
-  setMarkers(markers: EventMarker[]) {
+  setMarkers(markers: EventMarker[], anchorBusinessTime: number | null) {
     this._markers = markers;
+    this._anchorBusinessTime = anchorBusinessTime;
   }
 
   update() {
     if (!this._chart) return;
     const timeScale = this._chart.timeScale();
+
+    // Anchor for future offsets: the last bar's TRUE logical position,
+    // asked of the time scale (never assumed from array indices).
+    let anchorLogical: number | null = null;
+    if (this._anchorBusinessTime !== null) {
+      const anchorX = timeScale.timeToCoordinate(this._anchorBusinessTime as Time);
+      if (anchorX !== null) {
+        const logical = timeScale.coordinateToLogical(anchorX);
+        if (logical !== null) anchorLogical = Math.round(logical as number);
+      }
+    }
+
     this._renderer.update(
-      this._markers.map((m) => ({
-        x: timeScale.logicalToCoordinate(m.logical as Logical),
-        high: m.high,
-        upcoming: m.upcoming,
-        label: m.label,
-      }))
+      this._markers.map((m) => {
+        let x: number | null = null;
+        if (m.businessTime !== undefined) {
+          x = timeScale.timeToCoordinate(m.businessTime as Time);
+        } else if (m.futureSlots !== undefined && anchorLogical !== null) {
+          x = timeScale.logicalToCoordinate((anchorLogical + m.futureSlots) as Logical);
+        }
+        return {
+          x,
+          high: m.high,
+          upcoming: m.futureSlots !== undefined,
+          label: m.label,
+        };
+      })
     );
   }
 
@@ -127,14 +151,14 @@ class EventMarkersPaneView implements IPrimitivePaneView {
 export class EventMarkersPlugin implements ISeriesPrimitive<Time> {
   private _paneView = new EventMarkersPaneView();
   private _requestUpdate?: () => void;
-  private _pendingMarkers?: EventMarker[];
+  private _pending?: { markers: EventMarker[]; anchor: number | null };
 
   attached(param: SeriesAttachedParameter<Time>) {
     this._paneView.setChart(param.chart);
     this._requestUpdate = param.requestUpdate;
-    if (this._pendingMarkers) {
-      this._paneView.setMarkers(this._pendingMarkers);
-      this._pendingMarkers = undefined;
+    if (this._pending) {
+      this._paneView.setMarkers(this._pending.markers, this._pending.anchor);
+      this._pending = undefined;
       this._requestUpdate();
     }
   }
@@ -143,12 +167,12 @@ export class EventMarkersPlugin implements ISeriesPrimitive<Time> {
     this._requestUpdate = undefined;
   }
 
-  setMarkers(markers: EventMarker[]) {
-    this._paneView.setMarkers(markers);
+  setMarkers(markers: EventMarker[], anchorBusinessTime: number | null) {
+    this._paneView.setMarkers(markers, anchorBusinessTime);
     if (this._requestUpdate) {
       this._requestUpdate();
     } else {
-      this._pendingMarkers = markers;
+      this._pending = { markers, anchor: anchorBusinessTime };
     }
   }
 
