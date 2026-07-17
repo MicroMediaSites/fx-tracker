@@ -2,6 +2,8 @@ import { SymbolPicker } from '../ui/SymbolPicker';
 import { Combobox } from '../ui/Combobox';
 import { LivePriceDisplay } from './LivePriceDisplay';
 import { CandleCountdown } from './CandleCountdown';
+import { EventStrip } from './EventStrip';
+import type { EconomicCalendarEvent } from '../local/EconomicCalendarSection';
 import { IndicatorMenu } from './IndicatorMenu';
 import { SRToolsMenu } from './SRToolsMenu';
 import { useSettingsStore } from '../../stores/settingsStore';
@@ -16,6 +18,9 @@ interface ChartHeaderProps {
   loading: boolean;
   onInstrumentChange: (instrument: string) => void;
   onGranularityChange: (granularity: string) => void;
+
+  // Upcoming economic events for the instrument legs (chart-marker feed)
+  economicEvents?: EconomicCalendarEvent[];
 
   // Price display
   isHistoricalView: boolean;
@@ -65,6 +70,7 @@ export const ChartHeader = ({
   loading,
   onInstrumentChange,
   onGranularityChange,
+  economicEvents,
   isHistoricalView,
   hoveredCandle,
   streaming,
@@ -145,6 +151,13 @@ export const ChartHeader = ({
         {!isHistoricalView && !loading && (
           <div className="border-l border-[var(--color-border)] pl-4">
             <CandleCountdown granularity={granularity} />
+          </div>
+        )}
+
+        {/* Next economic release for the instrument legs */}
+        {!loading && economicEvents && economicEvents.length > 0 && (
+          <div className="border-l border-[var(--color-border)] pl-4">
+            <EventStrip events={economicEvents} />
           </div>
         )}
       </div>

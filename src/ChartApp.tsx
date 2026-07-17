@@ -3,13 +3,18 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { WindowHeader } from './components/ui/WindowHeader';
 import { useEnvironmentSync } from './hooks/useEnvironmentSync';
+import { useEconomicEvents } from './hooks/useEconomicEvents';
 import { buildChartingContext } from './lib/chatContextBuilder';
 import { getTerminalWelcome } from './lib/terminalWelcome';
 import {
   createChart,
   CandlestickSeries,
+  createSeriesMarkers,
   type IChartApi,
   type ISeriesApi,
+  type ISeriesMarkersPluginApi,
+  type SeriesMarker,
+  type Time,
 } from 'lightweight-charts';
 import { TradeOverlayPlugin, type TradeData } from './components/charts/TradeOverlayPlugin';
 import { IchimokuCloudPlugin } from './components/charts/IchimokuCloudPlugin';
@@ -65,6 +70,13 @@ export const ChartApp = () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const candleSeriesRef = useRef<ISeriesApi<any> | null>(null);
   const tradeOverlayRef = useRef<TradeOverlayPlugin | null>(null);
+  // The markers plugin plus the series it was created on. The candle series
+  // is mount-created and never replaced (instrument changes applyOptions on
+  // the same series), but keying the plugin to its series makes staleness
+  // structurally impossible if that lifecycle ever changes — a plugin for a
+  // dead series is discarded, never setMarkers'd, and never duplicated.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const eventMarkersRef = useRef<{ series: ISeriesApi<any>; plugin: ISeriesMarkersPluginApi<Time> } | null>(null);
   const ichimokuCloudRef = useRef<IchimokuCloudPlugin | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const indicatorSeriesRef = useRef<Map<string, ISeriesApi<any>>>(new Map());
@@ -93,6 +105,10 @@ export const ChartApp = () => {
   const tradesInstrumentRef = useRef<string>(initialParams.instrument);
   // Counter that increments when candles finish loading, triggering trade overlay effect
   const [candlesLoadedCount, setCandlesLoadedCount] = useState(0);
+
+  // Upcoming + recent economic releases for this instrument's currency legs
+  // (medium/high impact). Feeds the header strip and the chart markers.
+  const economicEvents = useEconomicEvents(instrument);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [strategyId] = useState<string | null>(initialParams.strategyId);
   const [signalDirection] = useState<'long' | 'short' | null>(initialParams.signalDirection);
@@ -767,6 +783,54 @@ export const ChartApp = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectiveTrades, candlesLoadedCount]);
 
+  // Economic-event markers: one dot above the candle that contains each
+  // medium/high release for the instrument legs. Same trigger pair as the
+  // trade overlay: markers can only be placed once the time map exists, and
+  // event times between bars snap to the nearest candle via toBusinessTime's
+  // closest-match fallback (weekend releases land on the adjacent candle).
+  useEffect(() => {
+    if (!candleSeriesRef.current) return;
+    if (timeMapStateRef.current.timeMap.size === 0) return;
+
+    // Only mark events inside the loaded candle range — closest-match
+    // snapping would otherwise pile out-of-range events onto the edge bars.
+    const actualTimes = Array.from(timeMapStateRef.current.timeMap.keys());
+    const minActual = Math.min(...actualTimes);
+    const maxActual = Math.max(...actualTimes) + timeMapStateRef.current.typicalInterval;
+
+    const byBusinessTime = new Map<number, { currencies: Set<string>; high: boolean }>();
+    for (const ev of economicEvents) {
+      if (ev.time_unix < minActual || ev.time_unix > maxActual) continue;
+      const t = toBusinessTimeUtil(ev.time_unix, timeMapStateRef.current.timeMap);
+      const slot = byBusinessTime.get(t) ?? { currencies: new Set<string>(), high: false };
+      slot.currencies.add(ev.currency);
+      slot.high = slot.high || ev.impact === 'high';
+      byBusinessTime.set(t, slot);
+    }
+
+    const markers: SeriesMarker<Time>[] = Array.from(byBusinessTime.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([t, slot]) => ({
+        time: t as Time,
+        position: 'aboveBar',
+        shape: 'circle',
+        color: slot.high ? '#f23645' : '#787b86',
+        size: 1,
+        text: Array.from(slot.currencies).join(' '),
+      }));
+
+    if (eventMarkersRef.current?.series === candleSeriesRef.current) {
+      eventMarkersRef.current.plugin.setMarkers(markers);
+    } else if (markers.length > 0) {
+      eventMarkersRef.current = {
+        series: candleSeriesRef.current,
+        plugin: createSeriesMarkers(candleSeriesRef.current, markers),
+      };
+    }
+  // candlesLoadedCount re-runs this once the time map is populated
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [economicEvents, candlesLoadedCount]);
+
   // Load indicators when chartIndicators changes
   useEffect(() => {
     if (!chartRef.current) {
@@ -1300,6 +1364,7 @@ export const ChartApp = () => {
           loading={loading}
           onInstrumentChange={setInstrument}
           onGranularityChange={setGranularity}
+          economicEvents={economicEvents}
           isHistoricalView={isHistoricalView}
           hoveredCandle={hoveredCandle}
           streaming={priceStreaming.streaming}
