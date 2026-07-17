@@ -737,8 +737,15 @@ impl ScriptedStrategy {
     /// cannot double-advance indicators, since the full path is the only
     /// feed. Discarding the returned signal is the suppression: warmup
     /// candles are historical, never tradeable.
-    pub fn warmup_candle(&mut self, candle: &Candle) {
-        let _ = self.on_candle_extended(candle);
+    ///
+    /// The signal is returned (not emitted) so the watcher can track the
+    /// position the script *believes* it holds after the replay: a
+    /// suppressed Entry still mutates script state (e.g. an internal
+    /// `position` var) even though no order was ever placed. The caller
+    /// reconciles that belief against the real account after warmup — see
+    /// `MultiInstrumentWatcher::reconcile_script_position`.
+    pub fn warmup_candle(&mut self, candle: &Candle) -> ExtendedSignal {
+        self.on_candle_extended(candle)
     }
 }
 

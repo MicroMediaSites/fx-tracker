@@ -98,10 +98,29 @@ impl StrategyExecutor {
     /// evaluation). Scripted: the full `on_candle()` path with the signal
     /// discarded, so script-local state machines are warm after a restart
     /// (issue #9).
-    pub fn warmup_candle(&mut self, candle: &Candle) {
+    ///
+    /// Returns the raw signal the script produced (None for rules engines,
+    /// which don't evaluate during warmup) so the warmup loop can fold the
+    /// position the script believes it entered/exited during the replay —
+    /// the input to the post-warmup account reconcile.
+    pub fn warmup_candle(&mut self, candle: &Candle) -> Option<Signal> {
         match self {
-            Self::Rules(engine) => engine.warmup_candle(candle),
-            Self::Scripted(strategy) => strategy.warmup_candle(candle),
+            Self::Rules(engine) => {
+                engine.warmup_candle(candle);
+                None
+            }
+            Self::Scripted(strategy) => Some(strategy.warmup_candle(candle).signal),
+        }
+    }
+
+    /// Fire the strategy's position-closed hook (the script's optional
+    /// `on_position_closed()`), clearing engine-side position sentinels.
+    /// Used by the post-warmup reconcile when the script replayed into a
+    /// position the account doesn't actually hold. No-op for rules engines:
+    /// their position state is engine-owned and synced every tick.
+    pub fn notify_position_closed(&mut self) {
+        if let Self::Scripted(strategy) = self {
+            strategy.notify_position_closed();
         }
     }
 
