@@ -20,7 +20,19 @@ automatically, restart on crash, and survive reboots (AGT-629).
 | **Stream hub** (singleton) | `com.openthink.wickd-stream` | `wickd stream <instruments> --env <e> --account <a>` |
 | **Autonomous watcher** (one per strategy) | `com.openthink.wickd-watch.<slug>` | `wickd watch <strategy> <instruments> --granularity <g> --env practice --account <a> --units <n> --auto` |
 | **Books collector** (singleton, periodic one-shot) | `com.openthink.wickd-books` | `wickd books <instruments> --store --env <e> --account <a>` every `StartInterval` seconds |
+| **Calendar sync** (singleton, periodic one-shot) | `com.openthink.wickd-calendar` | `wickd calendar sync` every `StartInterval` seconds |
 | **Candle watchdog** (singleton, periodic one-shot) | `com.openthink.wickd-watchdog` | `python3 wickd-candle-watchdog.py --grace <s> --realert <s>` every `StartInterval` seconds |
+
+**Calendar sync** keeps `~/.wickd/calendar/` (the economic-calendar CSV store
+shared by the strategy engine and the desktop app's calendar UI) current from
+the free ForexFactory weekly feed. Default interval 21600s (6h) — FF revises
+forecasts and re-times events through the week and rolls the feed Sunday ET.
+The merge preserves stored `actual` values (the weekly feed never carries
+them) and rewrites monthly files atomically, so the surprise accessors'
+directory-fingerprint refresh never sees a torn file. No OANDA credentials:
+the only network call is a public GET. Install:
+`install.sh calendar [--interval 21600]`; logs:
+`~/Library/Logs/wickd/calendar.{out,err}.log`.
 
 **The books collector is not a daemon.** launchd fires it on an interval
 (default 1200s — OANDA's 20-minute book-snapshot cadence), it appends any new
