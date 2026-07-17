@@ -7,13 +7,12 @@ import { useEconomicEvents } from './hooks/useEconomicEvents';
 import {
   createChart,
   CandlestickSeries,
-  createSeriesMarkers,
   type IChartApi,
   type ISeriesApi,
-  type ISeriesMarkersPluginApi,
-  type SeriesMarker,
-  type Time,
 } from 'lightweight-charts';
+import { EventMarkersPlugin, type EventMarker } from './components/charts/EventMarkersPlugin';
+import type { EconomicCalendarEvent } from './components/local/EconomicCalendarSection';
+import { ImpactBadge } from './components/local/EconomicCalendarSection';
 import { TradeOverlayPlugin, type TradeData } from './components/charts/TradeOverlayPlugin';
 import { IchimokuCloudPlugin } from './components/charts/IchimokuCloudPlugin';
 import { SRZoneOverlay } from './components/charts/SRZoneOverlay';
@@ -68,13 +67,15 @@ export const ChartApp = () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const candleSeriesRef = useRef<ISeriesApi<any> | null>(null);
   const tradeOverlayRef = useRef<TradeOverlayPlugin | null>(null);
-  // The markers plugin plus the series it was created on. The candle series
-  // is mount-created and never replaced (instrument changes applyOptions on
-  // the same series), but keying the plugin to its series makes staleness
-  // structurally impossible if that lifecycle ever changes — a plugin for a
-  // dead series is discarded, never setMarkers'd, and never duplicated.
+  // Event-marker plugin (custom primitive: draws past AND future releases
+  // by logical index) plus the series it is attached to — keyed to the
+  // series so staleness is structurally impossible if the mount-once
+  // series lifecycle ever changes.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const eventMarkersRef = useRef<{ series: ISeriesApi<any>; plugin: ISeriesMarkersPluginApi<Time> } | null>(null);
+  const eventMarkersRef = useRef<{ series: ISeriesApi<any>; plugin: EventMarkersPlugin } | null>(null);
+  // Events keyed by the logical index their marker occupies — the hover
+  // tooltip resolves crosshair moves against this map.
+  const eventLogicalMapRef = useRef<Map<number, EconomicCalendarEvent[]>>(new Map());
   const ichimokuCloudRef = useRef<IchimokuCloudPlugin | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const indicatorSeriesRef = useRef<Map<string, ISeriesApi<any>>>(new Map());
@@ -117,6 +118,7 @@ export const ChartApp = () => {
   const [toDate] = useState<string | null>(initialParams.to);
   const [parameterOverrides] = useState<Record<string, number> | null>(initialParams.parameterOverrides);
   const [hoveredCandle, setHoveredCandle] = useState<OHLCData | null>(null);
+  const [eventTooltip, setEventTooltip] = useState<{ x: number; events: EconomicCalendarEvent[] } | null>(null);
   const [selectedIndicator, setSelectedIndicator] = useState<{ id: string; label: string } | null>(null);
   const selectedIndicatorRef = useRef<{ id: string; label: string } | null>(null);
   const hoveredIndicatorRef = useRef<{ id: string; label: string } | null>(null);
@@ -631,6 +633,15 @@ export const ChartApp = () => {
 
     // Subscribe to crosshair move for OHLC display and indicator hover
     chart.subscribeCrosshairMove((param) => {
+      // Event-marker hover: logical works across the whole axis, including
+      // the future right-offset where scheduled releases render.
+      if (param.logical != null && param.point) {
+        const hovered = eventLogicalMapRef.current.get(Math.round(param.logical as number));
+        setEventTooltip(hovered?.length ? { x: param.point.x, events: hovered } : null);
+      } else {
+        setEventTooltip(null);
+      }
+
       if (!param.time || !param.seriesData || param.seriesData.size === 0) {
         setHoveredCandle(null);
         updateIndicatorLabel(null);
@@ -781,53 +792,71 @@ export const ChartApp = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectiveTrades, candlesLoadedCount]);
 
-  // Economic-event markers: one dot above the candle that contains each
-  // medium/high release for the instrument legs. Same trigger pair as the
-  // trade overlay: markers can only be placed once the time map exists, and
-  // event times between bars snap to the nearest candle via toBusinessTime's
-  // closest-match fallback (weekend releases land on the adjacent candle).
+  // Economic-event markers, past AND future. Past releases snap to the
+  // candle that contains them (logical = that candle's index); scheduled
+  // releases continue past the last bar into the right-offset margin at
+  // one logical slot per granularity interval — exactly where their candle
+  // will appear when it forms. The same logical keys drive the hover
+  // tooltip (crosshair subscription in the mount effect).
   useEffect(() => {
     if (!candleSeriesRef.current) return;
-    if (timeMapStateRef.current.timeMap.size === 0) return;
+    const candles = candlesDataRef.current;
+    if (candles.length === 0) return;
 
-    // Only mark events inside the loaded candle range — closest-match
-    // snapping would otherwise pile out-of-range events onto the edge bars.
-    const actualTimes = Array.from(timeMapStateRef.current.timeMap.keys());
-    const minActual = Math.min(...actualTimes);
-    const maxActual = Math.max(...actualTimes) + timeMapStateRef.current.typicalInterval;
+    const actualTimes = candles.map((c) => Math.floor(new Date(c.time).getTime() / 1000));
+    const lastActual = actualTimes[actualTimes.length - 1];
+    const gran = getGranularitySeconds(granularity);
 
-    const byBusinessTime = new Map<number, { currencies: Set<string>; high: boolean }>();
+    const byLogical = new Map<number, { events: EconomicCalendarEvent[]; high: boolean; upcoming: boolean }>();
     for (const ev of economicEvents) {
-      if (ev.time_unix < minActual || ev.time_unix > maxActual) continue;
-      const t = toBusinessTimeUtil(ev.time_unix, timeMapStateRef.current.timeMap);
-      const slot = byBusinessTime.get(t) ?? { currencies: new Set<string>(), high: false };
-      slot.currencies.add(ev.currency);
+      let logical: number;
+      let upcoming = false;
+      if (ev.time_unix < actualTimes[0]) {
+        continue; // before the loaded range
+      } else if (ev.time_unix < lastActual + gran) {
+        // Binary search: last candle whose open time <= the event instant.
+        let lo = 0;
+        let hi = actualTimes.length - 1;
+        while (lo < hi) {
+          const mid = Math.ceil((lo + hi) / 2);
+          if (actualTimes[mid] <= ev.time_unix) lo = mid;
+          else hi = mid - 1;
+        }
+        logical = lo;
+      } else {
+        const slotsAhead = Math.max(1, Math.round((ev.time_unix - lastActual) / gran));
+        if (slotsAhead > FUTURE_CANDLE_SLOTS) continue; // beyond the margin
+        logical = actualTimes.length - 1 + slotsAhead;
+        upcoming = true;
+      }
+      const slot = byLogical.get(logical) ?? { events: [], high: false, upcoming };
+      slot.events.push(ev);
       slot.high = slot.high || ev.impact === 'high';
-      byBusinessTime.set(t, slot);
+      byLogical.set(logical, slot);
     }
 
-    const markers: SeriesMarker<Time>[] = Array.from(byBusinessTime.entries())
+    eventLogicalMapRef.current = new Map(
+      Array.from(byLogical.entries()).map(([k, v]) => [k, v.events])
+    );
+
+    const markers: EventMarker[] = Array.from(byLogical.entries())
       .sort(([a], [b]) => a - b)
-      .map(([t, slot]) => ({
-        time: t as Time,
-        position: 'aboveBar',
-        shape: 'circle',
-        color: slot.high ? '#f23645' : '#787b86',
-        size: 1,
-        text: Array.from(slot.currencies).join(' '),
+      .map(([logical, slot]) => ({
+        logical,
+        high: slot.high,
+        upcoming: slot.upcoming,
+        label: Array.from(new Set(slot.events.map((e) => e.currency))).join(' '),
       }));
 
-    if (eventMarkersRef.current?.series === candleSeriesRef.current) {
-      eventMarkersRef.current.plugin.setMarkers(markers);
-    } else if (markers.length > 0) {
-      eventMarkersRef.current = {
-        series: candleSeriesRef.current,
-        plugin: createSeriesMarkers(candleSeriesRef.current, markers),
-      };
+    if (eventMarkersRef.current?.series !== candleSeriesRef.current) {
+      const plugin = new EventMarkersPlugin();
+      candleSeriesRef.current.attachPrimitive(plugin);
+      eventMarkersRef.current = { series: candleSeriesRef.current, plugin };
     }
-  // candlesLoadedCount re-runs this once the time map is populated
+    eventMarkersRef.current.plugin.setMarkers(markers);
+  // candlesLoadedCount re-runs this once candle data is populated
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [economicEvents, candlesLoadedCount]);
+  }, [economicEvents, candlesLoadedCount, granularity]);
 
   // Load indicators when chartIndicators changes
   useEffect(() => {
@@ -1415,6 +1444,36 @@ export const ChartApp = () => {
             showEditButton={showSRTools}
             containerRef={chartContainerRef}
           />
+
+          {/* Economic-event hover detail: what released (or will), and the
+              numbers — so a candle can be read against its news. */}
+          {eventTooltip && (
+            <div
+              data-testid="chart-event-tooltip"
+              className="absolute top-9 z-20 pointer-events-none rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)]/95 px-3 py-2 space-y-1 shadow-lg max-w-xs"
+              style={{ left: Math.max(8, Math.min(eventTooltip.x - 120, 99999)) }}
+            >
+              {eventTooltip.events.map((ev) => (
+                <div key={`${ev.date}-${ev.time}-${ev.currency}-${ev.event}`} className="text-xs">
+                  <div className="flex items-center gap-2">
+                    <ImpactBadge impact={ev.impact} />
+                    <span className="font-semibold">{ev.currency}</span>
+                    <span className="text-[var(--color-text-secondary)]">{ev.event}</span>
+                  </div>
+                  <div className="text-[var(--color-text-muted)] mt-0.5">
+                    {new Date(ev.time_unix * 1000).toLocaleString(undefined, {
+                      weekday: 'short',
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    })}
+                    {ev.actual ? ` · actual ${ev.actual}` : ' · scheduled'}
+                    {ev.forecast && ` · f ${ev.forecast}`}
+                    {ev.previous && ` · p ${ev.previous}`}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {effectiveTrades && <TradeLegend trades={effectiveTrades} />}

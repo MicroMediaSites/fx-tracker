@@ -31,7 +31,7 @@ use commands::streaming::{
     subscribe_to_prices, unsubscribe_from_prices, hub_stream_status,
 };
 use commands::spread_stats::get_spread_stats;
-use commands::economic_calendar::get_economic_calendar;
+use commands::economic_calendar::{get_economic_calendar, get_economic_event_history};
 use commands::feed::feed_list;
 use commands::oanda::{
     switch_oanda_environment, get_oanda_environment,
@@ -412,6 +412,7 @@ async fn main() {
             // Economic-calendar store reader (read-only, offline; the wickd
             // CLI + launchd sync job own freshness)
             get_economic_calendar,
+            get_economic_event_history,
             // AI market-awareness feed reader (read-only, offline; the wickd
             // CLI + launchd feed job own freshness)
             feed_list,
