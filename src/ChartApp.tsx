@@ -11,6 +11,7 @@ import {
   CandlestickSeries,
   type IChartApi,
   type ISeriesApi,
+  type Time,
 } from 'lightweight-charts';
 import { EventMarkersPlugin, type EventMarker } from './components/charts/EventMarkersPlugin';
 import type { EconomicCalendarEvent } from './components/local/EconomicCalendarSection';
@@ -75,9 +76,13 @@ export const ChartApp = () => {
   // series lifecycle ever changes.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const eventMarkersRef = useRef<{ series: ISeriesApi<any>; plugin: EventMarkersPlugin } | null>(null);
-  // Events keyed by the logical index their marker occupies — the hover
-  // tooltip resolves crosshair moves against this map.
-  const eventLogicalMapRef = useRef<Map<number, EconomicCalendarEvent[]>>(new Map());
+  // Hover-resolution state for the tooltip: past events keyed by their
+  // candle's business time (what crosshair param.time reports), future
+  // events keyed by slots-ahead-of-last-bar, plus the last bar's business
+  // time as the anchor for the future math.
+  const eventPastMapRef = useRef<Map<number, EconomicCalendarEvent[]>>(new Map());
+  const eventFutureMapRef = useRef<Map<number, EconomicCalendarEvent[]>>(new Map());
+  const eventAnchorRef = useRef<number | null>(null);
   const ichimokuCloudRef = useRef<IchimokuCloudPlugin | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const indicatorSeriesRef = useRef<Map<string, ISeriesApi<any>>>(new Map());
@@ -635,14 +640,25 @@ export const ChartApp = () => {
 
     // Subscribe to crosshair move for OHLC display and indicator hover
     chart.subscribeCrosshairMove((param) => {
-      // Event-marker hover: logical works across the whole axis, including
-      // the future right-offset where scheduled releases render.
-      if (param.logical != null && param.point) {
-        const hovered = eventLogicalMapRef.current.get(Math.round(param.logical as number));
-        setEventTooltip(hovered?.length ? { x: param.point.x, events: hovered } : null);
-      } else {
-        setEventTooltip(null);
+      // Event-marker hover. Past markers: the crosshair snaps to a bar, so
+      // param.time IS the marker's business-time key. Future markers: over
+      // the right-offset there are no bars — resolve the hovered slot as a
+      // logical offset from the last bar's anchored position.
+      let hovered: EconomicCalendarEvent[] | undefined;
+      if (param.point) {
+        if (typeof param.time === 'number') {
+          hovered = eventPastMapRef.current.get(param.time);
+        } else if (param.logical != null && eventAnchorRef.current !== null) {
+          const ts = chart.timeScale();
+          const anchorX = ts.timeToCoordinate(eventAnchorRef.current as Time);
+          const anchorLogical = anchorX !== null ? ts.coordinateToLogical(anchorX) : null;
+          if (anchorLogical !== null) {
+            const slot = Math.round((param.logical as number) - Math.round(anchorLogical as number));
+            if (slot > 0) hovered = eventFutureMapRef.current.get(slot);
+          }
+        }
       }
+      setEventTooltip(hovered?.length && param.point ? { x: param.point.x, events: hovered } : null);
 
       if (!param.time || !param.seriesData || param.seriesData.size === 0) {
         setHoveredCandle(null);
@@ -794,69 +810,77 @@ export const ChartApp = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectiveTrades, candlesLoadedCount]);
 
-  // Economic-event markers, past AND future. Past releases snap to the
-  // candle that contains them (logical = that candle's index); scheduled
-  // releases continue past the last bar into the right-offset margin at
-  // one logical slot per granularity interval — exactly where their candle
-  // will appear when it forms. The same logical keys drive the hover
-  // tooltip (crosshair subscription in the mount effect).
+  // Economic-event markers, past AND future.
+  //
+  // PAST releases snap to the business time of the candle that contains
+  // them (toBusinessTime closest-match) and are drawn via timeToCoordinate
+  // — never by bar index: the time scale's logical 0 belongs to whichever
+  // series has the earliest point, and indicators fetch deeper history
+  // than the candles, so index-based placement drifts left by the
+  // indicator lead-in (the 2026-07-16 misplot).
+  //
+  // SCHEDULED releases render in the right-offset margin as whole
+  // granularity-slots ahead of the last bar — where their candle will
+  // form — anchored to the last bar's true logical position (resolved by
+  // the plugin from the time scale itself).
   useEffect(() => {
     if (!candleSeriesRef.current) return;
+    if (timeMapStateRef.current.timeMap.size === 0) return;
     const candles = candlesDataRef.current;
     if (candles.length === 0) return;
 
     const actualTimes = candles.map((c) => Math.floor(new Date(c.time).getTime() / 1000));
+    const firstActual = actualTimes[0];
     const lastActual = actualTimes[actualTimes.length - 1];
     const gran = getGranularitySeconds(granularity);
+    const anchorBusinessTime = toBusinessTimeUtil(lastActual, timeMapStateRef.current.timeMap);
 
-    const byLogical = new Map<number, { events: EconomicCalendarEvent[]; high: boolean; upcoming: boolean }>();
+    const past = new Map<number, { events: EconomicCalendarEvent[]; high: boolean }>();
+    const future = new Map<number, { events: EconomicCalendarEvent[]; high: boolean }>();
     for (const ev of economicEvents) {
-      let logical: number;
-      let upcoming = false;
-      if (ev.time_unix < actualTimes[0]) {
-        continue; // before the loaded range
-      } else if (ev.time_unix < lastActual + gran) {
-        // Binary search: last candle whose open time <= the event instant.
-        let lo = 0;
-        let hi = actualTimes.length - 1;
-        while (lo < hi) {
-          const mid = Math.ceil((lo + hi) / 2);
-          if (actualTimes[mid] <= ev.time_unix) lo = mid;
-          else hi = mid - 1;
-        }
-        logical = lo;
+      if (ev.time_unix < firstActual) continue; // before the loaded range
+      if (ev.time_unix < lastActual + gran) {
+        const t = toBusinessTimeUtil(ev.time_unix, timeMapStateRef.current.timeMap);
+        const slot = past.get(t) ?? { events: [], high: false };
+        slot.events.push(ev);
+        slot.high = slot.high || ev.impact === 'high';
+        past.set(t, slot);
       } else {
         const slotsAhead = Math.max(1, Math.round((ev.time_unix - lastActual) / gran));
         if (slotsAhead > FUTURE_CANDLE_SLOTS) continue; // beyond the margin
-        logical = actualTimes.length - 1 + slotsAhead;
-        upcoming = true;
+        const slot = future.get(slotsAhead) ?? { events: [], high: false };
+        slot.events.push(ev);
+        slot.high = slot.high || ev.impact === 'high';
+        future.set(slotsAhead, slot);
       }
-      const slot = byLogical.get(logical) ?? { events: [], high: false, upcoming };
-      slot.events.push(ev);
-      slot.high = slot.high || ev.impact === 'high';
-      byLogical.set(logical, slot);
     }
 
-    eventLogicalMapRef.current = new Map(
-      Array.from(byLogical.entries()).map(([k, v]) => [k, v.events])
-    );
+    eventPastMapRef.current = new Map(Array.from(past.entries()).map(([k, v]) => [k, v.events]));
+    eventFutureMapRef.current = new Map(Array.from(future.entries()).map(([k, v]) => [k, v.events]));
+    eventAnchorRef.current = anchorBusinessTime;
 
-    const markers: EventMarker[] = Array.from(byLogical.entries())
-      .sort(([a], [b]) => a - b)
-      .map(([logical, slot]) => ({
-        logical,
+    const label = (evs: EconomicCalendarEvent[]) =>
+      Array.from(new Set(evs.map((e) => e.currency))).join(' ');
+    const markers: EventMarker[] = [
+      ...Array.from(past.entries()).map(([businessTime, slot]) => ({
+        businessTime,
         high: slot.high,
-        upcoming: slot.upcoming,
-        label: Array.from(new Set(slot.events.map((e) => e.currency))).join(' '),
-      }));
+        label: label(slot.events),
+      })),
+      ...Array.from(future.entries()).map(([futureSlots, slot]) => ({
+        futureSlots,
+        high: slot.high,
+        label: label(slot.events),
+      })),
+    ];
 
     if (eventMarkersRef.current?.series !== candleSeriesRef.current) {
       const plugin = new EventMarkersPlugin();
       candleSeriesRef.current.attachPrimitive(plugin);
       eventMarkersRef.current = { series: candleSeriesRef.current, plugin };
     }
-    eventMarkersRef.current.plugin.setMarkers(markers);
-  // candlesLoadedCount re-runs this once candle data is populated
+    eventMarkersRef.current.plugin.setMarkers(markers, anchorBusinessTime);
+  // candlesLoadedCount re-runs this once the time map is populated
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [economicEvents, candlesLoadedCount, granularity]);
 
@@ -1511,7 +1535,11 @@ export const ChartApp = () => {
                       hour: '2-digit',
                       minute: '2-digit',
                     })}
-                    {ev.actual ? ` · actual ${ev.actual}` : ' · scheduled'}
+                    {ev.time_unix > Date.now() / 1000
+                      ? ' · scheduled'
+                      : ev.actual
+                        ? ` · actual ${ev.actual}`
+                        : ' · released (actual pending in store)'}
                     {ev.forecast && ` · f ${ev.forecast}`}
                     {ev.previous && ` · p ${ev.previous}`}
                   </div>

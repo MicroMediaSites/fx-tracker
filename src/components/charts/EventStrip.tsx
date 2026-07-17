@@ -24,7 +24,7 @@ export const EventStrip = ({ events }: { events: EconomicCalendarEvent[] }) => {
   return (
     <span
       data-testid="chart-event-strip"
-      className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] whitespace-nowrap"
+      className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] whitespace-nowrap overflow-hidden text-ellipsis"
       title={`${next.currency} ${next.event} (${next.impact} impact)`}
     >
       <span

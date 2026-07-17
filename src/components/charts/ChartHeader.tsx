@@ -130,7 +130,9 @@ export const ChartHeader = ({
         </div>
 
         {/* Live price or Historical View OHLC */}
-        <div className="flex items-center text-sm border-l border-[var(--color-border)] pl-4 min-w-[320px]">
+        {/* Reserve the width of the WIDER render state (hover OHLC) so
+            entering/leaving a candle never reflows the header. */}
+        <div className="flex items-center text-sm border-l border-[var(--color-border)] pl-4 min-w-[440px]">
           <LivePriceDisplay
             isHistoricalView={isHistoricalView}
             hoveredCandle={hoveredCandle}
@@ -154,9 +156,11 @@ export const ChartHeader = ({
           </div>
         )}
 
-        {/* Next economic release for the instrument legs */}
+        {/* Next economic release for the instrument legs. min-w-0 +
+            truncate: this strip absorbs narrow-window pressure so the
+            fixed-width price/countdown cells never wrap. */}
         {!loading && economicEvents && economicEvents.length > 0 && (
-          <div className="border-l border-[var(--color-border)] pl-4">
+          <div className="border-l border-[var(--color-border)] pl-4 min-w-0 overflow-hidden">
             <EventStrip events={economicEvents} />
           </div>
         )}
