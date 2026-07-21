@@ -16,8 +16,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { CollapsibleSection } from '../ui/CollapsibleSection';
+import { useCalendarEvents } from '../../hooks/useCalendarEvents';
 
-const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // store changes at most every sync
 const COUNTDOWN_TICK_MS = 30 * 1000;
 const HISTORY_LIMIT = 8;
 
@@ -204,7 +204,9 @@ export const EventRow = ({ ev }: { ev: EconomicCalendarEvent }) => {
 };
 
 export const EconomicCalendarSection = () => {
-  const [events, setEvents] = useState<EconomicCalendarEvent[]>([]);
+  // Shared with CalendarWeek — one poller for the whole window, so this
+  // section's badge and the dashboard's countdown always agree.
+  const events = useCalendarEvents() ?? [];
   const [nowUnix, setNowUnix] = useState(() => Math.floor(Date.now() / 1000));
   const [highOnly, setHighOnly] = useState(() => localStorage.getItem(IMPACT_STORAGE_KEY) === 'true');
   const [currencies, setCurrencies] = useState<string[]>(() => {
@@ -219,27 +221,6 @@ export const EconomicCalendarSection = () => {
     }
     return DEFAULT_CURRENCIES;
   });
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const rows = await invoke<EconomicCalendarEvent[]>('get_economic_calendar', {
-          daysBack: 0,
-          daysAhead: 14,
-        });
-        if (!cancelled) setEvents(Array.isArray(rows) ? rows : []);
-      } catch {
-        // Store unreadable — keep the last known list
-      }
-    };
-    void load();
-    const interval = setInterval(() => void load(), REFRESH_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, []);
 
   useEffect(() => {
     const tick = setInterval(() => setNowUnix(Math.floor(Date.now() / 1000)), COUNTDOWN_TICK_MS);
