@@ -18,11 +18,10 @@
  * column, not today's.
  */
 import { useEffect, useMemo, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import type { EconomicCalendarEvent } from './EconomicCalendarSection';
 import { localDateKey } from './EconomicCalendarSection';
+import { useCalendarEvents } from '../../hooks/useCalendarEvents';
 
-const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const COUNTDOWN_TICK_MS = 30 * 1000;
 /** Days of forward coverage rendered as columns. */
 const DAYS = 7;
@@ -123,29 +122,10 @@ const DayEvent = ({ ev, past }: { ev: EconomicCalendarEvent; past: boolean }) =>
 };
 
 export const CalendarWeek = () => {
-  const [events, setEvents] = useState<EconomicCalendarEvent[] | null>(null);
+  // Shared with EconomicCalendarSection: one poller, one snapshot, so the
+  // countdown here can never disagree with the one in that section's badge.
+  const events = useCalendarEvents();
   const [nowUnix, setNowUnix] = useState(() => Math.floor(Date.now() / 1000));
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const rows = await invoke<EconomicCalendarEvent[]>('get_economic_calendar', {
-          daysBack: 1,
-          daysAhead: 14,
-        });
-        if (!cancelled) setEvents(Array.isArray(rows) ? rows : []);
-      } catch {
-        if (!cancelled) setEvents([]);
-      }
-    };
-    void load();
-    const interval = setInterval(() => void load(), REFRESH_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, []);
 
   // Countdown ticks independently of the (much slower) store poll.
   useEffect(() => {

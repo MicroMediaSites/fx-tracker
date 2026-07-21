@@ -272,6 +272,52 @@ pub fn list_at(path: impl AsRef<Path>) -> Result<Vec<QueuedAlert>> {
     Ok(out)
 }
 
+/// Read the most recent `limit` queued alerts from `path`, oldest first.
+///
+/// The queue is append-only with no retention (see issue #11), so it grows
+/// without bound while every consumer only ever wants the tail. [`list_at`]
+/// parses every line to return the last hundred; this parses only the lines it
+/// returns. That matters because the desktop feed drawer polls this path every
+/// 5 seconds while open.
+///
+/// Splitting lines still walks the whole file — the win is skipping N JSON
+/// parses, which dominate. A malformed line inside the returned window is
+/// still a hard error, same as `list_at`: silently dropping entries from a
+/// trading audit trail is worse than failing loudly. Lines *outside* the
+/// window are never parsed, so an old corrupt entry can no longer break a
+/// reader that does not care about it.
+pub fn list_tail_at(path: impl AsRef<Path>, limit: usize) -> Result<Vec<QueuedAlert>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    if limit == 0 {
+        return Ok(vec![]);
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading alert queue at {}", path.display()))?;
+
+    // Collect as (1-based line number, text) so an error still names the real
+    // line in the file, not an offset into the returned window.
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    for (i, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        lines.push((i + 1, line));
+    }
+    let start = lines.len().saturating_sub(limit);
+
+    let mut out = Vec::with_capacity(lines.len() - start);
+    for (lineno, line) in &lines[start..] {
+        let entry: QueuedAlert = serde_json::from_str(line)
+            .with_context(|| format!("alert-queue line {lineno} is not valid JSON"))?;
+        out.push(entry);
+    }
+    Ok(out)
+}
+
 /// Fetch a single queued alert by its queue-entry id from `path`.
 pub fn get_at(path: impl AsRef<Path>, id: &str) -> Result<Option<QueuedAlert>> {
     Ok(list_at(path)?.into_iter().find(|e| e.id == id))
@@ -352,6 +398,107 @@ mod tests {
     }
 
     // AC3 gate: only strategy-signal alerts expose a promotable proposal.
+    // ── list_tail_at (issue #11: bound the read, not just the file) ───────
+
+    fn level_alert(ts: &str, price: &str) -> QueuedAlert {
+        QueuedAlert::price_level(
+            ts.to_string(),
+            "EUR_USD".to_string(),
+            "1.0900".to_string(),
+            Direction::CrossUp,
+            price.to_string(),
+        )
+    }
+
+    #[test]
+    fn tail_returns_the_last_n_oldest_first() {
+        let path = temp_queue();
+        for i in 0..10 {
+            append_at(&path, &level_alert(&format!("2026-06-30T00:00:{i:02}Z"), "1.09")).unwrap();
+        }
+
+        let tail = list_tail_at(&path, 3).unwrap();
+
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0].ts, "2026-06-30T00:00:07Z");
+        assert_eq!(tail[2].ts, "2026-06-30T00:00:09Z");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn tail_returns_everything_when_the_queue_is_shorter_than_the_limit() {
+        let path = temp_queue();
+        append_at(&path, &level_alert("2026-06-30T00:00:00Z", "1.09")).unwrap();
+
+        assert_eq!(list_tail_at(&path, 100).unwrap().len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn tail_of_a_missing_queue_is_empty() {
+        assert!(list_tail_at(temp_queue(), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tail_with_a_zero_limit_is_empty() {
+        let path = temp_queue();
+        append_at(&path, &level_alert("2026-06-30T00:00:00Z", "1.09")).unwrap();
+
+        assert!(list_tail_at(&path, 0).unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn tail_agrees_with_list_at() {
+        // The tail must be a suffix of the full read — a faster path that
+        // returned different entries would be worse than a slow one.
+        let path = temp_queue();
+        for i in 0..5 {
+            append_at(&path, &level_alert(&format!("2026-06-30T00:00:{i:02}Z"), "1.09")).unwrap();
+        }
+
+        let full = list_at(&path).unwrap();
+        let tail = list_tail_at(&path, 2).unwrap();
+
+        assert_eq!(tail, full[full.len() - 2..].to_vec());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn tail_ignores_corruption_outside_the_window() {
+        // A malformed old line must not break a reader that only wants recent
+        // entries — the whole point of not parsing the history every poll.
+        let path = temp_queue();
+        std::fs::write(&path, "{ not json at all\n").unwrap();
+        append_at(&path, &level_alert("2026-06-30T00:00:01Z", "1.09")).unwrap();
+        append_at(&path, &level_alert("2026-06-30T00:00:02Z", "1.09")).unwrap();
+
+        let tail = list_tail_at(&path, 2).unwrap();
+
+        assert_eq!(tail.len(), 2);
+        // The full read still fails on it — corruption is not being hidden.
+        assert!(list_at(&path).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn tail_still_fails_on_corruption_inside_the_window() {
+        // Silently dropping entries from a trading audit trail would be worse
+        // than failing loudly.
+        let path = temp_queue();
+        append_at(&path, &level_alert("2026-06-30T00:00:01Z", "1.09")).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}{{ broken\n", std::fs::read_to_string(&path).unwrap()),
+        )
+        .unwrap();
+
+        let err = list_tail_at(&path, 5).unwrap_err();
+
+        assert!(format!("{err:#}").contains("line 2"), "should name the line: {err:#}");
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn only_strategy_signal_is_promotable() {
         let strat = QueuedAlert::strategy_signal(

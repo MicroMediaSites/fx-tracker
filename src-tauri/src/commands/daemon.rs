@@ -62,9 +62,13 @@ pub async fn daemon_status() -> Result<DaemonStatus, String> {
 #[tauri::command]
 pub async fn daemon_queue_list(limit: Option<usize>) -> Result<Vec<QueuedAlert>, String> {
     let path = alert_queue::queue_path().map_err(|e| e.to_string())?;
-    let mut entries = alert_queue::list_at(path).map_err(|e| e.to_string())?;
-    entries.reverse(); // list_at is oldest-first (tail order); UI wants newest first
-    entries.truncate(limit.unwrap_or(100));
+    let limit = limit.unwrap_or(100);
+    // Tail rather than read-all: the queue is append-only with no retention
+    // (issue #11) and the feed drawer polls this every 5s while open, so
+    // parsing the entire history to return the last hundred is work that grows
+    // forever against a fixed-size answer.
+    let mut entries = alert_queue::list_tail_at(path, limit).map_err(|e| e.to_string())?;
+    entries.reverse(); // tail is oldest-first; the UI wants newest first
     Ok(entries)
 }
 
