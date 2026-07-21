@@ -27,7 +27,6 @@ import {
 } from './lib/localStore';
 import { LocalBacktestsSection } from './components/local/LocalBacktestsSection';
 import { UpdateModal } from './components/ui/UpdateModal';
-import { SignalsSection } from './components/watcher/SignalFeed';
 import { EconomicCalendarSection } from './components/local/EconomicCalendarSection';
 import { AccountsSection } from './components/local/AccountsSection';
 import { useSettingsStore } from './stores/settingsStore';
@@ -294,12 +293,6 @@ export const LocalApp = () => {
             the offline-boot specs stay green. */}
         <div className="mt-6">
           <AccountsSection />
-        </div>
-
-        {/* Fired-signal history from the wickd daemon. Informational — the
-            Live Monitor stays reserved for actionable state. */}
-        <div className="mt-6">
-          <SignalsSection />
         </div>
 
         {/* Upcoming economic releases from ~/.wickd/calendar (read-only,

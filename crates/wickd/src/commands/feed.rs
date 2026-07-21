@@ -378,6 +378,46 @@ struct FeedContext {
     already_reported: Vec<FeedItem>,
 }
 
+/// Render the alert queue as a prompt section, or `""` when there is nothing
+/// to report. Shared by `tick` (so the summary knows what fired) and `ask` (so
+/// a follow-up question like "what fired today?" can be answered at all —
+/// without this, `ask` only ever saw what a tick chose to summarize).
+///
+/// Historical record only. Deliberately compact — a queue entry embeds the
+/// full proposal it fired with, whose `status` field is frozen at fire time;
+/// rendering that JSON verbatim once tricked the model into reporting
+/// long-dead fires as decisions awaiting action. The heading carries that
+/// framing explicitly, which is why both callers share this function rather
+/// than each phrasing it themselves. Pure and unit-tested.
+fn render_signal_fires(alerts: &[wickd_core::alert_queue::QueuedAlert]) -> String {
+    if alerts.is_empty() {
+        return String::new();
+    }
+    let mut msg = String::from(
+        "\n## RECENT SIGNAL FIRES (historical log — already handled by their watchers, NOT awaiting anyone)\n```data\n",
+    );
+    for a in alerts {
+        let line = match &a.payload {
+            QueuedPayload::StrategySignal { instrument, signal, granularity, proposal, .. } => {
+                format!(
+                    "fired @ {}: {} {} ({}{})\n",
+                    a.ts,
+                    instrument,
+                    signal.as_str(),
+                    proposal.strategy,
+                    granularity.as_deref().map(|g| format!(", {g}")).unwrap_or_default()
+                )
+            }
+            QueuedPayload::PriceLevel { instrument, level, price, .. } => {
+                format!("fired @ {}: {} crossed {} @ {}\n", a.ts, instrument, level, price)
+            }
+        };
+        msg.push_str(&neutralize_untrusted(&line));
+    }
+    msg.push_str("```\n");
+    msg
+}
+
 async fn assemble_context(args: &TickArgs, feed_path: &PathBuf) -> Result<FeedContext> {
     let pairs = resolve_pairs()?;
 
@@ -603,34 +643,7 @@ fn user_message(ctx: &FeedContext) -> String {
         msg.push_str("```\n");
     }
 
-    if !ctx.recent_alerts.is_empty() {
-        // Historical record only. Deliberately compact — a queue entry embeds
-        // the full proposal it fired with, whose `status` field is frozen at
-        // fire time; rendering that JSON verbatim once tricked the model into
-        // reporting long-dead fires as decisions awaiting action.
-        msg.push_str(
-            "\n## RECENT SIGNAL FIRES (historical log — already handled by their watchers, NOT awaiting anyone)\n```data\n",
-        );
-        for a in &ctx.recent_alerts {
-            let line = match &a.payload {
-                QueuedPayload::StrategySignal { instrument, signal, granularity, proposal, .. } => {
-                    format!(
-                        "fired @ {}: {} {} ({}{})\n",
-                        a.ts,
-                        instrument,
-                        signal.as_str(),
-                        proposal.strategy,
-                        granularity.as_deref().map(|g| format!(", {g}")).unwrap_or_default()
-                    )
-                }
-                QueuedPayload::PriceLevel { instrument, level, price, .. } => {
-                    format!("fired @ {}: {} crossed {} @ {}\n", a.ts, instrument, level, price)
-                }
-            };
-            msg.push_str(&neutralize_untrusted(&line));
-        }
-        msg.push_str("```\n");
-    }
+    msg.push_str(&render_signal_fires(&ctx.recent_alerts));
 
     if !ctx.price_action.is_empty() {
         msg.push_str("\n## RECENT PRICE ACTION\n```data\n");
@@ -689,6 +702,18 @@ async fn ask(args: AskArgs, out: Out) -> ! {
     items.reverse();
     items.truncate(PROMPT_HISTORY_ITEMS);
     let watchers = running_watchers();
+    // The fired-signal log. `ask` used to see only the feed, so "what fired
+    // today?" was unanswerable unless a tick happened to summarize it — the
+    // raw fires are the log the trader actually wants to query. Best-effort:
+    // an unreadable queue must not fail the question.
+    let recent_alerts = alert_queue::queue_path()
+        .and_then(alert_queue::list_at)
+        .map(|mut v| {
+            v.reverse();
+            v.truncate(PROMPT_HISTORY_ITEMS);
+            v
+        })
+        .unwrap_or_default();
 
     let history = match load_ask_history(args.history.as_deref()) {
         Ok(h) => h,
@@ -718,6 +743,7 @@ Answer plainly in a few short sentences of plain text (no JSON, no markdown head
         }
         user.push_str("```\n");
     }
+    user.push_str(&render_signal_fires(&recent_alerts));
     if !watchers.is_empty() {
         user.push_str("\n## RUNNING WATCHERS\n```data\n");
         for w in &watchers {
@@ -1004,6 +1030,49 @@ mod tests {
 
     fn model_json(items: &str) -> String {
         format!(r#"{{"items": {items}}}"#)
+    }
+
+    // ── shared signal-fire rendering (tick + ask) ──────────────────────────
+
+    fn price_level_alert(instrument: &str, level: &str, price: &str) -> QueuedAlert {
+        QueuedAlert {
+            id: "a1".into(),
+            ts: "2026-07-20T12:00:00Z".into(),
+            payload: QueuedPayload::PriceLevel {
+                instrument: instrument.into(),
+                level: level.into(),
+                direction: wickd_core::alert_queue::Direction::CrossUp,
+                price: price.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn signal_fires_render_empty_when_queue_is_empty() {
+        // Empty string, not a heading with nothing under it — an empty section
+        // reads to the model as "no fires happened", which is a claim.
+        assert_eq!(render_signal_fires(&[]), "");
+    }
+
+    #[test]
+    fn signal_fires_carry_the_historical_framing() {
+        let out = render_signal_fires(&[price_level_alert("EUR_USD", "1.0850", "1.0852")]);
+
+        // The framing is load-bearing: without it the model has previously
+        // reported long-dead fires as decisions awaiting action.
+        assert!(out.contains("historical log"), "missing historical framing: {out}");
+        assert!(out.contains("NOT awaiting anyone"), "missing not-pending framing: {out}");
+        assert!(out.contains("EUR_USD crossed 1.0850 @ 1.0852"), "missing the fire: {out}");
+    }
+
+    #[test]
+    fn signal_fires_are_fenced_as_untrusted_data() {
+        let out = render_signal_fires(&[price_level_alert("EUR_USD", "1.0850", "1.0852")]);
+
+        // Queue contents are untrusted input to the prompt — they must land
+        // inside the data fence, same as every other assembled section.
+        assert!(out.contains("```data"), "queue lines must be fenced: {out}");
+        assert!(out.trim_end().ends_with("```"), "fence must close: {out}");
     }
 
     fn sample_context() -> FeedContext {

@@ -71,6 +71,52 @@ test.describe('Feed overlay drawer', () => {
     await expect(rows.nth(1)).toContainText('EUR_USD');
   });
 
+  test('interleaves fired signals with feed items chronologically', async ({ appPage }) => {
+    // The drawer is now the ONLY home for fired signals — they are a log, not
+    // a panel. Both stores are read separately and merged here at render time.
+    const SIGNALS = [
+      {
+        id: 'queue-0001',
+        ts: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+        payload: {
+          kind: 'strategy-signal',
+          instrument: 'EUR_USD',
+          signal: 'buy',
+          granularity: 'M1',
+          account: 'tf-m1',
+          proposal: { strategy: 'rahagod', reason: 'kijun cross' },
+        },
+      },
+      {
+        id: 'queue-0002',
+        ts: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+        payload: {
+          kind: 'price-level',
+          instrument: 'GBP_USD',
+          level: '1.2700',
+          direction: 'cross-up',
+          price: '1.2703',
+        },
+      },
+    ];
+    await appPage.mockTauriCommand('feed_list', FEED_ITEMS);
+    await appPage.mockTauriCommand('daemon_queue_list', SIGNALS);
+    await appPage.goto('watcher');
+
+    await openDrawer(appPage);
+
+    const signalRows = appPage.page.getByTestId('feed-signal-row');
+    await expect(signalRows).toHaveCount(2);
+    await expect(signalRows.first()).toContainText('EUR_USD');
+    await expect(signalRows.first()).toContainText('buy');
+    await expect(signalRows.first()).toContainText('rahagod');
+    await expect(signalRows.first()).toContainText('tf-m1');
+    await expect(signalRows.nth(1)).toContainText('cross-up 1.2700 @ 1.2703');
+
+    // Feed items still render alongside them.
+    await expect(appPage.page.getByTestId('feed-item-row')).toHaveCount(2);
+  });
+
   test('shows the empty state when the producer has not written yet', async ({ appPage }) => {
     await appPage.goto('watcher');
 
