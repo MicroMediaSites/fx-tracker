@@ -125,7 +125,7 @@ pub async fn accounts_glance(
         }
     }
 
-    let wickd = find_wickd_binary().ok_or_else(|| {
+    let wickd = find_wickd_binary()?.ok_or_else(|| {
         "wickd CLI not found — install it (cargo install) to see account performance".to_string()
     })?;
 

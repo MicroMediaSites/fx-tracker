@@ -44,8 +44,9 @@ pub async fn feed_ask(question: String, history: Option<Vec<AskTurn>>) -> Result
     if question.chars().count() > 2000 {
         return Err("question is too long (2000 chars max)".to_string());
     }
-    let wickd = find_wickd_binary()
-        .ok_or_else(|| "wickd CLI not found — install it (cargo install) to use the feed".to_string())?;
+    let wickd = find_wickd_binary()?.ok_or_else(|| {
+        "wickd CLI not found — install it (cargo install) to use the feed".to_string()
+    })?;
 
     // Thread the prior transcript through the CLI's `--history -` stdin path
     // (avoids argv length limits). Only user/assistant turns are relayed; the
