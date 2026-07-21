@@ -50,7 +50,7 @@ describe('orderedAccounts', () => {
     expect(ordered[0].account).toBe('holding');
   });
 
-  it('keeps errored accounts at the top, not buried with the idle ones', () => {
+  it('does not bury an errored account among the idle ones', () => {
     // A broken account is something to look at; ranking it idle would hide it.
     const ordered = orderedAccounts([
       account({ account: 'idle' }),
@@ -58,6 +58,18 @@ describe('orderedAccounts', () => {
     ]);
 
     expect(ordered[0].account).toBe('broken');
+  });
+
+  it('ranks errored and active together, preserving their input order', () => {
+    // Both are "not idle" and share rank 0 — errored rows are NOT promoted
+    // above accounts that traded, they simply are not demoted. Pinned because
+    // the name of the test above could be read as claiming more than that.
+    const ordered = orderedAccounts([
+      account({ account: 'active', trades: 3 }),
+      account({ account: 'broken', error: '401 Unauthorized' }),
+    ]);
+
+    expect(ordered.map((a) => a.account)).toEqual(['active', 'broken']);
   });
 
   it('preserves the relative order within each group', () => {
