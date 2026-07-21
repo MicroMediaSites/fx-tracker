@@ -20,7 +20,11 @@ import { useState } from 'react';
 import { CollapsibleSection } from '../ui/CollapsibleSection';
 import { AccountGlance, useAccountsGlance } from '../../hooks/useAccountsGlance';
 
-const WINDOW_STORAGE_KEY = 'candlesight_accounts_window_days';
+// `wickd_` prefix, not the retired `candlesight_` brand — the surrounding
+// CollapsibleSection keys are pre-rename and stay as they are (renaming them
+// would silently drop everyone's saved collapse state); new keys use the
+// current name.
+const WINDOW_STORAGE_KEY = 'wickd_accounts_window_days';
 
 const WINDOWS: { days: number; label: string }[] = [
   { days: 1, label: '24h' },

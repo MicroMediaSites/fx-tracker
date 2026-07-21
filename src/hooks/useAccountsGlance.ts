@@ -78,6 +78,11 @@ export const useAccountsGlance = (days: number): UseAccountsGlance => {
   );
 
   useEffect(() => {
+    // Deliberate: changing the window discards the previous result rather than
+    // holding it on screen while the new one loads. Keeping it would render the
+    // 7d numbers underneath a "30d" label — briefly, but wrongly. A momentary
+    // "Loading accounts…" is the honest render, and the backend caches per
+    // (env, days), so switching back is instant inside the TTL.
     hasData.current = false;
     void load(false);
     const interval = setInterval(() => void load(false), REFRESH_INTERVAL_MS);
