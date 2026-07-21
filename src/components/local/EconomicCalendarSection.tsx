@@ -305,7 +305,8 @@ export const EconomicCalendarSection = () => {
   return (
     <CollapsibleSection
       id="home_economic_calendar"
-      title="Economic Calendar"
+      title="All releases"
+      defaultCollapsed
       badge={
         nextHigh ? (
           <span data-testid="calendar-next-high" className="text-xs text-[var(--color-text-muted)]">
