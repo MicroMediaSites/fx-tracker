@@ -79,12 +79,24 @@ describe('useCalendarEvents', () => {
   });
 
   it('keeps the last good snapshot when a later refresh fails', async () => {
-    const { result } = renderHook(() => useCalendarEvents());
-    await waitFor(() => expect(result.current).toEqual(EVENTS));
+    // Must actually drive the refresh — asserting the value before the
+    // re-fetch would pass no matter what the failure path did.
+    vi.useFakeTimers();
+    try {
+      const { result } = renderHook(() => useCalendarEvents());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(result.current).toEqual(EVENTS);
 
-    // A transient failure must not blank a populated dashboard.
-    invokeMock.mockRejectedValue(new Error('transient'));
-    expect(result.current).toEqual(EVENTS);
+      invokeMock.mockRejectedValue(new Error('transient'));
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+
+      // The refresh really ran, and really failed…
+      expect(invokeMock).toHaveBeenCalledTimes(2);
+      // …and a transient failure did not blank a populated dashboard.
+      expect(result.current).toEqual(EVENTS);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('polls while mounted and stops once the last consumer unmounts', async () => {
