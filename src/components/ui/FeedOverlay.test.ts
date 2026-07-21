@@ -8,7 +8,14 @@
  */
 import { describe, expect, it } from 'vitest';
 import { mergeTimeline, type FeedItem } from './FeedOverlay';
-import type { QueuedAlert } from '../../hooks/useWatchDaemon';
+import type { PendingSignal, QueuedAlert } from '../../hooks/useWatchDaemon';
+
+/**
+ * mergeTimeline only reads `id`/`ts`, so the embedded proposal is filled in
+ * just enough to satisfy the type — these tests are about ordering, not about
+ * the proposal's contents.
+ */
+const stubProposal = { strategy: 'rahagod' } as unknown as PendingSignal;
 
 const feedItem = (id: string, ts: string): FeedItem => ({
   id,
@@ -30,9 +37,7 @@ const signal = (id: string, ts: string): QueuedAlert => ({
     signal: 'buy',
     granularity: 'M1',
     account: 'tf-m1',
-    proposal: { strategy: 'rahagod' } as QueuedAlert['payload'] extends { proposal: infer P }
-      ? P
-      : never,
+    proposal: stubProposal,
   },
 });
 
