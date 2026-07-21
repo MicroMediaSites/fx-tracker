@@ -297,6 +297,17 @@ export function getTauriBridgeScript() {
       // appPage.mockTauriCommand('feed_list', [...]) / ('feed_ask', '...').
       'feed_list': [],
       'feed_ask': 'mocked answer',
+      // Multi-account glance (AccountsSection). Empty by default so the
+      // offline-boot specs see the "no accounts configured" state rather than
+      // a shell-out; seed per-test via
+      // appPage.mockTauriCommand('accounts_glance', { ...accounts: [...] }).
+      'accounts_glance': {
+        environment: 'practice',
+        days: 7,
+        since: '2026-07-13T00:00:00Z',
+        generated_at: '2026-07-20T00:00:00Z',
+        accounts: [],
+      },
       'daemon_queue_list': (args) => {
         const queue = [...(window.__E2E_DAEMON_QUEUE__ ?? [])].reverse();
         return queue.slice(0, args?.limit ?? 100);

@@ -2,6 +2,7 @@
 //!
 //! This module extracts command handlers from main.rs for better organization.
 
+pub mod accounts;
 pub mod backtest;
 pub mod chat;
 pub mod credentials;

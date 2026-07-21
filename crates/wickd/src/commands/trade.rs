@@ -66,7 +66,7 @@ use crate::commands::client;
 use crate::output::{exit, Out};
 use crate::prompt;
 use crate::risk;
-use crate::vault_store::env_str;
+use crate::vault_store::{self, env_str, DEFAULT_ACCOUNT};
 
 #[derive(Args, Debug)]
 pub struct TradeArgs {
@@ -97,6 +97,9 @@ enum TradeCmd {
     /// Account performance since its recorded baseline: realized/unrealized P&L,
     /// NAV vs baseline, and the closed-trade list from OANDA (AGT-631).
     Report(ReportArgs),
+    /// One-line performance summary for EVERY configured account in --env over
+    /// a rolling recent window. Ignores --account (it spans all of them).
+    Glance(GlanceArgs),
     /// Record or inspect an account's performance baseline (AGT-631).
     Baseline(BaselineArgs),
 }
@@ -107,6 +110,18 @@ struct ReportArgs {
     /// ones closed since the baseline. Default 500 — comfortably covers a
     /// quarter's paper trades. Raise it if the report window predates them.
     #[arg(long, default_value_t = 500)]
+    limit: u32,
+}
+
+#[derive(Args, Debug)]
+struct GlanceArgs {
+    /// Rolling window, in days back from now, that realized P&L is summed over.
+    #[arg(long, default_value_t = 7)]
+    days: u32,
+    /// How many recent closed trades to pull per account before filtering to
+    /// the window. Default 200 — the glance is a summary, not an audit; raise
+    /// it for a high-frequency account whose window truncates.
+    #[arg(long, default_value_t = 200)]
     limit: u32,
 }
 
@@ -437,6 +452,7 @@ async fn dispatch(args: TradeArgs, _out: Out) -> Result<serde_json::Value> {
         TradeCmd::Place(p) => place(env, &args.account, p).await,
         TradeCmd::Close(c) => close(env, &args.account, c).await,
         TradeCmd::Report(r) => report(env, &args.env, &args.account, r).await,
+        TradeCmd::Glance(g) => glance(env, &args.env, g).await,
         TradeCmd::Baseline(b) => baseline_cmd(env, &args.env, &args.account, b).await,
     }
 }
@@ -1396,6 +1412,186 @@ async fn report(
     Ok(build_report(account, &base, &snap, &closed))
 }
 
+/// Group every configured account name in `env_cfg` by the OANDA account id it
+/// resolves to, so accounts aliased to the same broker account are fetched once
+/// and rendered as one row. (Matt's practice config has `default` and `tf-m30`
+/// both pointing at `…-005`.)
+///
+/// The group's *primary* name is the first non-`default` name if there is one —
+/// `tf-m30` says more about what the account is doing than `default` does. Names
+/// that fail to resolve are skipped here and reported as errors by the caller.
+/// Pure (no keychain, no network) and unit-tested.
+fn group_accounts_by_id(
+    env: OandaEnvironment,
+    env_cfg: &vault_store::EnvConfig,
+) -> Vec<(String, Vec<String>)> {
+    let mut by_id: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for name in env_cfg.account_names() {
+        if let Ok(id) = env_cfg.account_id_for(env, &name) {
+            by_id.entry(id).or_default().push(name);
+        }
+    }
+    let mut groups: Vec<(String, Vec<String>)> = by_id
+        .into_values()
+        .map(|mut names| {
+            // Primary first, the rest in stable order behind it.
+            if let Some(pos) = names.iter().position(|n| n != DEFAULT_ACCOUNT) {
+                names.swap(0, pos);
+                names[1..].sort();
+            }
+            (names[0].clone(), names)
+        })
+        .collect();
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    groups
+}
+
+/// Build one account's glance row from its OANDA snapshot and the trades closed
+/// inside the window. Pure (no network) so the realized sum, win/loss tally, and
+/// win rate are unit-tested directly.
+///
+/// Scratch trades (exactly zero realized P&L) count toward `trades` but are
+/// excluded from the win-rate denominator — a break-even fill is neither a win
+/// nor a loss, and folding it into either skews a low-count window.
+fn build_glance_row(
+    primary: &str,
+    names: &[String],
+    account_id: &str,
+    snap: &AccountSnapshot,
+    closed: &[Trade],
+) -> serde_json::Value {
+    let realized: Decimal = closed.iter().map(|t| t.realized_pl).sum();
+    let wins = closed.iter().filter(|t| t.realized_pl > Decimal::ZERO).count();
+    let losses = closed.iter().filter(|t| t.realized_pl < Decimal::ZERO).count();
+    let decided = wins + losses;
+
+    serde_json::json!({
+        "account": primary,
+        "names": names,
+        "account_id": account_id,
+        "currency": snap.currency,
+        "nav": dec_str(snap.nav),
+        "balance": dec_str(snap.balance),
+        "unrealized_pl": dec_str(snap.unrealized_pl),
+        "open_trade_count": snap.open_trade_count,
+        "realized": dec_str(realized),
+        "trades": closed.len(),
+        "wins": wins,
+        "losses": losses,
+        // Null (not 0) when nothing decided in the window — the UI must render
+        // "—", not a misleading 0%.
+        "win_rate": if decided > 0 {
+            serde_json::json!((wins as f64 / decided as f64 * 1000.0).round() / 1000.0)
+        } else {
+            serde_json::Value::Null
+        },
+        "error": serde_json::Value::Null,
+    })
+}
+
+/// `wickd trade glance [--days N]`: a one-line performance summary for every
+/// account configured in `--env`, over a rolling window ending now.
+///
+/// Deliberately different from `report`: no baseline is required (the window is
+/// fixed and recent, not since-inception), and it spans all accounts rather than
+/// one. That makes it the cheap "how is the whole ladder doing" surface the
+/// desktop dashboard polls.
+///
+/// A per-account failure (revoked key, OANDA 5xx) is captured *into that row's
+/// `error` field* rather than failing the command — one bad account must not
+/// blank the whole panel.
+async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<serde_json::Value> {
+    let cfg = vault_store::load()?;
+    let env_cfg = match env {
+        OandaEnvironment::Practice => cfg.practice,
+        OandaEnvironment::Live => cfg.live,
+    }
+    .unwrap_or_default();
+
+    let groups = group_accounts_by_id(env, &env_cfg);
+    if groups.is_empty() {
+        bail!(
+            "no {env} credentials stored — run `wickd login --env {env}`",
+            env = env_str(env)
+        );
+    }
+
+    let now = Utc::now();
+    let since = now - chrono::Duration::days(g.days as i64);
+
+    // Resolve credentials up front and serially: keychain reads are local and
+    // fast, and keeping them off the worker threads avoids concurrent access to
+    // the same keychain item. Only the network fetches fan out.
+    let mut resolved = Vec::new();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for (primary, names) in groups {
+        match client::resolve(env_raw, &primary) {
+            Ok((_, oanda)) => resolved.push((primary, names, oanda)),
+            Err(e) => rows.push(serde_json::json!({
+                "account": primary,
+                "names": names,
+                "error": e.to_string(),
+            })),
+        }
+    }
+
+    let limit = g.limit;
+    let mut set = tokio::task::JoinSet::new();
+    for (primary, names, oanda) in resolved {
+        set.spawn(async move {
+            let account_id = oanda.account_id().to_string();
+            // The two fetches are independent — run them concurrently so an
+            // account costs one round trip of latency, not two. With the
+            // per-account fan-out above, the whole glance is ~one round trip.
+            let fetched = async {
+                let (acct, closed) = tokio::join!(
+                    endpoints::get_account(&oanda),
+                    endpoints::get_trade_history(&oanda, Some(limit), None),
+                );
+                Ok::<_, anyhow::Error>((
+                    acct.context("OANDA account fetch failed")?,
+                    closed.context("OANDA closed-trade history fetch failed")?,
+                ))
+            }
+            .await;
+
+            match fetched {
+                Ok((acct, closed)) => {
+                    let snap = AccountSnapshot::from_oanda(&acct);
+                    let closed = closed_since(closed, since);
+                    build_glance_row(&primary, &names, &account_id, &snap, &closed)
+                }
+                Err(e) => serde_json::json!({
+                    "account": primary,
+                    "names": names,
+                    "account_id": account_id,
+                    "error": format!("{e:#}"),
+                }),
+            }
+        });
+    }
+    while let Some(res) = set.join_next().await {
+        rows.push(res.context("account fetch task panicked")?);
+    }
+
+    // Stable ordering regardless of which fetch finished first.
+    rows.sort_by(|a, b| {
+        a.get("account")
+            .and_then(|v| v.as_str())
+            .cmp(&b.get("account").and_then(|v| v.as_str()))
+    });
+
+    Ok(serde_json::json!({
+        "environment": env_str(env),
+        "days": g.days,
+        "since": since.to_rfc3339(),
+        "generated_at": now.to_rfc3339(),
+        "count": rows.len(),
+        "accounts": rows,
+    }))
+}
+
 /// `wickd trade baseline …` (AGT-631, AC1): record or inspect an account's
 /// performance baseline.
 async fn baseline_cmd(
@@ -1506,6 +1702,103 @@ mod tests {
             close_price: Some(dec!(1.0)),
             strategy: strategy.map(|s| s.to_string()),
         }
+    }
+
+    // ── trade glance (multi-account rolling window) ────────────────────────
+
+    fn snap_10k() -> AccountSnapshot {
+        AccountSnapshot {
+            balance: dec!(10000),
+            nav: dec!(10012),
+            unrealized_pl: dec!(12),
+            currency: "USD".into(),
+            open_trade_count: 1,
+        }
+    }
+
+    fn env_cfg(default_id: Option<&str>, named: &[(&str, &str)]) -> vault_store::EnvConfig {
+        vault_store::EnvConfig {
+            account_id: default_id.map(|s| s.to_string()),
+            accounts: named
+                .iter()
+                .map(|(n, id)| {
+                    (
+                        n.to_string(),
+                        vault_store::AccountConfig { account_id: id.to_string() },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn glance_row_sums_realized_and_tallies_wins() {
+        let closed = vec![
+            closed_trade("1", "EUR_USD", dec!(100), dec!(40), "2026-07-19T00:00:00Z", None),
+            closed_trade("2", "EUR_USD", dec!(100), dec!(-10), "2026-07-18T00:00:00Z", None),
+            closed_trade("3", "GBP_USD", dec!(100), dec!(17.2), "2026-07-17T00:00:00Z", None),
+        ];
+        let row = build_glance_row("h004", &["h004".into()], "101-1", &snap_10k(), &closed);
+
+        assert_eq!(row["realized"], "47.2");
+        assert_eq!(row["trades"], 3);
+        assert_eq!(row["wins"], 2);
+        assert_eq!(row["losses"], 1);
+        assert_eq!(row["win_rate"], 0.667);
+        assert_eq!(row["nav"], "10012");
+        assert_eq!(row["unrealized_pl"], "12");
+        assert!(row["error"].is_null());
+    }
+
+    #[test]
+    fn glance_row_scratch_trades_are_neither_win_nor_loss() {
+        let closed = vec![
+            closed_trade("1", "EUR_USD", dec!(100), dec!(5), "2026-07-19T00:00:00Z", None),
+            closed_trade("2", "EUR_USD", dec!(100), dec!(0), "2026-07-18T00:00:00Z", None),
+        ];
+        let row = build_glance_row("h004", &["h004".into()], "101-1", &snap_10k(), &closed);
+
+        // Counted as a trade, excluded from the win-rate denominator: 1/1, not 1/2.
+        assert_eq!(row["trades"], 2);
+        assert_eq!(row["wins"], 1);
+        assert_eq!(row["losses"], 0);
+        assert_eq!(row["win_rate"], 1.0);
+    }
+
+    #[test]
+    fn glance_row_empty_window_has_null_win_rate() {
+        let row = build_glance_row("tf-h1", &["tf-h1".into()], "101-6", &snap_10k(), &[]);
+
+        assert_eq!(row["trades"], 0);
+        assert_eq!(row["realized"], "0");
+        // Null, never 0 — the UI must render "—" for "nothing decided yet".
+        assert!(row["win_rate"].is_null());
+    }
+
+    #[test]
+    fn glance_groups_aliases_of_the_same_oanda_account() {
+        // Matt's real practice shape: `default` (v1 slot) and `tf-m30` both
+        // resolve to …-005, so they are one broker account under two names.
+        let cfg = env_cfg(
+            Some("101-005"),
+            &[("tf-m30", "101-005"), ("h004", "101-001")],
+        );
+        let groups = group_accounts_by_id(OandaEnvironment::Practice, &cfg);
+
+        assert_eq!(groups.len(), 2, "…-005 must be fetched once, not twice");
+        let m30 = groups.iter().find(|(p, _)| p == "tf-m30").expect("tf-m30 group");
+        // The informative name wins the row label over the generic `default`.
+        assert_eq!(m30.1, vec!["tf-m30".to_string(), "default".to_string()]);
+        assert!(groups.iter().any(|(p, names)| p == "h004" && names == &["h004".to_string()]));
+    }
+
+    #[test]
+    fn glance_groups_keep_default_when_it_is_the_only_name() {
+        let cfg = env_cfg(Some("101-005"), &[]);
+        let groups = group_accounts_by_id(OandaEnvironment::Practice, &cfg);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "default");
     }
 
     fn baseline_10k() -> baseline::Baseline {

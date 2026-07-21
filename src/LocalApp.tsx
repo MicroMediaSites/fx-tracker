@@ -29,6 +29,7 @@ import { LocalBacktestsSection } from './components/local/LocalBacktestsSection'
 import { UpdateModal } from './components/ui/UpdateModal';
 import { SignalsSection } from './components/watcher/SignalFeed';
 import { EconomicCalendarSection } from './components/local/EconomicCalendarSection';
+import { AccountsSection } from './components/local/AccountsSection';
 import { useSettingsStore } from './stores/settingsStore';
 import { openBacktestWindow, openChartWindow, openWatcherWindow } from './utils/windows';
 
@@ -286,6 +287,14 @@ export const LocalApp = () => {
             <LocalBacktestsSection strategyId={selected.id} strategyName={selected.name} />
           ) : null;
         })()}
+
+        {/* Rolling-window performance for every account the CLI is logged into.
+            The one panel here that is NOT offline (it reaches OANDA via
+            `wickd trade glance`); it caches and degrades to an error line, so
+            the offline-boot specs stay green. */}
+        <div className="mt-6">
+          <AccountsSection />
+        </div>
 
         {/* Fired-signal history from the wickd daemon. Informational — the
             Live Monitor stays reserved for actionable state. */}
