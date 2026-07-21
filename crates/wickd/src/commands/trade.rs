@@ -118,6 +118,12 @@ struct GlanceArgs {
     /// Rolling window, in days back from now, that realized P&L is summed over.
     #[arg(long, default_value_t = 7)]
     days: u32,
+    /// Exact window start — an ISO date (YYYY-MM-DD) or RFC3339 instant.
+    /// Overrides --days. This exists because "today" is not a whole number of
+    /// days back: the desktop app passes its viewer's local midnight, which
+    /// the CLI cannot infer (it has no idea what timezone the reader is in).
+    #[arg(long)]
+    since: Option<String>,
     /// How many recent closed trades to pull per account before filtering to
     /// the window. Default 200 — the glance is a summary, not an audit; raise
     /// it for a high-frequency account whose window truncates.
@@ -1412,6 +1418,23 @@ async fn report(
     Ok(build_report(account, &base, &snap, &closed))
 }
 
+/// Resolve the glance window's start instant: an explicit `--since` if given,
+/// otherwise `days` back from `now`. Pure and unit-tested.
+///
+/// `--since` wins over `--days` rather than erroring on both, because `--days`
+/// carries a clap default and is therefore always "set" — there is no way to
+/// tell "the user asked for 7" from "nobody passed anything".
+fn glance_window(
+    now: DateTime<Utc>,
+    days: u32,
+    since: Option<&str>,
+) -> Result<DateTime<Utc>> {
+    match since {
+        Some(s) => parse_baseline_date(s).context("invalid --since"),
+        None => Ok(now - chrono::Duration::days(days as i64)),
+    }
+}
+
 /// Group every configured account name in `env_cfg` by the OANDA account id it
 /// resolves to, so accounts aliased to the same broker account are fetched once
 /// and rendered as one row. (Matt's practice config has `default` and `tf-m30`
@@ -1518,7 +1541,7 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
     }
 
     let now = Utc::now();
-    let since = now - chrono::Duration::days(g.days as i64);
+    let since = glance_window(now, g.days, g.since.as_deref())?;
 
     // Resolve credentials up front and serially: keychain reads are local and
     // fast, and keeping them off the worker threads avoids concurrent access to
@@ -1584,7 +1607,10 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
 
     Ok(serde_json::json!({
         "environment": env_str(env),
-        "days": g.days,
+        // Null when --since drove the window: reporting the unused --days
+        // default alongside an explicit instant would misdescribe the result.
+        // `since` below is always the authoritative window start.
+        "days": if g.since.is_some() { serde_json::Value::Null } else { g.days.into() },
         "since": since.to_rfc3339(),
         "generated_at": now.to_rfc3339(),
         "count": rows.len(),
@@ -1773,6 +1799,42 @@ mod tests {
         assert_eq!(row["realized"], "0");
         // Null, never 0 — the UI must render "—" for "nothing decided yet".
         assert!(row["win_rate"].is_null());
+    }
+
+    #[test]
+    fn glance_window_defaults_to_days_back_from_now() {
+        let now = dt("2026-07-20T15:00:00Z");
+        let since = glance_window(now, 7, None).unwrap();
+
+        assert_eq!(since, dt("2026-07-13T15:00:00Z"));
+    }
+
+    #[test]
+    fn glance_window_since_overrides_days() {
+        let now = dt("2026-07-20T15:00:00Z");
+        // The app's "Today" view: local midnight, which is NOT a whole number
+        // of days back from now and cannot be expressed with --days at all.
+        let since = glance_window(now, 7, Some("2026-07-20T06:00:00Z")).unwrap();
+
+        assert_eq!(since, dt("2026-07-20T06:00:00Z"));
+    }
+
+    #[test]
+    fn glance_window_accepts_a_bare_iso_date() {
+        let now = dt("2026-07-20T15:00:00Z");
+        let since = glance_window(now, 7, Some("2026-07-20")).unwrap();
+
+        assert_eq!(since, dt("2026-07-20T00:00:00Z"));
+    }
+
+    #[test]
+    fn glance_window_rejects_a_malformed_since() {
+        let now = dt("2026-07-20T15:00:00Z");
+        let err = glance_window(now, 7, Some("yesterday")).unwrap_err();
+
+        // Must not silently fall back to --days: a bad window would quietly
+        // report the wrong period's P&L as if it were the one asked for.
+        assert!(format!("{err:#}").contains("--since"), "unhelpful error: {err:#}");
     }
 
     #[test]

@@ -149,17 +149,47 @@ export const LocalApp = () => {
       className="min-h-screen bg-[var(--color-bg-page)] text-[var(--color-text-primary)] flex flex-col"
       data-testid="local-app"
     >
-      <header className="px-8 pt-8 pb-4 border-b border-white/10">
-        <h1 className="text-2xl font-bold tracking-tight">wickd</h1>
-        <p className="text-sm text-[var(--color-text-secondary)] mt-1" data-testid="local-store-path">
-          Local-first mode — no sign-in required. Store: {storePath || '…'}
-        </p>
+      {/* One compact line. The wordmark was a 2xl heading over a sentence of
+          boilerplate ("Local-first mode — no sign-in required") plus a store
+          path — roughly a third of the window spent on things nobody reads
+          after the first launch. The store path stays (the offline-boot spec
+          asserts it, and it is genuinely useful when something is wrong) but
+          as a title-attribute tail rather than a headline. */}
+      <header className="px-6 py-2 border-b border-white/10 flex items-baseline gap-3">
+        <h1 className="text-sm font-semibold tracking-tight">wickd</h1>
+        <span
+          className="text-xs text-[var(--color-text-faint)] truncate"
+          data-testid="local-store-path"
+          title={storePath || undefined}
+        >
+          {storePath || '…'}
+        </span>
       </header>
 
-      <main className="flex-1 px-8 py-6 max-w-3xl w-full mx-auto">
-        <section aria-labelledby="strategies-heading">
+      <main className="flex-1 px-6 py-4 max-w-4xl w-full mx-auto">
+        {/* Ordered by what the boot question actually is: "was today
+            profitable, and what news is coming". Accounts and the calendar
+            lead; strategy authoring is a task you go looking for, not a thing
+            you check, so it sits below them. */}
+
+        {/* The one panel here that is NOT offline (it reaches OANDA via
+            `wickd trade glance`); it caches and degrades to an error line, so
+            the offline-boot specs stay green. */}
+        <AccountsSection />
+
+        {/* Upcoming economic releases from ~/.wickd/calendar (read-only,
+            offline; the wickd CLI's launchd sync job owns freshness). */}
+        <div className="mt-4">
+          <EconomicCalendarSection />
+        </div>
+
+        <div className="mt-4">
+          <section aria-labelledby="strategies-heading">
           <div className="flex items-center justify-between mb-3 gap-3">
-            <h2 id="strategies-heading" className="text-lg font-semibold">
+            <h2
+              id="strategies-heading"
+              className="text-sm font-medium text-[var(--color-text-secondary)]"
+            >
               Strategies
             </h2>
             {strategies !== null && strategies.some((s) => s.source === 'candlesight') && (
@@ -278,35 +308,16 @@ export const LocalApp = () => {
             </ul>
           )}
 
-        </section>
+          </section>
 
-        {(() => {
-          const selected = strategies?.find((s) => s.id === selectedStrategyId);
-          return selected ? (
-            <LocalBacktestsSection strategyId={selected.id} strategyName={selected.name} />
-          ) : null;
-        })()}
-
-        {/* Rolling-window performance for every account the CLI is logged into.
-            The one panel here that is NOT offline (it reaches OANDA via
-            `wickd trade glance`); it caches and degrades to an error line, so
-            the offline-boot specs stay green. */}
-        <div className="mt-6">
-          <AccountsSection />
-        </div>
-
-        {/* Upcoming economic releases from ~/.wickd/calendar (read-only,
-            offline; the wickd CLI's launchd sync job owns freshness). */}
-        <div className="mt-6">
-          <EconomicCalendarSection />
+          {(() => {
+            const selected = strategies?.find((s) => s.id === selectedStrategyId);
+            return selected ? (
+              <LocalBacktestsSection strategyId={selected.id} strategyName={selected.name} />
+            ) : null;
+          })()}
         </div>
       </main>
-
-      <footer className="px-8 py-4 border-t border-white/10 flex items-center justify-between">
-        <span className="text-xs text-[var(--color-text-muted)]">
-          Everything above is served from the local store — works fully offline.
-        </span>
-      </footer>
 
       <UpdateModal
         isOpen={showUpdateModal}

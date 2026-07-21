@@ -74,7 +74,10 @@ pub struct AccountGlance {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountsGlance {
     pub environment: String,
-    pub days: u32,
+    /// Null when an explicit `since` drove the window (the app's "Today"),
+    /// since no whole-day count describes it.
+    #[serde(default)]
+    pub days: Option<u32>,
     /// Start of the window (RFC3339).
     pub since: String,
     /// When the CLI produced these numbers (RFC3339) — the UI shows this as the
@@ -84,8 +87,14 @@ pub struct AccountsGlance {
     pub accounts: Vec<AccountGlance>,
 }
 
+/// Cache identity: environment + the exact window requested. `since` is part of
+/// the key, not just `days` — the app's "Today" reuses one `since` value all
+/// day, so keying on days alone would serve a stale midnight boundary after
+/// the date rolls over.
+type CacheKey = (String, Option<u32>, Option<String>);
+
 struct Cached {
-    key: (String, u32),
+    key: CacheKey,
     value: AccountsGlance,
     fetched: Instant,
 }
@@ -100,19 +109,33 @@ fn cache() -> &'static Mutex<Option<Cached>> {
 /// Rolling-window performance for every account configured in `env`.
 ///
 /// `refresh: true` bypasses the TTL (the panel's manual refresh button).
+/// `since`, when given, is an RFC3339 instant that overrides `days` — the
+/// frontend passes its own local midnight for the "Today" window, which no
+/// whole-day count can express.
 #[tauri::command]
 pub async fn accounts_glance(
     days: Option<u32>,
+    since: Option<String>,
     env: Option<String>,
     refresh: Option<bool>,
 ) -> Result<AccountsGlance, String> {
-    let days = days.unwrap_or(7).clamp(1, 365);
     let env = match env.as_deref().unwrap_or("practice") {
         // Allowlist, not passthrough: this string becomes a CLI argument.
         e @ ("practice" | "live") => e.to_string(),
         other => return Err(format!("unknown environment '{other}'")),
     };
-    let key = (env.clone(), days);
+    // Validate before it becomes an argument: the CLI would reject a malformed
+    // instant anyway, but failing here keeps the error specific to the input.
+    let since = match since {
+        Some(s) => {
+            let parsed = chrono::DateTime::parse_from_rfc3339(s.trim())
+                .map_err(|e| format!("invalid since '{s}': {e}"))?;
+            Some(parsed.to_rfc3339())
+        }
+        None => None,
+    };
+    let days = if since.is_some() { None } else { Some(days.unwrap_or(7).clamp(1, 365)) };
+    let key: CacheKey = (env.clone(), days, since.clone());
 
     // Hold the lock across the fetch so concurrent callers coalesce onto one
     // CLI run rather than each spawning their own.
@@ -129,11 +152,17 @@ pub async fn accounts_glance(
         "wickd CLI not found — install it (cargo install) to see account performance".to_string()
     })?;
 
+    let mut args: Vec<String> =
+        vec!["trade".into(), "glance".into(), "--env".into(), env.clone()];
+    match (&since, days) {
+        (Some(s), _) => args.extend(["--since".to_string(), s.clone()]),
+        (None, Some(d)) => args.extend(["--days".to_string(), d.to_string()]),
+        (None, None) => unreachable!("days is always Some when since is None"),
+    }
+
     let output = tokio::time::timeout(
         GLANCE_TIMEOUT,
-        tokio::process::Command::new(&wickd)
-            .args(["trade", "glance", "--env", &env, "--days", &days.to_string()])
-            .output(),
+        tokio::process::Command::new(&wickd).args(&args).output(),
     )
     .await
     .map_err(|_| "account fetch timed out".to_string())?
