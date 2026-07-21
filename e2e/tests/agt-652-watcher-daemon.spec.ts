@@ -131,7 +131,10 @@ test.describe('AGT-652 — Live Monitor as a wickd daemon client', () => {
     });
   });
 
-  test('signal feed renders on the Home window as "Signals"', async ({ appPage }) => {
+  test('fired signals are a drawer log, not a Home-window panel', async ({ appPage }) => {
+    // Signals moved into the feed drawer: they are a log to watch scroll by
+    // (or to ask the agent about), not high-level state worth a panel. The
+    // Home window must not render them at all.
     await appPage.page.addInitScript(
       ({ queue }) => {
         (window as unknown as Record<string, unknown>).__E2E_DAEMON_QUEUE__ = queue;
@@ -141,11 +144,8 @@ test.describe('AGT-652 — Live Monitor as a wickd daemon client', () => {
 
     await appPage.goto('local');
 
-    const alertRows = appPage.page.getByTestId('queue-alert-row');
-    await expect(alertRows).toHaveCount(2);
-    await expect(alertRows.filter({ hasText: 'buy' })).toHaveCount(1);
-    await expect(alertRows.filter({ hasText: 'buy' }).getByText('revert_adx')).toBeVisible();
-    await expect(appPage.page.getByText('cross-up 1.2700 @ 1.2703')).toBeVisible();
+    await expect(appPage.page.getByTestId('queue-alert-row')).toHaveCount(0);
+    await expect(appPage.page.getByRole('heading', { name: 'Signals' })).toHaveCount(0);
   });
 
   test('instrument-first flow: pin a price window, attach a strategy under it', async ({ appPage }) => {
