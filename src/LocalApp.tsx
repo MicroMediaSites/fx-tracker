@@ -29,6 +29,7 @@ import { LocalBacktestsSection } from './components/local/LocalBacktestsSection'
 import { UpdateModal } from './components/ui/UpdateModal';
 import { EconomicCalendarSection } from './components/local/EconomicCalendarSection';
 import { AccountsSection } from './components/local/AccountsSection';
+import { CalendarWeek } from './components/local/CalendarWeek';
 import { useSettingsStore } from './stores/settingsStore';
 import { openBacktestWindow, openChartWindow, openWatcherWindow } from './utils/windows';
 
@@ -167,19 +168,22 @@ export const LocalApp = () => {
       </header>
 
       <main className="flex-1 px-6 py-4 max-w-4xl w-full mx-auto">
-        {/* Ordered by what the boot question actually is: "was today
-            profitable, and what news is coming". Accounts and the calendar
-            lead; strategy authoring is a task you go looking for, not a thing
-            you check, so it sits below them. */}
+        {/* The dashboard proper: the two questions this window is opened to
+            answer, each rendered as shape rather than as a list — a hero P&L
+            figure with a tile grid, then the next release with the week
+            beside it. Everything below the rule is dig-in material.
 
-        {/* The one panel here that is NOT offline (it reaches OANDA via
-            `wickd trade glance`); it caches and degrades to an error line, so
-            the offline-boot specs stay green. */}
+            Accounts is the one block here that is NOT offline (it reaches
+            OANDA via `wickd trade glance`); it caches and degrades to an
+            error line, so the offline-boot specs stay green. */}
         <AccountsSection />
 
-        {/* Upcoming economic releases from ~/.wickd/calendar (read-only,
-            offline; the wickd CLI's launchd sync job owns freshness). */}
-        <div className="mt-4">
+        <div className="mt-6">
+          <CalendarWeek />
+        </div>
+
+        {/* ── Below the fold: detail, not dashboard ─────────────────────── */}
+        <div className="mt-8 pt-5 border-t border-[var(--color-border)]">
           <EconomicCalendarSection />
         </div>
 
