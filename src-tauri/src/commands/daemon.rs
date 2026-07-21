@@ -89,9 +89,83 @@ const UI_WATCH_GRANULARITIES: &[&str] = &[
 /// Built-in (non-Rhai) strategies `wickd watch` accepts by name.
 const BUILTIN_STRATEGIES: &[&str] = &["ma-crossover", "rsi"];
 
+/// Env var that overrides CLI resolution outright, so a dev run can point the
+/// app at a freshly-built binary without installing over `~/.cargo/bin/wickd`
+/// (that install is Developer ID signed on purpose — re-signing it ad-hoc
+/// changes its keychain ACL identity and reintroduces per-invocation prompts).
+///
+/// ```sh
+/// WICKD_BIN=/path/to/target/release/wickd npm run tauri dev
+/// ```
+pub(crate) const WICKD_BIN_ENV: &str = "WICKD_BIN";
+
+/// Interpret a `WICKD_BIN` value. Pure (takes the raw value rather than reading
+/// the environment) so it is testable without racing on the process-global env
+/// in parallel tests.
+///
+/// - unset, or set to an empty/whitespace-only value (how a shell clears a
+///   var), means "no override" — resolution falls through to the candidate list
+/// - a value naming an existing, executable file is the override
+/// - anything else is a hard error, NOT a silent fallback to the installed
+///   binary: falling back would make a typo look like "my change did nothing",
+///   which is the exact confusion the override exists to remove
+fn resolve_wickd_override(
+    raw: Option<&std::ffi::OsStr>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let raw = match raw {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    // Only trim when the value is valid UTF-8; a non-UTF-8 path is still a
+    // legitimate path and must not be discarded as "blank".
+    if raw.to_str().is_some_and(|s| s.trim().is_empty()) {
+        return Ok(None);
+    }
+    let path = std::path::PathBuf::from(raw);
+    if !path.is_file() {
+        return Err(format!(
+            "{WICKD_BIN_ENV} is set to '{}', which is not an existing file — \
+             fix the path or unset {WICKD_BIN_ENV} to use the installed wickd",
+            path.display()
+        ));
+    }
+    if !is_executable(&path) {
+        return Err(format!(
+            "{WICKD_BIN_ENV} is set to '{}', which is not executable — \
+             chmod +x it or unset {WICKD_BIN_ENV} to use the installed wickd",
+            path.display()
+        ));
+    }
+    Ok(Some(path))
+}
+
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &std::path::Path) -> bool {
+    true
+}
+
 /// Locate the wickd CLI binary. GUI apps don't inherit a login-shell PATH, so
 /// probe the conventional install locations before falling back to PATH.
-pub(crate) fn find_wickd_binary() -> Option<std::path::PathBuf> {
+///
+/// `Err` means the `WICKD_BIN` override is set but unusable — a hard failure
+/// callers surface verbatim. `Ok(None)` is the ordinary "no CLI installed"
+/// case, which callers report with their own context-specific message.
+pub(crate) fn find_wickd_binary() -> Result<Option<std::path::PathBuf>, String> {
+    if let Some(path) = resolve_wickd_override(std::env::var_os(WICKD_BIN_ENV).as_deref())? {
+        return Ok(Some(path));
+    }
+    Ok(find_installed_wickd_binary())
+}
+
+/// The conventional-locations probe: the resolution that applies when no
+/// `WICKD_BIN` override is in play.
+fn find_installed_wickd_binary() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(home) = &home {
@@ -182,8 +256,9 @@ pub async fn start_watcher(
     }
 
     // --- spawn ---
-    let bin = find_wickd_binary()
-        .ok_or("wickd CLI not found — install it (cargo install) or start the watcher from a terminal")?;
+    let bin = find_wickd_binary()?.ok_or(
+        "wickd CLI not found — install it (cargo install) or start the watcher from a terminal",
+    )?;
 
     let log_dir = wickd_core::paths::wickd_data_home()
         .map_err(|e| e.to_string())?
@@ -279,6 +354,98 @@ mod tests {
 
     // The ps-parsing tests moved to wickd_core::watchers with the code
     // (AGT-652-style lift so the CLI's feed producer shares the scan).
+
+    // --- WICKD_BIN override resolution -------------------------------------
+    //
+    // These drive the pure `resolve_wickd_override` helper directly rather
+    // than setting WICKD_BIN: env vars are process-global and cargo runs tests
+    // in parallel threads, so `set_var` here would race every other test.
+
+    /// A unique temp dir for one test, cleaned up by the caller.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wickd-bin-override-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn unset_override_means_fall_through_to_the_candidate_list() {
+        assert_eq!(resolve_wickd_override(None).unwrap(), None);
+    }
+
+    #[test]
+    fn blank_override_is_treated_as_unset() {
+        // `WICKD_BIN= npm run tauri dev` is how a shell clears the var.
+        for raw in ["", "   ", "\t"] {
+            assert_eq!(
+                resolve_wickd_override(Some(std::ffi::OsStr::new(raw))).unwrap(),
+                None,
+                "{raw:?} should read as no override"
+            );
+        }
+    }
+
+    #[test]
+    fn an_executable_file_is_used_as_the_override() {
+        let dir = scratch_dir("ok");
+        let bin = dir.join("wickd");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let resolved = resolve_wickd_override(Some(bin.as_os_str())).unwrap();
+        assert_eq!(resolved, Some(bin));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_override_path_is_a_hard_error_not_a_silent_fallback() {
+        let dir = scratch_dir("missing");
+        let bin = dir.join("does-not-exist");
+
+        let err = resolve_wickd_override(Some(bin.as_os_str())).unwrap_err();
+        assert!(err.contains(WICKD_BIN_ENV), "{err}");
+        assert!(err.contains("not an existing file"), "{err}");
+        assert!(err.contains(&bin.display().to_string()), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_directory_is_rejected_rather_than_spawned() {
+        let dir = scratch_dir("dir");
+
+        let err = resolve_wickd_override(Some(dir.as_os_str())).unwrap_err();
+        assert!(err.contains("not an existing file"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_file_is_rejected_with_a_distinct_message() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("noexec");
+        let bin = dir.join("wickd");
+        std::fs::write(&bin, b"not executable").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = resolve_wickd_override(Some(bin.as_os_str())).unwrap_err();
+        assert!(err.contains("not executable"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // The store reads honor WICKD_HOME via wickd-core path resolution — proven
     // by reading seeded files through the same list functions the commands use.
