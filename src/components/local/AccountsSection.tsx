@@ -18,18 +18,28 @@
  */
 import { useState } from 'react';
 import { CollapsibleSection } from '../ui/CollapsibleSection';
-import { AccountGlance, useAccountsGlance } from '../../hooks/useAccountsGlance';
+import {
+  AccountGlance,
+  GlanceWindow,
+  useAccountsGlance,
+} from '../../hooks/useAccountsGlance';
 
 // `wickd_` prefix, not the retired `candlesight_` brand — the surrounding
 // CollapsibleSection keys are pre-rename and stay as they are (renaming them
 // would silently drop everyone's saved collapse state); new keys use the
 // current name.
-const WINDOW_STORAGE_KEY = 'wickd_accounts_window_days';
+const WINDOW_STORAGE_KEY = 'wickd_accounts_window';
 
-const WINDOWS: { days: number; label: string }[] = [
-  { days: 1, label: '24h' },
-  { days: 7, label: '7d' },
-  { days: 30, label: '30d' },
+/**
+ * "Today" leads and is the default: the question this panel exists to answer on
+ * cold boot is "has today been profitable, per account". It is deliberately not
+ * `24h` — mid-morning those are very different spans, and the one you want is
+ * the calendar day.
+ */
+const WINDOWS: { id: string; label: string; window: GlanceWindow }[] = [
+  { id: 'today', label: 'today', window: { kind: 'today' } },
+  { id: '7d', label: '7d', window: { kind: 'days', days: 7 } },
+  { id: '30d', label: '30d', window: { kind: 'days', days: 30 } },
 ];
 
 /**
@@ -63,6 +73,25 @@ const pnlColor = (value: string | null): string => {
 const percent = (rate: number | null): string =>
   rate === null ? '—' : `${Math.round(rate * 100)}%`;
 
+/** True when the account neither traded in the window nor holds anything open. */
+const isIdle = (a: AccountGlance): boolean => {
+  const openPl = Number(a.unrealized_pl);
+  const hasOpen = (a.open_trade_count ?? 0) > 0 || (Number.isFinite(openPl) && openPl !== 0);
+  return (a.trades ?? 0) === 0 && !hasOpen;
+};
+
+/**
+ * Accounts that did something in the window first, then the idle ones — each
+ * group keeping the CLI's stable alphabetical order.
+ *
+ * Errored rows count as active: a broken account is something to look at, not
+ * something to bury at the bottom.
+ */
+export const orderedAccounts = (accounts: AccountGlance[]): AccountGlance[] => {
+  const rank = (a: AccountGlance) => (a.error ? 0 : isIdle(a) ? 1 : 0);
+  return [...accounts].sort((a, b) => rank(a) - rank(b));
+};
+
 const AccountRow = ({ acct }: { acct: AccountGlance }) => {
   const aliases = acct.names.slice(1);
 
@@ -86,11 +115,19 @@ const AccountRow = ({ acct }: { acct: AccountGlance }) => {
 
   const openPl = Number(acct.unrealized_pl);
   const hasOpen = (acct.open_trade_count ?? 0) > 0 || (Number.isFinite(openPl) && openPl !== 0);
+  // An account that did nothing in the window is recessive: with a ladder of
+  // six, four are usually idle, and giving them equal weight buries the two
+  // that actually traded — which is the whole question this panel answers.
+  // Same predicate that drives the ordering, so dimming and sorting can't drift.
+  const idle = isIdle(acct);
 
   return (
     <div
       data-testid="account-row"
-      className="px-3 py-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)]"
+      data-idle={idle || undefined}
+      className={`px-3 py-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] ${
+        idle ? 'opacity-55' : ''
+      }`}
     >
       <div className="flex items-baseline justify-between gap-3">
         <span className="text-sm font-mono text-[var(--color-text-primary)] truncate">
@@ -142,15 +179,16 @@ const AccountRow = ({ acct }: { acct: AccountGlance }) => {
 };
 
 export const AccountsSection = () => {
-  const [days, setDays] = useState<number>(() => {
-    const stored = Number(localStorage.getItem(WINDOW_STORAGE_KEY));
-    return WINDOWS.some((w) => w.days === stored) ? stored : 7;
+  const [windowId, setWindowId] = useState<string>(() => {
+    const stored = localStorage.getItem(WINDOW_STORAGE_KEY);
+    return WINDOWS.some((w) => w.id === stored) ? (stored as string) : 'today';
   });
-  const { data, error, loading, refresh } = useAccountsGlance(days);
+  const selected = WINDOWS.find((w) => w.id === windowId) ?? WINDOWS[0];
+  const { data, error, loading, refresh } = useAccountsGlance(selected.window);
 
-  const selectWindow = (next: number) => {
-    setDays(next);
-    localStorage.setItem(WINDOW_STORAGE_KEY, String(next));
+  const selectWindow = (next: string) => {
+    setWindowId(next);
+    localStorage.setItem(WINDOW_STORAGE_KEY, next);
   };
 
   const asOf = data
@@ -176,12 +214,12 @@ export const AccountsSection = () => {
           <div className="flex items-center gap-0.5" role="group" aria-label="Performance window">
             {WINDOWS.map((w) => (
               <button
-                key={w.days}
-                data-testid={`accounts-window-${w.label}`}
-                onClick={() => selectWindow(w.days)}
-                aria-pressed={w.days === days}
+                key={w.id}
+                data-testid={`accounts-window-${w.id}`}
+                onClick={() => selectWindow(w.id)}
+                aria-pressed={w.id === windowId}
                 className={`px-1.5 py-0.5 text-xs rounded font-mono transition-colors ${
-                  w.days === days
+                  w.id === windowId
                     ? 'bg-[var(--color-info)]/15 text-[var(--color-info)]'
                     : 'text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)]'
                 }`}
@@ -215,14 +253,15 @@ export const AccountsSection = () => {
       ) : (
         <>
           <div className="space-y-1.5">
-            {data.accounts.map((a) => (
+            {orderedAccounts(data.accounts).map((a) => (
               <AccountRow key={a.account_id ?? a.account} acct={a} />
             ))}
           </div>
           <p className="mt-2 text-xs text-[var(--color-text-faint)]">
-            Realized P&amp;L from trades closed in the last{' '}
-            {WINDOWS.find((w) => w.days === days)?.label}; open positions are counted separately and
-            as of now. {asOf && `As of ${asOf}.`}
+            Realized P&amp;L from trades closed{' '}
+            {selected.id === 'today' ? 'since local midnight' : `in the last ${selected.label}`};
+            open positions are counted separately and as of now.{' '}
+            {asOf && `As of ${asOf}.`}
           </p>
         </>
       )}

@@ -141,6 +141,26 @@ test.describe('Accounts at a glance', () => {
     await expect(appPage.page.locator('[data-testid="account-realized"]')).toHaveCount(3);
   });
 
+  test('defaults to the today window and asks the backend for a since instant', async ({
+    appPage,
+  }) => {
+    // "Was today profitable" is the cold-boot question, so today leads — and
+    // it must go out as `since` (local midnight), not `days: 1`, which is a
+    // different span entirely before mid-afternoon.
+    await appPage.mockTauriCommand('accounts_glance', GLANCE);
+    await appPage.goto('local');
+
+    await expect(appPage.page.getByTestId('accounts-window-today')).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+    await expect(appPage.page.getByTestId('accounts-window-7d')).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    );
+    await expect(appPage.page.getByText('since local midnight')).toBeVisible();
+  });
+
   test('empty config explains how to fix it', async ({ appPage }) => {
     await appPage.mockTauriCommand('accounts_glance', { ...GLANCE, accounts: [] });
     await appPage.goto('local');
