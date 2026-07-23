@@ -408,11 +408,10 @@ impl MarketOrderRequest {
         }
     }
 
-    /// Attach strategy attribution as OANDA `clientExtensions` (AGT-630, AC1).
-    /// `None` leaves the order unattributed (the field is omitted from the POST
-    /// body), so callers can thread an optional strategy straight through.
-    /// `None` leaves the order unattributed (both fields omitted from the POST
-    /// body), so callers can thread an optional strategy straight through.
+    /// Attach strategy attribution (AGT-630, AC1) to both the order and the
+    /// resulting trade. `None` leaves the order unattributed — both fields are
+    /// omitted from the POST body — so callers can thread an optional strategy
+    /// straight through.
     pub fn with_strategy(mut self, strategy: Option<&str>) -> Self {
         let ext = strategy.map(ClientExtensions::for_strategy);
         // Order-level AND trade-level: only the latter survives onto the trade

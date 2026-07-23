@@ -1686,7 +1686,7 @@ fn history_row(t: &Trade) -> serde_json::Value {
 /// has no baseline row of its own; its start was recorded under the alias
 /// `default`, since both names resolve to the same OANDA account.)
 async fn history(
-    _env: OandaEnvironment,
+    env: OandaEnvironment,
     env_raw: &str,
     account: &str,
     h: HistoryArgs,
@@ -1716,7 +1716,9 @@ async fn history(
     // say so rather than let a partial history read as complete.
     let truncated = fetched.len() as u32 >= h.limit;
 
-    let mut trades = match since {
+    // `closed_since` already returns newest-first; the no-window branch sorts
+    // to match, so there is one sort on each path and none after.
+    let trades = match since {
         Some(s) => closed_since(fetched, s),
         None => {
             let mut all = fetched;
@@ -1724,7 +1726,6 @@ async fn history(
             all
         }
     };
-    trades.sort_by(|a, b| b.close_time.cmp(&a.close_time));
 
     let realized: Decimal = trades.iter().map(|t| t.realized_pl).sum();
     let blended = trades.iter().filter(|t| t.exit_count > 1).count();
@@ -1732,7 +1733,7 @@ async fn history(
     Ok(serde_json::json!({
         "account": account,
         "account_id": oanda.account_id(),
-        "environment": env_str(_env),
+        "environment": env_str(env),
         "baseline": baseline.as_ref().map(|b| serde_json::json!({
             "balance": b.balance,
             "date": b.baseline_date,
