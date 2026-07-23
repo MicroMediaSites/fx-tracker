@@ -308,6 +308,20 @@ export function getTauriBridgeScript() {
         generated_at: '2026-07-20T00:00:00Z',
         accounts: [],
       },
+      // Trade-history drill-down. Empty by default; seed per-test via
+      // appPage.mockTauriCommand('account_history', { ...trades: [...] }).
+      'account_history': {
+        account: 'default',
+        account_id: '101-001-26151603-005',
+        environment: 'practice',
+        baseline: null,
+        since: null,
+        count: 0,
+        realized: '0',
+        blended_exits: 0,
+        truncated: false,
+        trades: [],
+      },
       'daemon_queue_list': (args) => {
         const queue = [...(window.__E2E_DAEMON_QUEUE__ ?? [])].reverse();
         return queue.slice(0, args?.limit ?? 100);

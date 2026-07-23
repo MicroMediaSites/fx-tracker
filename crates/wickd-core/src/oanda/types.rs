@@ -287,9 +287,19 @@ pub struct MarketOrderSpec {
     pub stop_loss_on_fill: Option<StopLossOnFill>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub take_profit_on_fill: Option<TakeProfitOnFill>,
-    /// Strategy attribution (AGT-630, AC1); omitted when no strategy is known.
+    /// Strategy attribution on the ORDER (AGT-630, AC1); omitted when no
+    /// strategy is known. This tags the order's own transaction records.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_extensions: Option<ClientExtensions>,
+    /// Strategy attribution on the resulting TRADE. OANDA carries
+    /// `clientExtensions` and `tradeClientExtensions` as *separate* fields: the
+    /// former tags the order, the latter tags the trade the fill opens — and
+    /// only the trade-level one echoes back on `/v3/accounts/{id}/trades`.
+    /// Setting only `clientExtensions` (the original AGT-630 mistake) left
+    /// every closed trade unattributed when read back, so `trade report`'s
+    /// per-strategy grouping was always empty. Both are set together now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trade_client_extensions: Option<ClientExtensions>,
 }
 
 /// Stop loss order to create when the trade is filled
@@ -365,6 +375,7 @@ impl MarketOrderRequest {
                 stop_loss_on_fill: None,
                 take_profit_on_fill: None,
                 client_extensions: None,
+                trade_client_extensions: None,
             },
         }
     }
@@ -392,6 +403,7 @@ impl MarketOrderRequest {
                     time_in_force: Some(TimeInForce::GTC),
                 }),
                 client_extensions: None,
+                trade_client_extensions: None,
             },
         }
     }
@@ -399,8 +411,14 @@ impl MarketOrderRequest {
     /// Attach strategy attribution as OANDA `clientExtensions` (AGT-630, AC1).
     /// `None` leaves the order unattributed (the field is omitted from the POST
     /// body), so callers can thread an optional strategy straight through.
+    /// `None` leaves the order unattributed (both fields omitted from the POST
+    /// body), so callers can thread an optional strategy straight through.
     pub fn with_strategy(mut self, strategy: Option<&str>) -> Self {
-        self.order.client_extensions = strategy.map(ClientExtensions::for_strategy);
+        let ext = strategy.map(ClientExtensions::for_strategy);
+        // Order-level AND trade-level: only the latter survives onto the trade
+        // record fetched from `/trades`, which is what attribution reads.
+        self.order.client_extensions = ext.clone();
+        self.order.trade_client_extensions = ext;
         self
     }
 }
@@ -440,9 +458,13 @@ pub struct EntryOrderSpec {
     pub stop_loss_on_fill: Option<StopLossOnFill>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub take_profit_on_fill: Option<TakeProfitOnFill>,
-    /// Strategy attribution (AGT-630, AC1); omitted when no strategy is known.
+    /// Strategy attribution on the ORDER (AGT-630, AC1); omitted when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_extensions: Option<ClientExtensions>,
+    /// Strategy attribution on the resulting TRADE — the one that echoes back
+    /// on `/trades`. See [`MarketOrderSpec::trade_client_extensions`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trade_client_extensions: Option<ClientExtensions>,
 }
 
 impl EntryOrderRequest {
@@ -488,6 +510,12 @@ impl EntryOrderRequest {
                     }
                 }),
                 client_extensions: opts
+                    .strategy
+                    .as_deref()
+                    .map(ClientExtensions::for_strategy),
+                // Trade-level twin — the one that survives onto the trade
+                // record read back from `/trades`.
+                trade_client_extensions: opts
                     .strategy
                     .as_deref()
                     .map(ClientExtensions::for_strategy),
@@ -899,6 +927,56 @@ pub struct AutochartistScores {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── strategy attribution reaches the TRADE, not just the order ─────────
+
+    #[test]
+    fn attributed_market_order_carries_trade_client_extensions() {
+        // The bug: only `clientExtensions` was set, which tags the order but
+        // does NOT echo back on `/trades`. OANDA needs `tradeClientExtensions`
+        // to tag the trade the fill opens. Both must be present, spelled
+        // exactly, or read-back attribution stays empty.
+        let body = serde_json::to_value(
+            MarketOrderRequest::with_sl_tp("EUR_USD", 1000, None, None).with_strategy(Some("rahagod")),
+        )
+        .unwrap();
+        let order = &body["order"];
+
+        assert_eq!(order["clientExtensions"]["tag"], "rahagod");
+        assert_eq!(order["tradeClientExtensions"]["tag"], "rahagod");
+        assert_eq!(order["tradeClientExtensions"]["comment"], "wickd strategy=rahagod");
+    }
+
+    #[test]
+    fn unattributed_market_order_omits_both_extensions() {
+        // Byte-identical to the pre-attribution POST body when no strategy is
+        // known — neither field should appear.
+        let body = serde_json::to_value(MarketOrderRequest::new("EUR_USD", 1000)).unwrap();
+        let order = &body["order"];
+
+        assert!(order.get("clientExtensions").is_none());
+        assert!(order.get("tradeClientExtensions").is_none());
+    }
+
+    #[test]
+    fn attributed_entry_order_carries_trade_client_extensions() {
+        let opts = EntryOptions {
+            strategy: Some("kijun_revert_trend".to_string()),
+            ..Default::default()
+        };
+        let body = serde_json::to_value(EntryOrderRequest::new(
+            EntryOrderType::Limit,
+            "EUR_USD",
+            1000,
+            "1.0800",
+            &opts,
+        ))
+        .unwrap();
+        let order = &body["order"];
+
+        assert_eq!(order["clientExtensions"]["tag"], "kijun_revert_trend");
+        assert_eq!(order["tradeClientExtensions"]["tag"], "kijun_revert_trend");
+    }
 
     #[test]
     fn test_format_price_for_oanda_standard_pairs() {

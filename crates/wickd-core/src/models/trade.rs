@@ -39,6 +39,25 @@ pub struct Trade {
     /// manual or pre-attribution trades — those report as unattributed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<String>,
+    /// How many separate transactions closed this trade.
+    ///
+    /// Carried so a reader can tell a clean single exit from a partially-exited
+    /// trade. It matters because [`Trade::close_price`] is OANDA's
+    /// `averageClosePrice` — already BLENDED across every exit — so for a
+    /// multi-exit trade it is not a price anything actually filled at, and
+    /// showing it as "the exit" would be a quiet lie.
+    ///
+    /// `/trades` gives no way to decompose the blend; that needs the
+    /// transactions endpoint, which wickd does not have. Until it does, the
+    /// honest move is to surface that the trade had N exits rather than
+    /// present the average as one.
+    ///
+    /// 0 for open trades. 1 for the ordinary case: `wickd` never partially
+    /// closes (`close_position` always sends `"ALL"`) and `auto_exec` blocks
+    /// scale-ins, so anything above 1 came from manual intervention or a
+    /// broker-side SL/TP interacting with a partial fill.
+    #[serde(default)]
+    pub exit_count: usize,
 }
 
 impl Trade {
@@ -108,6 +127,10 @@ impl From<OandaTrade> for Trade {
             // OANDA echoes the placing order's clientExtensions onto the trade;
             // the `tag` is the strategy name (AGT-630). `None` when unattributed.
             strategy: oanda.client_extensions.and_then(|c| c.tag),
+            // Previously parsed off the wire and discarded. It is the only
+            // per-exit handle `/trades` gives, and without it `close_price`
+            // (a blended average) is indistinguishable from a real fill price.
+            exit_count: oanda.closing_transaction_ids.len(),
         }
     }
 }

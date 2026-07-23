@@ -20,6 +20,7 @@
  *     same as losing everything.
  */
 import { useState } from 'react';
+import { AccountHistoryModal } from './AccountHistoryModal';
 import {
   AccountGlance,
   GlanceWindow,
@@ -77,6 +78,18 @@ const pnlColor = (value: number | null): string => {
 const percent = (rate: number | null): string =>
   rate === null ? '—' : `${Math.round(rate * 100)}%`;
 
+/**
+ * Last three digits of the OANDA account id — the sub-account number Matt
+ * thinks in (`003`, `004`, …). OANDA ids look like `101-001-26151603-005`; the
+ * final hyphen-group is the sub-account. Falls back to the whole tail if the
+ * shape is unexpected rather than guessing.
+ */
+export const accountSuffix = (accountId: string | null): string | null => {
+  if (!accountId) return null;
+  const last = accountId.split('-').pop() ?? accountId;
+  return last.slice(-3);
+};
+
 /** True when the account neither traded in the window nor holds anything open. */
 export const isIdle = (a: AccountGlance): boolean => {
   const openPl = parse(a.unrealized_pl);
@@ -99,8 +112,9 @@ export const orderedAccounts = (accounts: AccountGlance[]): AccountGlance[] => {
  * scanning the grid should surface which accounts moved without reading any
  * labels.
  */
-const AccountTile = ({ acct }: { acct: AccountGlance }) => {
+const AccountTile = ({ acct, onOpen }: { acct: AccountGlance; onOpen: (account: string) => void }) => {
   const aliases = acct.names.slice(1);
+  const suffix = accountSuffix(acct.account_id);
 
   if (acct.error) {
     return (
@@ -108,8 +122,15 @@ const AccountTile = ({ acct }: { acct: AccountGlance }) => {
         data-testid="account-tile"
         className="px-3 py-2.5 rounded-lg border border-[var(--color-sell)]/30 bg-[var(--color-bg-elevated)] min-w-0"
       >
-        <div className="text-xs font-mono text-[var(--color-text-secondary)] truncate">
-          {acct.account}
+        <div className="flex items-baseline gap-1.5">
+          <span className="text-xs font-mono text-[var(--color-text-secondary)] truncate">
+            {acct.account}
+          </span>
+          {suffix && (
+            <span className="text-[10px] font-mono text-[var(--color-text-faint)] shrink-0">
+              {suffix}
+            </span>
+          )}
         </div>
         <div className="mt-1 text-sm text-[var(--color-sell)]" title={acct.error}>
           unavailable
@@ -130,12 +151,15 @@ const AccountTile = ({ acct }: { acct: AccountGlance }) => {
   const idle = isIdle(acct);
 
   return (
-    <div
+    <button
+      type="button"
       data-testid="account-tile"
       data-idle={idle || undefined}
-      className={`px-3 py-2.5 rounded-lg border bg-[var(--color-bg-elevated)] min-w-0 ${
+      onClick={() => onOpen(acct.account)}
+      title="View trade history"
+      className={`text-left px-3 py-2.5 rounded-lg border bg-[var(--color-bg-elevated)] min-w-0 transition-colors hover:border-[var(--color-info)]/50 hover:bg-[var(--color-bg-elevated)]/80 focus:outline-none focus:border-[var(--color-info)] ${
         idle
-          ? 'border-[var(--color-border)]/60 opacity-50'
+          ? 'border-[var(--color-border)]/60 opacity-50 hover:opacity-80'
           : 'border-[var(--color-border)]'
       }`}
     >
@@ -143,6 +167,14 @@ const AccountTile = ({ acct }: { acct: AccountGlance }) => {
         <span className="text-xs font-mono text-[var(--color-text-secondary)] truncate">
           {acct.account}
         </span>
+        {suffix && (
+          <span
+            className="text-[10px] font-mono text-[var(--color-text-faint)] shrink-0"
+            title={`OANDA sub-account ${suffix}`}
+          >
+            {suffix}
+          </span>
+        )}
         {aliases.length > 0 && (
           <span
             className="text-[11px] text-[var(--color-text-faint)] shrink-0"
@@ -179,7 +211,7 @@ const AccountTile = ({ acct }: { acct: AccountGlance }) => {
           </>
         )}
       </div>
-    </div>
+    </button>
   );
 };
 
@@ -195,6 +227,9 @@ export const AccountsSection = () => {
     setWindowId(next);
     localStorage.setItem(WINDOW_STORAGE_KEY, next);
   };
+
+  // Which account's trade-history drill-down is open (null = none).
+  const [openAccount, setOpenAccount] = useState<string | null>(null);
 
   const summary = data ? summarizeAccounts(data.accounts) : null;
   const asOf = data
@@ -312,11 +347,17 @@ export const AccountsSection = () => {
             className="grid gap-2 grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6"
           >
             {orderedAccounts(data.accounts).map((a) => (
-              <AccountTile key={a.account_id ?? a.account} acct={a} />
+              <AccountTile
+                key={a.account_id ?? a.account}
+                acct={a}
+                onOpen={setOpenAccount}
+              />
             ))}
           </div>
         )}
       </div>
+
+      <AccountHistoryModal account={openAccount} onClose={() => setOpenAccount(null)} />
     </section>
   );
 };

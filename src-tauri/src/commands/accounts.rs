@@ -187,3 +187,81 @@ pub async fn accounts_glance(
     *guard = Some(Cached { key, value: glance.clone(), fetched: Instant::now() });
     Ok(glance)
 }
+
+/// An account name is safe to pass as a CLI argument only if it matches the
+/// vault's own naming rule. Mirrors `vault_store::validate_account_name`, which
+/// is not importable from the app crate — the point is to reject anything
+/// exotic before it becomes argv, not to perfectly reproduce that function.
+fn valid_account_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Closed-trade history for one account, with entry/exit detail, since its
+/// experiment start (or `since`). Shells out to `wickd trade history`.
+///
+/// Returned as raw JSON: the per-trade shape is rich (entry, exit, blended
+/// flag, duration) and the frontend renders it directly rather than round-trip
+/// it through a typed mirror that would need updating in lockstep. This is the
+/// drill-down behind an account tile — user-triggered, never on the boot path,
+/// and it reaches OANDA so it is not offline.
+#[tauri::command]
+pub async fn account_history(
+    account: String,
+    since: Option<String>,
+    env: Option<String>,
+) -> Result<serde_json::Value, String> {
+    if !valid_account_name(&account) {
+        return Err(format!("invalid account name '{account}'"));
+    }
+    let env = match env.as_deref().unwrap_or("practice") {
+        e @ ("practice" | "live") => e.to_string(),
+        other => return Err(format!("unknown environment '{other}'")),
+    };
+    let since = match since {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s.trim())
+                .map_err(|e| format!("invalid since '{s}': {e}"))?
+                .to_rfc3339(),
+        ),
+        None => None,
+    };
+
+    let wickd = find_wickd_binary()?.ok_or_else(|| {
+        "wickd CLI not found — install it (cargo install) to see trade history".to_string()
+    })?;
+
+    let mut args: Vec<String> = vec![
+        "trade".into(),
+        "history".into(),
+        "--env".into(),
+        env,
+        "--account".into(),
+        account,
+    ];
+    if let Some(s) = &since {
+        args.extend(["--since".to_string(), s.clone()]);
+    }
+
+    let output = tokio::time::timeout(
+        GLANCE_TIMEOUT,
+        tokio::process::Command::new(&wickd).args(&args).output(),
+    )
+    .await
+    .map_err(|_| "history fetch timed out".to_string())?
+    .map_err(|e| format!("running wickd trade history: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|_| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if stderr.trim().is_empty() { stdout } else { stderr };
+        format!("unexpected wickd output: {}", detail.chars().take(200).collect::<String>())
+    })?;
+
+    if let Some(err) = value.get("error") {
+        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+        return Err(msg.to_string());
+    }
+    Ok(value)
+}
