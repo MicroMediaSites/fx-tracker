@@ -62,6 +62,113 @@ pub async fn get_trade_history(
     get_trades(client, count, instrument, Some("CLOSED")).await
 }
 
+/// One page of closed trades older than `before_id` (OANDA `beforeID`), newest
+/// first. `None` starts at the newest trade. This is the paging primitive
+/// behind [`get_closed_trades_since`].
+pub async fn get_trades_before(
+    client: &OandaClient,
+    count: Option<u32>,
+    before_id: Option<&str>,
+) -> Result<Vec<Trade>> {
+    let mut url = format!(
+        "{}/v3/accounts/{}/trades",
+        client.base_url(),
+        client.account_id()
+    );
+
+    let mut query_parts = vec!["state=CLOSED".to_string()];
+    if let Some(c) = count {
+        query_parts.push(format!("count={}", c));
+    }
+    if let Some(b) = before_id {
+        query_parts.push(format!("beforeID={}", b));
+    }
+    url.push('?');
+    url.push_str(&query_parts.join("&"));
+
+    let response = client.get(&url).send().await?.error_for_status()?;
+    let trades_response: TradesResponse = response.json().await?;
+    Ok(trades_response.trades.into_iter().map(Trade::from).collect())
+}
+
+/// Outcome of a paged history walk.
+#[derive(Debug, Clone)]
+pub struct PagedHistory {
+    /// Closed trades, newest first, across every page fetched.
+    pub trades: Vec<Trade>,
+    /// How many requests were issued (1 per page).
+    pub pages: usize,
+    /// True when the walk stopped at `max_pages` with history still unread —
+    /// i.e. the result does NOT reach back to `oldest_wanted`. Callers must
+    /// surface this rather than let a partial history read as complete.
+    pub truncated: bool,
+}
+
+/// Walk closed-trade history backwards until `oldest_wanted` is covered.
+///
+/// OANDA caps `/trades?count` at 500 and returns newest-first, so a single
+/// request cannot reach an old baseline on a busy account (a 30-trades/day
+/// watcher outgrows 500 in under three weeks). This pages with `beforeID`
+/// until one of three stops:
+///
+///  1. a page contains a trade closed at/before `oldest_wanted` — covered;
+///  2. a short or empty page — the account's history is exhausted;
+///  3. `max_pages` — reported as `truncated`, never silently.
+///
+/// Trades are returned unfiltered (the caller applies the exact window), so the
+/// final page may reach slightly past `oldest_wanted`.
+pub async fn get_closed_trades_since(
+    client: &OandaClient,
+    oldest_wanted: Option<chrono::DateTime<chrono::Utc>>,
+    page_size: u32,
+    max_pages: usize,
+) -> Result<PagedHistory> {
+    let mut all: Vec<Trade> = Vec::new();
+    let mut before_id: Option<String> = None;
+    let mut pages = 0usize;
+
+    while pages < max_pages {
+        let page = get_trades_before(client, Some(page_size), before_id.as_deref()).await?;
+        pages += 1;
+        let page_len = page.len();
+
+        // The next page starts below the lowest id we have seen. Ids are
+        // numeric strings; parse for the comparison so "9" doesn't sort above
+        // "10", and skip any unparseable id rather than paging from garbage.
+        let min_id = page
+            .iter()
+            .filter_map(|t| t.id.parse::<u64>().ok().map(|n| (n, t.id.clone())))
+            .min_by_key(|(n, _)| *n)
+            .map(|(_, id)| id);
+
+        // Does this page already reach past the window?
+        let reached = match oldest_wanted {
+            Some(cut) => page
+                .iter()
+                .any(|t| t.close_time.map(|ct| ct <= cut).unwrap_or(false)),
+            None => false,
+        };
+
+        all.extend(page);
+
+        if reached {
+            return Ok(PagedHistory { trades: all, pages, truncated: false });
+        }
+        // A short page means OANDA has nothing older — history exhausted.
+        if page_len < page_size as usize {
+            return Ok(PagedHistory { trades: all, pages, truncated: false });
+        }
+        match min_id {
+            Some(id) => before_id = Some(id),
+            // No usable id to page from: stop rather than loop on the same page.
+            None => return Ok(PagedHistory { trades: all, pages, truncated: true }),
+        }
+    }
+
+    // Ran out of page budget with history still unread.
+    Ok(PagedHistory { trades: all, pages, truncated: true })
+}
+
 pub async fn get_account(client: &OandaClient) -> Result<super::types::OandaAccount> {
     let url = format!("{}/v3/accounts/{}", client.base_url(), client.account_id());
     let response = client.get(&url).send().await?.error_for_status()?;
@@ -603,6 +710,156 @@ mod tests {
             ],
             "lastTransactionID": "99999"
         })
+    }
+
+    // ── paged closed-trade history (beforeID walk) ────────────────────────
+
+    /// One CLOSED trade page. `ids` are returned newest-first, as OANDA does.
+    fn closed_page(ids: &[u64], close_day: u32) -> serde_json::Value {
+        let trades: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": id.to_string(),
+                    "instrument": "EUR_USD",
+                    "price": "1.08500",
+                    "openTime": format!("2026-07-{:02}T09:00:00.000000000Z", close_day),
+                    "initialUnits": "1000",
+                    "currentUnits": "0",
+                    "realizedPL": "1.0000",
+                    "state": "CLOSED",
+                    "closeTime": format!("2026-07-{:02}T10:00:00.000000000Z", close_day),
+                    "averageClosePrice": "1.08600",
+                    "closingTransactionIDs": [format!("{}", id + 1)]
+                })
+            })
+            .collect();
+        json!({ "trades": trades, "lastTransactionID": "99999" })
+    }
+
+    #[tokio::test]
+    async fn paged_history_stops_on_a_short_page() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        // A page smaller than the page size means OANDA has nothing older.
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(closed_page(&[300, 299], 20)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let out = get_closed_trades_since(&client, None, 5, 10).await.unwrap();
+
+        assert_eq!(out.trades.len(), 2);
+        assert_eq!(out.pages, 1);
+        assert!(!out.truncated, "a short page is exhaustion, not truncation");
+    }
+
+    #[tokio::test]
+    async fn paged_history_stops_once_the_window_is_covered() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        // Page 1: full, all closed Jul 20 (inside the window).
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/trades"))
+            .and(query_param("count", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(closed_page(&[300, 299], 20)))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        // Page 2: reaches Jul 10, at/before the cutoff → walk stops here.
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/trades"))
+            .and(query_param("beforeID", "299"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(closed_page(&[298, 297], 10)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let cut = chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let out = get_closed_trades_since(&client, Some(cut), 2, 10).await.unwrap();
+
+        assert_eq!(out.pages, 2, "should stop as soon as the window is covered");
+        assert_eq!(out.trades.len(), 4);
+        assert!(!out.truncated);
+    }
+
+    #[tokio::test]
+    async fn paged_history_reports_truncation_at_the_page_cap() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        // Every page is full and never reaches the cutoff, so the walk runs out
+        // of budget. That MUST be reported, not silently returned as complete.
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(closed_page(&[300, 299], 24)))
+            .mount(&mock_server)
+            .await;
+
+        let cut = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let out = get_closed_trades_since(&client, Some(cut), 2, 3).await.unwrap();
+
+        assert_eq!(out.pages, 3, "stops at max_pages");
+        assert!(out.truncated, "hitting the page cap must surface as truncated");
+    }
+
+    #[tokio::test]
+    async fn paged_history_pages_from_the_lowest_id_numerically() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        // Ids 100 and 99: a string comparison would page from "99" (wrong, it
+        // is the larger string) — the walk must page from 99 as a NUMBER.
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/trades"))
+            .and(query_param("count", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(closed_page(&[100, 99], 24)))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/trades"))
+            .and(query_param("beforeID", "99"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(closed_page(&[98], 24)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let out = get_closed_trades_since(&client, None, 2, 10).await.unwrap();
+
+        assert_eq!(out.trades.len(), 3);
+        assert_eq!(out.pages, 2);
+    }
+
+    #[tokio::test]
+    async fn paged_history_handles_an_empty_account() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/trades"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "trades": [], "lastTransactionID": "1" })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let out = get_closed_trades_since(&client, None, 500, 10).await.unwrap();
+
+        assert!(out.trades.is_empty());
+        assert!(!out.truncated);
     }
 
     fn mock_positions_response() -> serde_json::Value {

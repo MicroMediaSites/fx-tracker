@@ -140,12 +140,17 @@ struct HistoryArgs {
     /// the account's recorded baseline (its experiment start).
     #[arg(long)]
     since: Option<String>,
-    /// How many recent closed trades to pull from OANDA before filtering to the
-    /// window. OANDA caps this at 500 and returns newest-first, so a
-    /// high-frequency account can outgrow its baseline window — the response
-    /// says so via `truncated` rather than quietly showing a partial history.
+    /// Trades per OANDA request. Capped at 500 by the API; the walk pages with
+    /// `beforeID` until the window is covered, so this is a page size, not a
+    /// ceiling on the result.
     #[arg(long, default_value_t = 500)]
     limit: u32,
+    /// Safety bound on how many pages the walk will fetch. 20 pages × 500 =
+    /// 10,000 trades, comfortably past any of these accounts' history. Hitting
+    /// it sets `truncated` in the response rather than silently returning a
+    /// partial record.
+    #[arg(long, default_value_t = 20)]
+    max_pages: usize,
 }
 
 #[derive(Args, Debug)]
@@ -1707,14 +1712,16 @@ async fn history(
     };
 
     let (_, oanda) = client::resolve(env_raw, account)?;
-    let fetched = endpoints::get_trade_history(&oanda, Some(h.limit), None)
+    // Pages with `beforeID` until the window is covered. A single request caps
+    // at 500 newest-first, which a ~30-trades/day watcher outgrows in under
+    // three weeks — so without paging an old baseline silently falls off the
+    // end of the history.
+    let paged = endpoints::get_closed_trades_since(&oanda, since, h.limit, h.max_pages)
         .await
         .context("OANDA closed-trade history fetch failed")?;
-
-    // OANDA returns newest-first and caps `count`. If it handed back exactly
-    // the limit, older trades in the window almost certainly exist beyond it —
-    // say so rather than let a partial history read as complete.
-    let truncated = fetched.len() as u32 >= h.limit;
+    let truncated = paged.truncated;
+    let pages = paged.pages;
+    let fetched = paged.trades;
 
     // `closed_since` already returns newest-first; the no-window branch sorts
     // to match, so there is one sort on each path and none after.
@@ -1745,6 +1752,9 @@ async fn history(
         // several fills — see `history_row`.
         "blended_exits": blended,
         "truncated": truncated,
+        // How many OANDA requests the walk took — surfaced so a slow response
+        // is explicable rather than mysterious.
+        "pages": pages,
         "trades": trades.iter().map(history_row).collect::<Vec<_>>(),
     }))
 }
