@@ -1266,7 +1266,12 @@ fn spawn_queue_tail(
     tx: UnboundedSender<FeedEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut seen = alert_queue::list_at(&queue_path).map(|e| e.len()).unwrap_or(0);
+        // Seeded on the last id, not the length: retention rotates this file,
+        // and a remembered count would stall the tail (or skip entries) the
+        // first time the live file shrank underneath it.
+        let mut last_id = alert_queue::list_at(&queue_path)
+            .ok()
+            .and_then(|e| e.last().map(|entry| entry.id.clone()));
         let mut ticker = tokio::time::interval(Duration::from_millis(750));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1275,17 +1280,16 @@ fn spawn_queue_tail(
                 Ok(e) => e,
                 Err(_) => continue, // transient read failure; keep polling
             };
-            if entries.len() <= seen {
-                continue;
-            }
-            for entry in &entries[seen..] {
+            for entry in alert_queue::entries_after(&entries, last_id.as_deref()) {
                 if let Some(p) = entry.promotable_proposal() {
                     if p.instrument == instrument && tx.send(FeedEvent::Proposal(p.clone())).is_err() {
                         return; // ticket loop is gone
                     }
                 }
             }
-            seen = entries.len();
+            if let Some(last) = entries.last() {
+                last_id = Some(last.id.clone());
+            }
         }
     })
 }

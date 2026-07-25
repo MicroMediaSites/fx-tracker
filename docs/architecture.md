@@ -461,3 +461,11 @@ window is a read-only client of its outputs:
 Approval of a pending signal is deliberately NOT an app action — it is the
 CLI's `wickd approve <id>` (the semi-auto trust ladder). The app renders the
 queue and offers the command to copy.
+
+The signal feed is bounded by **rotation**, not by a rewrite (AGT-777): past
+`MAX_QUEUE_BYTES` the next append renames the file to `alert-queue.1.ndjson`
+(two generations kept) and starts a fresh one. Rewriting it in place the way
+`feed.ndjson` is pruned would silently destroy anything the *other* writer
+appended mid-operation — the queue has two independent writer processes
+(`signal_alert.rs`, `sink.rs`). Readers take the tail through the archives, so
+rotation is invisible to `daemon_queue_list` and `wickd queue list`.
