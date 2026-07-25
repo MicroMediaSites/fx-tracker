@@ -38,8 +38,13 @@ export interface AccountHistory {
   realized: string;
   /** How many trades in this window had a blended (multi-fill) exit. */
   blended_exits: number;
-  /** True when OANDA's fetch cap was hit and older trades may exist. */
+  /**
+   * True when the paged walk hit its page budget with history still unread —
+   * the result does NOT reach back to `since`.
+   */
   truncated: boolean;
+  /** How many OANDA requests the paged walk took. */
+  pages?: number;
   trades: HistoryTrade[];
 }
 
