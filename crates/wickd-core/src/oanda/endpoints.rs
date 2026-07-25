@@ -973,6 +973,15 @@ mod tests {
                     "clientExtensions": {
                         "tag": "ma-crossover",
                         "comment": "wickd strategy=ma-crossover"
+                    },
+                    // The trade-level twin is the load-bearing one: only this
+                    // survives onto the trade record read back from `/trades`.
+                    // The original test asserted only the order-level field, so
+                    // it passed for months while every closed trade came back
+                    // unattributed. Both are required now.
+                    "tradeClientExtensions": {
+                        "tag": "ma-crossover",
+                        "comment": "wickd strategy=ma-crossover"
                     }
                 }
             })))
@@ -981,7 +990,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // Without the clientExtensions in the body, the matcher above would not
+        // Without BOTH extensions in the body, the matcher above would not
         // match and this call would fail — so a passing unwrap IS the assertion.
         let result = place_market_order_attributed(
             &client,

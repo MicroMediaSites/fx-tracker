@@ -100,6 +100,9 @@ enum TradeCmd {
     /// One-line performance summary for EVERY configured account in --env over
     /// a rolling recent window. Ignores --account (it spans all of them).
     Glance(GlanceArgs),
+    /// Closed-trade history for --account with entry and exit detail, since the
+    /// account's baseline (its experiment start) unless --since overrides.
+    History(HistoryArgs),
     /// Record or inspect an account's performance baseline (AGT-631).
     Baseline(BaselineArgs),
 }
@@ -128,6 +131,20 @@ struct GlanceArgs {
     /// the window. Default 200 — the glance is a summary, not an audit; raise
     /// it for a high-frequency account whose window truncates.
     #[arg(long, default_value_t = 200)]
+    limit: u32,
+}
+
+#[derive(Args, Debug)]
+struct HistoryArgs {
+    /// Window start — an ISO date (YYYY-MM-DD) or RFC3339 instant. Defaults to
+    /// the account's recorded baseline (its experiment start).
+    #[arg(long)]
+    since: Option<String>,
+    /// How many recent closed trades to pull from OANDA before filtering to the
+    /// window. OANDA caps this at 500 and returns newest-first, so a
+    /// high-frequency account can outgrow its baseline window — the response
+    /// says so via `truncated` rather than quietly showing a partial history.
+    #[arg(long, default_value_t = 500)]
     limit: u32,
 }
 
@@ -459,6 +476,7 @@ async fn dispatch(args: TradeArgs, _out: Out) -> Result<serde_json::Value> {
         TradeCmd::Close(c) => close(env, &args.account, c).await,
         TradeCmd::Report(r) => report(env, &args.env, &args.account, r).await,
         TradeCmd::Glance(g) => glance(env, &args.env, g).await,
+        TradeCmd::History(h) => history(env, &args.env, &args.account, h).await,
         TradeCmd::Baseline(b) => baseline_cmd(env, &args.env, &args.account, b).await,
     }
 }
@@ -1618,6 +1636,119 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
     }))
 }
 
+/// Render one closed trade with its entry and exit detail. Pure and
+/// unit-tested.
+///
+/// `exit_count` drives an honesty flag rather than being cosmetic: OANDA's
+/// `averageClosePrice` (this trade's `close_price`) is blended across every
+/// exit, so on a multi-exit trade it is not a price anything filled at.
+/// `blended_exit` tells the UI to say "3 exits (avg)" instead of presenting it
+/// as *the* exit. `/trades` cannot decompose the blend — that needs the
+/// transactions endpoint, which wickd does not have yet.
+fn history_row(t: &Trade) -> serde_json::Value {
+    let side = if t.units > Decimal::ZERO { "long" } else { "short" };
+    let duration_secs = match (t.close_time, t.open_time) {
+        (Some(close), open) => Some((close - open).num_seconds()),
+        _ => None,
+    };
+
+    serde_json::json!({
+        "id": t.id,
+        "instrument": t.instrument,
+        "side": side,
+        "units": dec_str(t.units.abs()),
+        "strategy": t.strategy,
+        "entry": {
+            "time": t.open_time.to_rfc3339(),
+            "price": dec_str(t.open_price),
+        },
+        "exit": {
+            "time": t.close_time.map(|ct| ct.to_rfc3339()),
+            "price": t.close_price.map(dec_str),
+            "count": t.exit_count,
+            // True when `price` is an average across several fills rather than
+            // a real one. The UI must not present it as a single exit.
+            "blended": t.exit_count > 1,
+        },
+        "realized_pl": dec_str(t.realized_pl),
+        "duration_secs": duration_secs,
+    })
+}
+
+/// `wickd trade history --account <name>`: the account's closed trades with
+/// entry/exit detail, newest first, since its experiment start.
+///
+/// Deliberately more forgiving than `report`, which hard-fails without a
+/// baseline. An un-baselined account still has a history worth seeing, so this
+/// falls back to whatever the fetch window covers and reports
+/// `baseline: null` — the caller can say "since the start of available
+/// history" rather than showing nothing. (That is not hypothetical: `tf-m30`
+/// has no baseline row of its own; its start was recorded under the alias
+/// `default`, since both names resolve to the same OANDA account.)
+async fn history(
+    env: OandaEnvironment,
+    env_raw: &str,
+    account: &str,
+    h: HistoryArgs,
+) -> Result<serde_json::Value> {
+    // Baseline lookup is best-effort: a missing baselines.db must not stop a
+    // history that OANDA can serve perfectly well without it.
+    let baseline = baseline::open()
+        .ok()
+        .and_then(|conn| baseline::latest(&conn, account).ok().flatten());
+
+    let since = match (&h.since, &baseline) {
+        (Some(s), _) => Some(parse_baseline_date(s).context("invalid --since")?),
+        (None, Some(b)) => Some(
+            parse_baseline_date(&b.baseline_date)
+                .context("stored baseline_date is not a valid date")?,
+        ),
+        (None, None) => None,
+    };
+
+    let (_, oanda) = client::resolve(env_raw, account)?;
+    let fetched = endpoints::get_trade_history(&oanda, Some(h.limit), None)
+        .await
+        .context("OANDA closed-trade history fetch failed")?;
+
+    // OANDA returns newest-first and caps `count`. If it handed back exactly
+    // the limit, older trades in the window almost certainly exist beyond it —
+    // say so rather than let a partial history read as complete.
+    let truncated = fetched.len() as u32 >= h.limit;
+
+    // `closed_since` already returns newest-first; the no-window branch sorts
+    // to match, so there is one sort on each path and none after.
+    let trades = match since {
+        Some(s) => closed_since(fetched, s),
+        None => {
+            let mut all = fetched;
+            all.sort_by(|a, b| b.close_time.cmp(&a.close_time));
+            all
+        }
+    };
+
+    let realized: Decimal = trades.iter().map(|t| t.realized_pl).sum();
+    let blended = trades.iter().filter(|t| t.exit_count > 1).count();
+
+    Ok(serde_json::json!({
+        "account": account,
+        "account_id": oanda.account_id(),
+        "environment": env_str(env),
+        "baseline": baseline.as_ref().map(|b| serde_json::json!({
+            "balance": b.balance,
+            "date": b.baseline_date,
+        })),
+        "since": since.map(|s| s.to_rfc3339()),
+        "count": trades.len(),
+        "realized": dec_str(realized),
+        // Non-zero means at least one trade's exit price is an average across
+        // several fills — see `history_row`.
+        "blended_exits": blended,
+        "truncated": truncated,
+        "trades": trades.iter().map(history_row).collect::<Vec<_>>(),
+    }))
+}
+
 /// `wickd trade baseline …` (AGT-631, AC1): record or inspect an account's
 /// performance baseline.
 async fn baseline_cmd(
@@ -1727,6 +1858,8 @@ mod tests {
             close_time: Some(dt(close)),
             close_price: Some(dec!(1.0)),
             strategy: strategy.map(|s| s.to_string()),
+            // A clean single exit — the ordinary case for a wickd trade.
+            exit_count: 1,
         }
     }
 
@@ -1799,6 +1932,72 @@ mod tests {
         assert_eq!(row["realized"], "0");
         // Null, never 0 — the UI must render "—" for "nothing decided yet".
         assert!(row["win_rate"].is_null());
+    }
+
+    // ── trade history rows (entry/exit detail + blended-exit honesty) ──────
+
+    fn trade_with_exits(
+        realized: Decimal,
+        open_price: Decimal,
+        close_price: Decimal,
+        exit_count: usize,
+    ) -> Trade {
+        Trade {
+            id: "t1".into(),
+            instrument: "EUR_USD".into(),
+            open_price,
+            open_time: dt("2026-07-20T09:00:00Z"),
+            units: dec!(2000),
+            realized_pl: realized,
+            unrealized_pl: None,
+            state: TradeState::Closed,
+            close_time: Some(dt("2026-07-20T09:12:00Z")),
+            close_price: Some(close_price),
+            strategy: Some("rahagod".into()),
+            exit_count,
+        }
+    }
+
+    #[test]
+    fn history_row_reports_entry_exit_side_and_duration() {
+        let row = history_row(&trade_with_exits(dec!(4.2), dec!(1.14000), dec!(1.14021), 1));
+
+        assert_eq!(row["side"], "long");
+        assert_eq!(row["units"], "2000");
+        assert_eq!(row["entry"]["price"], "1.14000");
+        assert_eq!(row["exit"]["price"], "1.14021");
+        assert_eq!(row["realized_pl"], "4.2");
+        assert_eq!(row["duration_secs"], 12 * 60);
+        assert_eq!(row["strategy"], "rahagod");
+    }
+
+    #[test]
+    fn history_row_marks_a_short_by_sign_but_reports_absolute_units() {
+        let mut t = trade_with_exits(dec!(-1.0), dec!(1.14000), dec!(1.14010), 1);
+        t.units = dec!(-2000);
+        let row = history_row(&t);
+
+        assert_eq!(row["side"], "short");
+        // Size is shown unsigned; the side pill carries direction.
+        assert_eq!(row["units"], "2000");
+    }
+
+    #[test]
+    fn history_row_single_exit_is_not_blended() {
+        let row = history_row(&trade_with_exits(dec!(1.0), dec!(1.1), dec!(1.2), 1));
+
+        assert_eq!(row["exit"]["count"], 1);
+        assert_eq!(row["exit"]["blended"], false);
+    }
+
+    #[test]
+    fn history_row_multi_exit_is_flagged_blended() {
+        // The close_price is OANDA's averageClosePrice across the exits, not a
+        // real fill — the flag is what stops the UI presenting it as one.
+        let row = history_row(&trade_with_exits(dec!(3.0), dec!(1.1), dec!(1.15), 3));
+
+        assert_eq!(row["exit"]["count"], 3);
+        assert_eq!(row["exit"]["blended"], true);
     }
 
     #[test]
