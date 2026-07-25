@@ -429,10 +429,9 @@ async fn assemble_context(args: &TickArgs, feed_path: &PathBuf) -> Result<FeedCo
         .and_then(pending::list_at)
         .unwrap_or_default();
     let recent_alerts = alert_queue::queue_path()
-        .and_then(alert_queue::list_at)
+        .and_then(|p| alert_queue::list_tail_at(p, PROMPT_HISTORY_ITEMS))
         .map(|mut v| {
-            v.reverse();
-            v.truncate(PROMPT_HISTORY_ITEMS);
+            v.reverse(); // newest first for the prompt
             v
         })
         .unwrap_or_default();
@@ -707,10 +706,9 @@ async fn ask(args: AskArgs, out: Out) -> ! {
     // raw fires are the log the trader actually wants to query. Best-effort:
     // an unreadable queue must not fail the question.
     let recent_alerts = alert_queue::queue_path()
-        .and_then(alert_queue::list_at)
+        .and_then(|p| alert_queue::list_tail_at(p, PROMPT_HISTORY_ITEMS))
         .map(|mut v| {
-            v.reverse();
-            v.truncate(PROMPT_HISTORY_ITEMS);
+            v.reverse(); // newest first for the prompt
             v
         })
         .unwrap_or_default();

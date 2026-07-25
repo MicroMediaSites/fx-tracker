@@ -101,11 +101,11 @@ fn classify(msg: &str) -> i32 {
 
 fn list(args: ListArgs) -> Result<serde_json::Value> {
     let path = alert_queue::queue_path()?;
-    let mut entries = alert_queue::list_at(&path)?;
-    // Keep the most-recent `limit`, still in oldest-first (tail) order.
-    if entries.len() > args.limit {
-        entries = entries.split_off(entries.len() - args.limit);
-    }
+    // The most-recent `limit`, oldest-first (tail order). Tailing rather than
+    // reading-then-truncating also reaches through a rotation: right after one
+    // the live file holds a couple of entries, and `list_tail_at` tops the
+    // window up from the archives instead of returning a short list.
+    let entries = alert_queue::list_tail_at(&path, args.limit)?;
     Ok(serde_json::json!({
         "count": entries.len(),
         "queue": entries,
@@ -120,14 +120,16 @@ async fn follow(limit: usize, out: Out) -> ! {
         Err(e) => out.fail(exit::GENERIC, "queue_failed", format!("{e:#}")),
     };
 
-    // Seed with the existing tail (bounded by `limit`), emitting each as a line.
-    let mut seen = match alert_queue::list_at(&path) {
+    // Seed with the existing tail (bounded by `limit`), emitting each as a
+    // line, and remember the last id rather than a count — a count would break
+    // the first time retention rotates the queue out from under this loop
+    // (`alert_queue::entries_after`).
+    let mut last_id = match alert_queue::list_tail_at(&path, limit) {
         Ok(entries) => {
-            let start = entries.len().saturating_sub(limit);
-            for entry in &entries[start..] {
+            for entry in &entries {
                 emit_line(entry);
             }
-            entries.len()
+            entries.last().map(|e| e.id.clone())
         }
         Err(e) => out.fail(exit::GENERIC, "queue_failed", format!("{e:#}")),
     };
@@ -138,13 +140,14 @@ async fn follow(limit: usize, out: Out) -> ! {
             _ = tokio::signal::ctrl_c() => std::process::exit(exit::OK),
             _ = ticker.tick() => {
                 match alert_queue::list_at(&path) {
-                    Ok(entries) if entries.len() > seen => {
-                        for entry in &entries[seen..] {
+                    Ok(entries) => {
+                        for entry in alert_queue::entries_after(&entries, last_id.as_deref()) {
                             emit_line(entry);
                         }
-                        seen = entries.len();
+                        if let Some(last) = entries.last() {
+                            last_id = Some(last.id.clone());
+                        }
                     }
-                    Ok(_) => {}
                     // A transient read error mid-tail shouldn't kill the follow;
                     // report it and keep polling.
                     Err(e) => eprintln!("warning: alert queue read failed: {e:#}"),
