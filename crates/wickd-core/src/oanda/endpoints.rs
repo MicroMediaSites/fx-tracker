@@ -65,10 +65,15 @@ pub async fn get_trade_history(
 /// One page of closed trades older than `before_id` (OANDA `beforeID`), newest
 /// first. `None` starts at the newest trade. This is the paging primitive
 /// behind [`get_closed_trades_since`].
+///
+/// `before_id` is a `u64`, not a string, deliberately: it is interpolated into
+/// the query string, and a numeric type makes query injection impossible by
+/// construction rather than by the caller remembering to sanitise. OANDA trade
+/// ids are numeric, so nothing is lost.
 pub async fn get_trades_before(
     client: &OandaClient,
     count: Option<u32>,
-    before_id: Option<&str>,
+    before_id: Option<u64>,
 ) -> Result<Vec<Trade>> {
     let mut url = format!(
         "{}/v3/accounts/{}/trades",
@@ -124,22 +129,19 @@ pub async fn get_closed_trades_since(
     max_pages: usize,
 ) -> Result<PagedHistory> {
     let mut all: Vec<Trade> = Vec::new();
-    let mut before_id: Option<String> = None;
+    let mut before_id: Option<u64> = None;
     let mut pages = 0usize;
 
     while pages < max_pages {
-        let page = get_trades_before(client, Some(page_size), before_id.as_deref()).await?;
+        let page = get_trades_before(client, Some(page_size), before_id).await?;
         pages += 1;
         let page_len = page.len();
 
-        // The next page starts below the lowest id we have seen. Ids are
-        // numeric strings; parse for the comparison so "9" doesn't sort above
-        // "10", and skip any unparseable id rather than paging from garbage.
-        let min_id = page
-            .iter()
-            .filter_map(|t| t.id.parse::<u64>().ok().map(|n| (n, t.id.clone())))
-            .min_by_key(|(n, _)| *n)
-            .map(|(_, id)| id);
+        // The next page starts below the lowest id seen. Ids arrive as numeric
+        // strings; compare them as NUMBERS so "99" doesn't sort above "100"
+        // (which would re-request the same page forever). An unparseable id is
+        // skipped rather than paged from.
+        let min_id = page.iter().filter_map(|t| t.id.parse::<u64>().ok()).min();
 
         // Does this page already reach past the window?
         let reached = match oldest_wanted {
@@ -797,11 +799,20 @@ mod tests {
 
         // Every page is full and never reaches the cutoff, so the walk runs out
         // of budget. That MUST be reported, not silently returned as complete.
-        Mock::given(method("GET"))
-            .and(path("/v3/accounts/test-account-123/trades"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(closed_page(&[300, 299], 24)))
-            .mount(&mock_server)
-            .await;
+        //
+        // Three mocks, each answering once, consumed in registration order —
+        // so successive requests get DISTINCT descending ids the way a real
+        // endpoint would. A single always-the-same-page mock would satisfy the
+        // pages/truncated assertions while quietly filling `trades` with
+        // duplicates, which the id-uniqueness assertion below would miss.
+        for ids in [[300u64, 299], [298, 297], [296, 295]] {
+            Mock::given(method("GET"))
+                .and(path("/v3/accounts/test-account-123/trades"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(closed_page(&ids, 24)))
+                .up_to_n_times(1)
+                .mount(&mock_server)
+                .await;
+        }
 
         let cut = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
             .unwrap()
@@ -810,6 +821,12 @@ mod tests {
 
         assert_eq!(out.pages, 3, "stops at max_pages");
         assert!(out.truncated, "hitting the page cap must surface as truncated");
+        // Every page advanced: no id appears twice. This is what makes the
+        // mock a faithful stand-in rather than a loop that merely satisfies
+        // the counters above.
+        let ids: Vec<&str> = out.trades.iter().map(|t| t.id.as_str()).collect();
+        let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), unique.len(), "paging must not re-request a page: {ids:?}");
     }
 
     #[tokio::test]
