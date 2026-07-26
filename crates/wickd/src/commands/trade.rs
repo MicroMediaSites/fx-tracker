@@ -52,9 +52,12 @@ use clap::{Args, Subcommand, ValueEnum};
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 
+use std::collections::HashMap;
+
 use wickd_core::config::OandaEnvironment;
 use wickd_core::models::Trade;
 use wickd_core::oanda::endpoints;
+use wickd_core::trade_fills::{self, TradeFills};
 use wickd_core::oanda::types::{
     EntryOptions, EntryOrderRequest, EntryOrderType, OandaAccount, OrderCreateResponse, TimeInForce,
     TriggerCondition,
@@ -1650,11 +1653,33 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
 /// `blended_exit` tells the UI to say "3 exits (avg)" instead of presenting it
 /// as *the* exit. `/trades` cannot decompose the blend — that needs the
 /// transactions endpoint, which wickd does not have yet.
-fn history_row(t: &Trade) -> serde_json::Value {
+fn history_row(t: &Trade, fills: Option<&TradeFills>) -> serde_json::Value {
     let side = if t.units > Decimal::ZERO { "long" } else { "short" };
     let duration_secs = match (t.close_time, t.open_time) {
         (Some(close), open) => Some((close - open).num_seconds()),
         _ => None,
+    };
+
+    // AGT-782: the real fills behind the blended `exit`, when the transaction
+    // feed covered them and they reconcile. `null` — not `[]` — when there is
+    // no decomposition, so "we did not decompose this" cannot be misread as
+    // "this trade had no exits".
+    let exits = match fills.filter(|f| f.is_showable()) {
+        Some(f) => serde_json::Value::Array(
+            f.exits
+                .iter()
+                .map(|fill| {
+                    serde_json::json!({
+                        "transaction_id": fill.transaction_id,
+                        "time": fill.time,
+                        "price": dec_str(fill.price),
+                        "units": dec_str(fill.units),
+                        "realized_pl": dec_str(fill.realized_pl),
+                    })
+                })
+                .collect(),
+        ),
+        None => serde_json::Value::Null,
     };
 
     serde_json::json!({
@@ -1675,6 +1700,10 @@ fn history_row(t: &Trade) -> serde_json::Value {
             // a real one. The UI must not present it as a single exit.
             "blended": t.exit_count > 1,
         },
+        // Each real exit fill, oldest first — or null when the trade was not
+        // decomposed (no transaction coverage, or a decomposition that did not
+        // reconcile). `exit.blended` keeps its meaning either way.
+        "exits": exits,
         "realized_pl": dec_str(t.realized_pl),
         "duration_secs": duration_secs,
     })
@@ -1737,6 +1766,36 @@ async fn history(
     let realized: Decimal = trades.iter().map(|t| t.realized_pl).sum();
     let blended = trades.iter().filter(|t| t.exit_count > 1).count();
 
+    // AGT-782: decompose the blended exits into the fills that made them.
+    //
+    // Only worth a fetch when a trade actually has more than one exit — for a
+    // single-exit trade `close_price` IS the fill price, so the feed would
+    // confirm what is already shown at the cost of a request. Best-effort
+    // throughout: a history OANDA can serve must not fail because the
+    // transaction feed could not be read, so a failure falls back to the
+    // blended display and is reported rather than swallowed.
+    let mut decompose_error: Option<String> = None;
+    let fills = if blended > 0 {
+        match trade_fills::covering_id_range(&trades) {
+            Some((from_id, to_id)) => {
+                match endpoints::get_transactions_idrange(&oanda, from_id, to_id).await {
+                    Ok(transactions) => trade_fills::decompose(&trades, &transactions),
+                    Err(e) => {
+                        decompose_error = Some(format!("{e}"));
+                        HashMap::new()
+                    }
+                }
+            }
+            None => HashMap::new(),
+        }
+    } else {
+        HashMap::new()
+    };
+    let decomposed = trades
+        .iter()
+        .filter(|t| fills.get(&t.id).is_some_and(TradeFills::is_showable))
+        .count();
+
     Ok(serde_json::json!({
         "account": account,
         "account_id": oanda.account_id(),
@@ -1751,11 +1810,21 @@ async fn history(
         // Non-zero means at least one trade's exit price is an average across
         // several fills — see `history_row`.
         "blended_exits": blended,
+        // How many of those the transaction feed could break back down into
+        // real fills (AGT-782). Below `blended_exits` means some trade kept its
+        // average: the feed did not cover it, or its fills did not reconcile.
+        "decomposed_exits": decomposed,
+        // Why the decomposition did not run, when it was wanted but failed.
+        // Null on the ordinary paths — nothing to decompose, or it worked.
+        "decompose_error": decompose_error,
         "truncated": truncated,
         // How many OANDA requests the walk took — surfaced so a slow response
         // is explicable rather than mysterious.
         "pages": pages,
-        "trades": trades.iter().map(history_row).collect::<Vec<_>>(),
+        "trades": trades
+            .iter()
+            .map(|t| history_row(t, fills.get(&t.id)))
+            .collect::<Vec<_>>(),
     }))
 }
 
@@ -1870,6 +1939,7 @@ mod tests {
             strategy: strategy.map(|s| s.to_string()),
             // A clean single exit — the ordinary case for a wickd trade.
             exit_count: 1,
+            closing_transaction_ids: vec!["9001".into()],
         }
     }
 
@@ -1965,12 +2035,13 @@ mod tests {
             close_price: Some(close_price),
             strategy: Some("rahagod".into()),
             exit_count,
+            closing_transaction_ids: (0..exit_count).map(|n| (9000 + n).to_string()).collect(),
         }
     }
 
     #[test]
     fn history_row_reports_entry_exit_side_and_duration() {
-        let row = history_row(&trade_with_exits(dec!(4.2), dec!(1.14000), dec!(1.14021), 1));
+        let row = history_row(&trade_with_exits(dec!(4.2), dec!(1.14000), dec!(1.14021), 1), None);
 
         assert_eq!(row["side"], "long");
         assert_eq!(row["units"], "2000");
@@ -1985,7 +2056,7 @@ mod tests {
     fn history_row_marks_a_short_by_sign_but_reports_absolute_units() {
         let mut t = trade_with_exits(dec!(-1.0), dec!(1.14000), dec!(1.14010), 1);
         t.units = dec!(-2000);
-        let row = history_row(&t);
+        let row = history_row(&t, None);
 
         assert_eq!(row["side"], "short");
         // Size is shown unsigned; the side pill carries direction.
@@ -1994,7 +2065,7 @@ mod tests {
 
     #[test]
     fn history_row_single_exit_is_not_blended() {
-        let row = history_row(&trade_with_exits(dec!(1.0), dec!(1.1), dec!(1.2), 1));
+        let row = history_row(&trade_with_exits(dec!(1.0), dec!(1.1), dec!(1.2), 1), None);
 
         assert_eq!(row["exit"]["count"], 1);
         assert_eq!(row["exit"]["blended"], false);
@@ -2004,10 +2075,90 @@ mod tests {
     fn history_row_multi_exit_is_flagged_blended() {
         // The close_price is OANDA's averageClosePrice across the exits, not a
         // real fill — the flag is what stops the UI presenting it as one.
-        let row = history_row(&trade_with_exits(dec!(3.0), dec!(1.1), dec!(1.15), 3));
+        let row = history_row(&trade_with_exits(dec!(3.0), dec!(1.1), dec!(1.15), 3), None);
 
         assert_eq!(row["exit"]["count"], 3);
         assert_eq!(row["exit"]["blended"], true);
+    }
+
+    // ── per-exit decomposition on the row (AGT-782) ───────────────────────
+
+    fn fill(txid: &str, price: &str, units: &str, pl: &str) -> wickd_core::trade_fills::Fill {
+        wickd_core::trade_fills::Fill {
+            transaction_id: txid.into(),
+            time: "2026-07-20T09:10:00Z".into(),
+            price: price.parse().unwrap(),
+            units: units.parse().unwrap(),
+            realized_pl: pl.parse().unwrap(),
+        }
+    }
+
+    // AC1: each exit reported with its own price, units and realized P&L.
+    #[test]
+    fn history_row_carries_each_real_exit_when_decomposed() {
+        let t = trade_with_exits(dec!(3.0), dec!(1.1), dec!(1.15), 2);
+        let fills = TradeFills {
+            entry: None,
+            exits: vec![
+                fill("9000", "1.14000", "-1200", "1.2000"),
+                fill("9001", "1.16000", "-800", "1.8000"),
+            ],
+            reconciled: true,
+        };
+
+        let row = history_row(&t, Some(&fills));
+
+        let exits = row["exits"].as_array().expect("decomposed rows");
+        assert_eq!(exits.len(), 2);
+        // Prices keep OANDA's precision rather than being normalized.
+        assert_eq!(exits[0]["price"], "1.14000");
+        assert_eq!(exits[0]["units"], "-1200");
+        assert_eq!(exits[0]["realized_pl"], "1.2000");
+        assert_eq!(exits[1]["transaction_id"], "9001");
+        // The blended flag keeps its meaning: `exit.price` is STILL an average.
+        assert_eq!(row["exit"]["blended"], true);
+        assert_eq!(row["exit"]["price"], "1.15");
+    }
+
+    // AC4: no decomposition → the blended display, and `exits` is null rather
+    // than an empty array that would read as "this trade had no exits".
+    #[test]
+    fn history_row_exits_are_null_without_a_decomposition() {
+        let row = history_row(&trade_with_exits(dec!(3.0), dec!(1.1), dec!(1.15), 3), None);
+
+        assert!(row["exits"].is_null());
+        assert_eq!(row["exit"]["blended"], true);
+    }
+
+    // AC3: a decomposition that did not reconcile must not be shown — a
+    // partial set of rows presented as the whole set is the worse lie.
+    #[test]
+    fn history_row_hides_a_decomposition_that_did_not_reconcile() {
+        let t = trade_with_exits(dec!(3.0), dec!(1.1), dec!(1.15), 2);
+        let unreconciled = TradeFills {
+            entry: None,
+            // Only one of the two exits was covered by the fetched range.
+            exits: vec![fill("9000", "1.14000", "-1200", "1.2000")],
+            reconciled: false,
+        };
+
+        let row = history_row(&t, Some(&unreconciled));
+
+        assert!(row["exits"].is_null(), "falls back to blended rather than showing a partial set");
+    }
+
+    #[test]
+    fn history_row_shape_is_unchanged_for_an_undecomposed_trade() {
+        // AC5: everything a consumer reads today still reads the same; the
+        // decomposition only ever ADDS `exits`.
+        let row = history_row(&trade_with_exits(dec!(4.2), dec!(1.14000), dec!(1.14021), 1), None);
+
+        assert_eq!(row["entry"]["price"], "1.14000");
+        assert_eq!(row["exit"]["price"], "1.14021");
+        assert_eq!(row["exit"]["count"], 1);
+        assert_eq!(row["exit"]["blended"], false);
+        assert_eq!(row["realized_pl"], "4.2");
+        assert_eq!(row["strategy"], "rahagod");
     }
 
     #[test]

@@ -58,6 +58,18 @@ pub struct Trade {
     /// broker-side SL/TP interacting with a partial fill.
     #[serde(default)]
     pub exit_count: usize,
+    /// The transactions that closed this trade — the same set `exit_count`
+    /// counts, kept as ids rather than only a length (AGT-782).
+    ///
+    /// These are the handles that let a decomposition bound its fetch: a
+    /// trade's own id is the transaction that opened it, so a set of trades
+    /// spans `min(trade ids) ..= max(closing ids)` and nothing wider needs
+    /// reading. See [`crate::trade_fills::covering_id_range`].
+    ///
+    /// `exit_count` is retained alongside rather than derived from this,
+    /// because it is part of the serialized shape consumers already read.
+    #[serde(default)]
+    pub closing_transaction_ids: Vec<String>,
 }
 
 impl Trade {
@@ -131,6 +143,7 @@ impl From<OandaTrade> for Trade {
             // per-exit handle `/trades` gives, and without it `close_price`
             // (a blended average) is indistinguishable from a real fill price.
             exit_count: oanda.closing_transaction_ids.len(),
+            closing_transaction_ids: oanda.closing_transaction_ids,
         }
     }
 }
