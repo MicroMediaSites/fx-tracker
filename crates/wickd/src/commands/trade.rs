@@ -58,6 +58,7 @@ use wickd_core::config::OandaEnvironment;
 use wickd_core::models::Trade;
 use wickd_core::oanda::endpoints;
 use wickd_core::oanda::position_mode;
+use wickd_core::oanda::types::CloseUnits;
 use wickd_core::trade_fills::{self, TradeFills};
 use wickd_core::oanda::types::{
     EntryOptions, EntryOrderRequest, EntryOrderType, OandaAccount, OrderCreateResponse, TimeInForce,
@@ -367,11 +368,22 @@ impl EntryPlan {
 
 #[derive(Args, Debug)]
 struct CloseArgs {
-    #[arg(long)]
-    instrument: String,
+    /// The instrument to close a whole side of. Required unless --trade-id
+    /// names a single trade instead.
+    #[arg(long, required_unless_present = "trade_id", conflicts_with = "trade_id")]
+    instrument: Option<String>,
     /// Which side to close: long | short.
+    #[arg(long, required_unless_present = "trade_id", conflicts_with = "trade_id")]
+    side: Option<String>,
+    /// Close ONE trade by its OANDA trade id, rather than a whole side of an
+    /// instrument (AGT-780). This is the precise close: on a side with several
+    /// trades open, --instrument/--side would take out all of them.
     #[arg(long)]
-    side: String,
+    trade_id: Option<String>,
+    /// How many units of --trade-id to close. Omit to close the whole trade.
+    /// A positive magnitude, not the trade's signed units.
+    #[arg(long, requires = "trade_id")]
+    units: Option<Decimal>,
     /// Arm a REAL position close. Without it, the close is simulated (paper)
     /// and emitted as JSON without ever contacting OANDA.
     #[arg(long)]
@@ -751,6 +763,23 @@ fn build_paper_close(env: OandaEnvironment, instrument: &str, side: &str) -> ser
     })
 }
 
+/// The paper (dry-run) shape of a close-by-trade-id. Pure, so the contract is
+/// unit-tested without an audit write or a network call.
+fn build_paper_trade_close(
+    env: OandaEnvironment,
+    trade_id: &str,
+    units: CloseUnits,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "mode": Mode::Paper.as_str(),
+        "submitted": false,
+        "environment": env_str(env),
+        "trade_id": trade_id,
+        "units": units.wire(),
+    })
+}
+
 /// `trade place`: a thin adapter over the shared guarded execution path.
 /// Behavior is identical to before the AGT-599 refactor — all the logic now
 /// lives in [`execute_place`], which `approve` also calls.
@@ -1098,18 +1127,139 @@ async fn place_confirmed(
 /// `--auto` selects the non-interactive practice arming; otherwise the default
 /// interactive (TTY-keystroke) arming applies.
 async fn close(env: OandaEnvironment, account: &str, c: CloseArgs) -> Result<serde_json::Value> {
-    if c.auto {
-        execute_close_auto(env, account, &c.instrument, &c.side, c.live).await
-    } else {
-        execute_close_armed(
-            env,
-            account,
-            &c.instrument,
-            &c.side,
-            c.live,
-            Arming::Interactive { yes: c.yes },
-        )
+    let arming =
+        if c.auto { Arming::AutoPractice } else { Arming::Interactive { yes: c.yes } };
+
+    // AGT-780: closing one trade by id goes through the same guarded sequence
+    // as a side close — same arming, same audit ordering, same kill-switch. The
+    // only difference is what gets closed.
+    if let Some(trade_id) = c.trade_id.as_deref() {
+        return execute_close_trade_armed(env, account, trade_id, c.units, c.live, arming).await;
+    }
+
+    // clap guarantees both are present when --trade-id is absent.
+    let instrument = c.instrument.as_deref().unwrap_or_default();
+    let side = c.side.as_deref().unwrap_or_default();
+    execute_close_armed(env, account, instrument, side, c.live, arming).await
+}
+
+/// The guarded close of ONE trade, by id, for all or part of its units
+/// (AGT-780).
+///
+/// Deliberately the same sequence as [`execute_close_armed`] — paper by
+/// default, arming gate, pre-submit audit row, kill-switch, submit, terminal
+/// audit row — because a partial close is no less live execution than a full
+/// one and must be no easier to fire.
+///
+/// It does NOT run the netting assertion (AGT-781). That guard exists because
+/// an instrument+side close is ambiguous on a hedging account; naming the trade
+/// is precisely how you avoid that ambiguity, so this path is safe on either
+/// account type.
+async fn execute_close_trade_armed(
+    env: OandaEnvironment,
+    account: &str,
+    trade_id: &str,
+    units: Option<Decimal>,
+    live: bool,
+    arming: Arming,
+) -> Result<serde_json::Value> {
+    let requested = match units {
+        Some(u) => CloseUnits::Partial(u),
+        None => CloseUnits::All,
+    };
+
+    // Paper (default): emit the would-be close, never submit, never need creds.
+    if execution_mode(live) == Mode::Paper {
+        audit::record_decision(
+            audit::AuditEntry::now("close", Mode::Paper.as_str(), "not_submitted")
+                .env(env_str(env))
+                .detail(Some(format!("trade_id={trade_id} units={}", requested.wire()))),
+        );
+        return Ok(build_paper_trade_close(env, trade_id, requested));
+    }
+
+    arm_live(env, arming, "trade close")?;
+    audit::record_required(
+        &audit::AuditEntry::now("close", Mode::Live.as_str(), "attempt")
+            .env(env_str(env))
+            .detail(Some(format!("trade_id={trade_id} units={}", requested.wire()))),
+    )?;
+    let (_, oanda) = client::resolve(env_str(env), account)?;
+    risk::enforce_live_close(&oanda).await?;
+
+    // Read the trade first: its size is what the requested units are validated
+    // against, and validation happens before anything is submitted.
+    let trade = endpoints::get_trade(&oanda, trade_id)
         .await
+        .with_context(|| format!("could not read trade {trade_id}"))?;
+    let remaining = requested.remaining_of(&trade);
+
+    let response = match endpoints::close_trade(&oanda, &trade, requested)
+        .await
+        .context("OANDA trade close failed")
+    {
+        Ok(r) => r,
+        Err(err) => {
+            // Same contract as every other submit path (AGT-610): a terminal
+            // row always follows the attempt row, including on a rejection.
+            record_submit_terminal_error_default(
+                "close",
+                env,
+                &trade.instrument,
+                None,
+                &None,
+                &None,
+                &None,
+                &err,
+            );
+            return Err(err);
+        }
+    };
+
+    let fill = response.order_fill_transaction;
+    audit::record_decision(
+        audit::AuditEntry::now(
+            "close",
+            Mode::Live.as_str(),
+            if fill.is_some() { "filled" } else { "no_fill" },
+        )
+        .env(env_str(env))
+        .instrument(&trade.instrument)
+        .detail(Some(format!("trade_id={trade_id} units={}", requested.wire()))),
+    );
+
+    match fill {
+        Some(f) => {
+            risk::record_fill(&f.pl);
+            Ok(serde_json::json!({
+                "ok": true,
+                "mode": Mode::Live.as_str(),
+                "submitted": true,
+                "closed": true,
+                "environment": env_str(env),
+                "trade_id": trade_id,
+                "instrument": f.instrument,
+                "units": f.units,
+                // What is left of the trade — zero for a full close. This is
+                // the answer a partial close exists to give.
+                "units_remaining": dec_str(remaining),
+                "price": f.price,
+                "realized_pl": f.pl,
+                "fill_id": f.id,
+                "time": f.time,
+            }))
+        }
+        None => Ok(serde_json::json!({
+            "ok": true,
+            "mode": Mode::Live.as_str(),
+            "submitted": true,
+            "closed": false,
+            "environment": env_str(env),
+            "trade_id": trade_id,
+            "instrument": trade.instrument,
+            "units_remaining": dec_str(trade.units.abs()),
+            "reason": "OANDA accepted the close but reported no fill",
+        })),
     }
 }
 
@@ -2400,18 +2550,78 @@ mod tests {
     #[test]
     fn paper_close_is_a_dry_run() {
         let c = CloseArgs {
-            instrument: "EUR_USD".to_string(),
-            side: "long".to_string(),
+            instrument: Some("EUR_USD".to_string()),
+            side: Some("long".to_string()),
+            trade_id: None,
+            units: None,
             live: false,
             yes: false,
             auto: false,
         };
         assert_eq!(execution_mode(c.live), Mode::Paper);
-        let v = build_paper_close(OandaEnvironment::Practice, &c.instrument, &c.side);
+        let v = build_paper_close(
+            OandaEnvironment::Practice,
+            c.instrument.as_deref().unwrap(),
+            c.side.as_deref().unwrap(),
+        );
         assert_eq!(v["mode"], "paper");
         assert_eq!(v["submitted"], false);
         assert_eq!(v["instrument"], "EUR_USD");
         assert_eq!(v["side"], "long");
+    }
+
+    // ── closing one trade by id (AGT-780) ─────────────────────────────────
+
+    #[test]
+    fn paper_trade_close_is_a_dry_run() {
+        let v = build_paper_trade_close(
+            OandaEnvironment::Practice,
+            "4001",
+            CloseUnits::Partial(dec!(400)),
+        );
+
+        assert_eq!(v["mode"], "paper");
+        assert_eq!(v["submitted"], false);
+        assert_eq!(v["trade_id"], "4001");
+        assert_eq!(v["units"], "400");
+
+        // Omitting --units closes the whole trade.
+        let all = build_paper_trade_close(OandaEnvironment::Practice, "4001", CloseUnits::All);
+        assert_eq!(all["units"], "ALL");
+    }
+
+    // AC5/AC6: the two ways to address a close are exclusive, and the existing
+    // --instrument/--side form is unchanged for every caller that uses it.
+    #[test]
+    fn close_addressing_modes_are_mutually_exclusive() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            close: CloseArgs,
+        }
+
+        // The pre-AGT-780 form still parses exactly as before.
+        let side = Wrapper::try_parse_from(["x", "--instrument", "EUR_USD", "--side", "long"])
+            .expect("side close still parses");
+        assert_eq!(side.close.instrument.as_deref(), Some("EUR_USD"));
+        assert!(side.close.trade_id.is_none());
+
+        // The new form.
+        let by_id = Wrapper::try_parse_from(["x", "--trade-id", "4001", "--units", "400"])
+            .expect("trade close parses");
+        assert_eq!(by_id.close.trade_id.as_deref(), Some("4001"));
+        assert_eq!(by_id.close.units, Some(dec!(400)));
+
+        // --trade-id closes one trade; --instrument closes a whole side. Asking
+        // for both is a confusion about which, so it is refused at parse time.
+        assert!(Wrapper::try_parse_from(["x", "--trade-id", "4001", "--instrument", "EUR_USD"])
+            .is_err());
+        // Units without a trade to take them from.
+        assert!(Wrapper::try_parse_from(["x", "--units", "400"]).is_err());
+        // A side close still needs both halves.
+        assert!(Wrapper::try_parse_from(["x", "--side", "long"]).is_err());
     }
 
     // AGT-613 rewrites the AGT-611 arming contract: a live submit now requires a

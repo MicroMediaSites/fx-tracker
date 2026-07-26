@@ -336,6 +336,54 @@ pub async fn close_position(
     parse_response(&text)
 }
 
+/// Fetch one trade by its OANDA id (`GET /trades/{tradeID}`).
+///
+/// The per-trade close needs the trade's current size to validate against, and
+/// `/trades` (the list) is a needlessly wide read for one id.
+pub async fn get_trade(client: &OandaClient, trade_id: &str) -> Result<Trade> {
+    let url = format!(
+        "{}/v3/accounts/{}/trades/{}",
+        client.base_url(),
+        client.account_id(),
+        trade_id
+    );
+    let response = client.get(&url).send().await?.error_for_status()?;
+    let text = response.text().await?;
+    let parsed: super::types::TradeResponse = parse_response(&text)?;
+    Ok(Trade::from(parsed.trade))
+}
+
+/// Close one trade — all of it, or `units` of it (AGT-780).
+///
+/// This is the precise counterpart to [`close_position`], which closes by
+/// instrument and side and therefore cannot express "half of trade 4001", nor
+/// distinguish one trade from another on the same side. It is also the
+/// prerequisite for partial exits existing at all: `ClosePositionRequest`
+/// hardcodes `"ALL"`.
+///
+/// Takes the `Trade` rather than a bare id so the requested amount is validated
+/// against what is actually open **before** anything is submitted — a close
+/// larger than the trade cannot reach OANDA and land an attempt in the audit
+/// log on its way to being rejected.
+pub async fn close_trade(
+    client: &OandaClient,
+    trade: &Trade,
+    units: super::types::CloseUnits,
+) -> Result<OrderCreateResponse> {
+    units.validate_against(trade)?;
+
+    let url = format!(
+        "{}/v3/accounts/{}/trades/{}/close",
+        client.base_url(),
+        client.account_id(),
+        trade.id
+    );
+    let body = super::types::CloseTradeRequest::new(units);
+    let response = client.put(&url).json(&body).send().await?;
+    let text = response.text().await?;
+    parse_response(&text)
+}
+
 // ============================================================================
 // The transaction feed (AGT-779)
 // ============================================================================
@@ -789,7 +837,7 @@ mod tests {
     use super::*;
     use crate::oanda::types::{EntryOptions, EntryOrderType};
     use wiremock::{MockServer, Mock, ResponseTemplate};
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{body_json, method, path, query_param};
     use serde_json::json;
 
     async fn setup_mock_client(mock_server: &MockServer) -> OandaClient {
@@ -942,6 +990,136 @@ mod tests {
         let ids: Vec<&str> = out.trades.iter().map(|t| t.id.as_str()).collect();
         let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
         assert_eq!(ids.len(), unique.len(), "paging must not re-request a page: {ids:?}");
+    }
+
+    // ── closing one trade by id (AGT-780) ─────────────────────────────────
+
+    fn open_trade_json(id: &str, units: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "instrument": "EUR_USD",
+            "price": "1.08000",
+            "openTime": "2026-07-20T10:00:00.000000000Z",
+            "initialUnits": units,
+            "currentUnits": units,
+            "realizedPL": "0.0000",
+            "unrealizedPL": "1.5000",
+            "state": "OPEN",
+            "financing": "0.0000"
+        })
+    }
+
+    #[tokio::test]
+    async fn a_trade_is_fetched_by_id() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/trades/4001"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "trade": open_trade_json("4001", "1000") })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let trade = get_trade(&client, "4001").await.unwrap();
+
+        assert_eq!(trade.id, "4001");
+        assert_eq!(trade.units, "1000".parse::<rust_decimal::Decimal>().unwrap());
+    }
+
+    // AC2: the partial close reduces the trade rather than closing it, and the
+    // fill says so — `tradeReduced`, not `tradesClosed`.
+    #[tokio::test]
+    async fn a_partial_close_sends_the_units_and_reduces_the_trade() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        Mock::given(method("PUT"))
+            .and(path("/v3/accounts/test-account-123/trades/4001/close"))
+            .and(body_json(json!({ "units": "400" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "orderFillTransaction": {
+                    "id": "4050", "time": "2026-07-20T12:00:00Z", "type": "ORDER_FILL",
+                    "reason": "MARKET_ORDER_TRADE_CLOSE", "instrument": "EUR_USD",
+                    "units": "-400", "price": "1.08500", "pl": "4.0000",
+                    "tradeReduced": { "tradeID": "4001", "units": "-400", "realizedPL": "4.0000" }
+                },
+                "lastTransactionID": "4050"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let trade = get_trade_fixture("4001", "1000");
+        let out = close_trade(&client, &trade, super::super::types::CloseUnits::Partial(
+            "400".parse().unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        let fill = out.order_fill_transaction.expect("filled");
+        assert_eq!(fill.trade_reduced.as_ref().unwrap().units, "-400");
+        assert!(fill.trades_closed.is_empty(), "the trade is reduced, not closed");
+    }
+
+    #[tokio::test]
+    async fn a_full_close_sends_all() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        Mock::given(method("PUT"))
+            .and(path("/v3/accounts/test-account-123/trades/4001/close"))
+            .and(body_json(json!({ "units": "ALL" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "orderFillTransaction": {
+                    "id": "4090", "time": "2026-07-20T15:00:00Z", "type": "ORDER_FILL",
+                    "instrument": "EUR_USD", "units": "-1000", "price": "1.09000", "pl": "10.0000",
+                    "tradesClosed": [
+                        { "tradeID": "4001", "units": "-1000", "realizedPL": "10.0000" }
+                    ]
+                },
+                "lastTransactionID": "4090"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let trade = get_trade_fixture("4001", "1000");
+        let out = close_trade(&client, &trade, super::super::types::CloseUnits::All)
+            .await
+            .unwrap();
+
+        assert_eq!(out.order_fill_transaction.unwrap().trades_closed.len(), 1);
+    }
+
+    // AC3: an oversized close never reaches OANDA. No mock is mounted, so any
+    // request would fail the call for the wrong reason.
+    #[tokio::test]
+    async fn an_oversized_close_is_rejected_without_calling_out() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        let trade = get_trade_fixture("4001", "1000");
+        let err = close_trade(
+            &client,
+            &trade,
+            super::super::types::CloseUnits::Partial("2500".parse().unwrap()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{err}").contains("only 1000 are open"), "{err}");
+    }
+
+    /// A `Trade` straight off the fixture JSON, so the tests exercise the same
+    /// conversion the live path uses.
+    fn get_trade_fixture(id: &str, units: &str) -> Trade {
+        let oanda: super::super::types::OandaTrade =
+            serde_json::from_value(open_trade_json(id, units)).expect("fixture decodes");
+        Trade::from(oanda)
     }
 
     // ── the transaction feed (AGT-779) ────────────────────────────────────
