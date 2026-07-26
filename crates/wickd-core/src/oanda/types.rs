@@ -593,12 +593,18 @@ pub struct OrderTransaction {
     pub position_fill: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct OrderFillTransaction {
     pub id: String,
     pub time: String,
     #[serde(rename = "type")]
     pub transaction_type: String,
+    /// Why the fill happened, e.g. `MARKET_ORDER`, `MARKET_ORDER_TRADE_CLOSE`,
+    /// `STOP_LOSS_ORDER`, `TAKE_PROFIT_ORDER`. This is how a close is
+    /// identified — OANDA has no `TRADE_CLOSE` transaction type; a close is an
+    /// `ORDER_FILL` with a closing reason and a populated `trades_closed`.
+    #[serde(default)]
+    pub reason: Option<String>,
     pub instrument: String,
     pub units: String,
     pub price: String,
@@ -618,14 +624,14 @@ pub struct OrderFillTransaction {
     pub trades_closed: Vec<TradeClosed>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct TradeOpened {
     #[serde(rename = "tradeID")]
     pub trade_id: String,
     pub units: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct TradeReduced {
     #[serde(rename = "tradeID")]
     pub trade_id: String,
@@ -634,7 +640,7 @@ pub struct TradeReduced {
     pub realized_pl: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct TradeClosed {
     #[serde(rename = "tradeID")]
     pub trade_id: String,
@@ -643,7 +649,7 @@ pub struct TradeClosed {
     pub realized_pl: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct OrderCancelTransaction {
     pub id: String,
     pub time: String,
@@ -923,9 +929,321 @@ pub struct AutochartistScores {
     pub uniformity: Option<i32>,
 }
 
+// ============================================================================
+// The transaction feed (AGT-779)
+// ============================================================================
+
+/// One entry of the account's transaction feed, tagged by OANDA's `type`.
+///
+/// This is what makes a multi-exit trade decomposable: `/trades` only ever
+/// reports `averageClosePrice`, blended across every exit, while the fills that
+/// produced it are individually recorded here — an [`OrderFillTransaction`]
+/// carrying `trade_reduced` / `trades_closed` per exit.
+///
+/// ## Unknown types are kept, not rejected
+///
+/// OANDA emits ~30 transaction types and adds to them. A feed read must not
+/// fail because one page contained a type wickd does not model — a single
+/// `DAILY_FINANCING` would otherwise take out a whole history read. Anything
+/// unmodelled lands in [`Transaction::Unknown`] with its JSON intact, so it
+/// round-trips and can be inspected without a code change.
+///
+/// **Note on `TRADE_CLOSE`:** OANDA has no such transaction type. Closing a
+/// trade produces an `ORDER_FILL` whose `reason` is `MARKET_ORDER_TRADE_CLOSE`
+/// (or `STOP_LOSS_ORDER` / `TAKE_PROFIT_ORDER` when an exit order fired), which
+/// is why closes are read off the fill's `reason` and `trades_closed` rather
+/// than a variant of their own. [`Transaction::closes_a_trade`] is that check.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Transaction {
+    /// An order filled — the only transaction that moves units, and the one
+    /// carrying the per-trade open/reduce/close detail.
+    OrderFill(Box<OrderFillTransaction>),
+    /// A stop-loss order was created/modified against a trade.
+    StopLossOrder(TradeOrderTransaction),
+    /// A take-profit order was created/modified against a trade.
+    TakeProfitOrder(TradeOrderTransaction),
+    /// An order was cancelled (an exit order removed when its trade closed,
+    /// most often).
+    OrderCancel(OrderCancelTransaction),
+    /// A type wickd does not model, preserved verbatim.
+    Unknown {
+        /// OANDA's `type` string, e.g. `DAILY_FINANCING`.
+        transaction_type: String,
+        /// The whole transaction as received, so nothing is lost.
+        raw: serde_json::Value,
+    },
+}
+
+/// A stop-loss / take-profit order transaction: an exit order attached to a
+/// trade. Carries `trade_id` so it can be attributed to the trade it guards.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct TradeOrderTransaction {
+    pub id: String,
+    pub time: String,
+    #[serde(rename = "type")]
+    pub transaction_type: String,
+    #[serde(rename = "tradeID")]
+    pub trade_id: String,
+    #[serde(default)]
+    pub price: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl Transaction {
+    /// OANDA's transaction id (`id`), for ordering and range walks.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Transaction::OrderFill(t) => Some(&t.id),
+            Transaction::StopLossOrder(t) | Transaction::TakeProfitOrder(t) => Some(&t.id),
+            Transaction::OrderCancel(t) => Some(&t.id),
+            Transaction::Unknown { raw, .. } => raw.get("id").and_then(|v| v.as_str()),
+        }
+    }
+
+    /// OANDA's `type` string for any variant, modelled or not.
+    pub fn transaction_type(&self) -> &str {
+        match self {
+            Transaction::OrderFill(t) => &t.transaction_type,
+            Transaction::StopLossOrder(t) | Transaction::TakeProfitOrder(t) => &t.transaction_type,
+            Transaction::OrderCancel(t) => &t.transaction_type,
+            Transaction::Unknown { transaction_type, .. } => transaction_type,
+        }
+    }
+
+    /// The fill this transaction is, if it is one — the accessor a per-exit
+    /// decomposition walks the feed with.
+    pub fn order_fill(&self) -> Option<&OrderFillTransaction> {
+        match self {
+            Transaction::OrderFill(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Whether this transaction closed or reduced any trade. True for a fill
+    /// carrying `tradeReduced` or a non-empty `tradesClosed` — i.e. the fills a
+    /// per-exit view is built from.
+    pub fn closes_a_trade(&self) -> bool {
+        self.order_fill()
+            .is_some_and(|f| f.trade_reduced.is_some() || !f.trades_closed.is_empty())
+    }
+}
+
+/// OANDA's `type` values this enum models. Anything else is
+/// [`Transaction::Unknown`].
+pub const ORDER_FILL_TYPE: &str = "ORDER_FILL";
+pub const STOP_LOSS_ORDER_TYPE: &str = "STOP_LOSS_ORDER";
+pub const TAKE_PROFIT_ORDER_TYPE: &str = "TAKE_PROFIT_ORDER";
+pub const ORDER_CANCEL_TYPE: &str = "ORDER_CANCEL";
+
+impl<'de> Deserialize<'de> for Transaction {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as DeError;
+
+        // Buffered rather than `#[serde(tag = "type")]` because the modelled
+        // structs declare `type` themselves (an internally-tagged enum consumes
+        // it), and because the fallback has to keep the original JSON.
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let transaction_type = raw
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // A modelled type that fails to decode is a real error: it means the
+        // shape changed underneath us, and silently demoting it to `Unknown`
+        // would hide that from every caller.
+        match transaction_type.as_str() {
+            ORDER_FILL_TYPE => Ok(Transaction::OrderFill(Box::new(
+                serde_json::from_value(raw).map_err(DeError::custom)?,
+            ))),
+            STOP_LOSS_ORDER_TYPE => Ok(Transaction::StopLossOrder(
+                serde_json::from_value(raw).map_err(DeError::custom)?,
+            )),
+            TAKE_PROFIT_ORDER_TYPE => Ok(Transaction::TakeProfitOrder(
+                serde_json::from_value(raw).map_err(DeError::custom)?,
+            )),
+            ORDER_CANCEL_TYPE => Ok(Transaction::OrderCancel(
+                serde_json::from_value(raw).map_err(DeError::custom)?,
+            )),
+            _ => Ok(Transaction::Unknown { transaction_type, raw }),
+        }
+    }
+}
+
+impl Serialize for Transaction {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Transaction::OrderFill(t) => t.serialize(serializer),
+            Transaction::StopLossOrder(t) | Transaction::TakeProfitOrder(t) => {
+                t.serialize(serializer)
+            }
+            Transaction::OrderCancel(t) => t.serialize(serializer),
+            Transaction::Unknown { raw, .. } => raw.serialize(serializer),
+        }
+    }
+}
+
+/// A page of the transaction feed (`/transactions/idrange`, `/transactions/sinceid`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransactionsResponse {
+    #[serde(default)]
+    pub transactions: Vec<Transaction>,
+    /// The account's newest transaction id at the time of the response. The
+    /// walk uses it to tell "the page is full because there is more" from "the
+    /// page is full and that was everything".
+    #[serde(default, rename = "lastTransactionID")]
+    pub last_transaction_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the transaction feed (AGT-779) ────────────────────────────────────
+
+    /// A close fill that reduced one trade and closed another — the shape a
+    /// per-exit decomposition is built from.
+    fn order_fill_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "4102",
+            "time": "2026-07-20T14:00:00.000000000Z",
+            "type": "ORDER_FILL",
+            "reason": "MARKET_ORDER_TRADE_CLOSE",
+            "instrument": "EUR_USD",
+            "units": "-1500",
+            "price": "1.09120",
+            "pl": "12.4000",
+            "financing": "-0.1200",
+            "commission": "0.0000",
+            "accountBalance": "10012.4000",
+            "tradeReduced": { "tradeID": "4001", "units": "-500", "realizedPL": "4.1000" },
+            "tradesClosed": [
+                { "tradeID": "3999", "units": "-1000", "realizedPL": "8.3000" }
+            ]
+        })
+    }
+
+    #[test]
+    fn order_fill_decodes_with_its_per_trade_detail() {
+        let tx: Transaction = serde_json::from_value(order_fill_json()).expect("decodes");
+
+        let fill = tx.order_fill().expect("is an ORDER_FILL");
+        assert_eq!(fill.id, "4102");
+        assert_eq!(fill.reason.as_deref(), Some("MARKET_ORDER_TRADE_CLOSE"));
+        // The per-exit shape: which trade, how many units, how much realized.
+        assert_eq!(fill.trade_reduced.as_ref().unwrap().trade_id, "4001");
+        assert_eq!(fill.trade_reduced.as_ref().unwrap().realized_pl, "4.1000");
+        assert_eq!(fill.trades_closed.len(), 1);
+        assert_eq!(fill.trades_closed[0].trade_id, "3999");
+        assert_eq!(fill.trades_closed[0].units, "-1000");
+
+        assert_eq!(tx.id(), Some("4102"));
+        assert_eq!(tx.transaction_type(), ORDER_FILL_TYPE);
+        assert!(tx.closes_a_trade());
+    }
+
+    #[test]
+    fn an_opening_fill_does_not_read_as_closing_a_trade() {
+        let opening = serde_json::json!({
+            "id": "3999", "time": "2026-07-20T10:00:00Z", "type": "ORDER_FILL",
+            "reason": "MARKET_ORDER", "instrument": "EUR_USD",
+            "units": "1000", "price": "1.08300",
+            "tradeOpened": { "tradeID": "3999", "units": "1000" }
+        });
+
+        let tx: Transaction = serde_json::from_value(opening).expect("decodes");
+
+        assert!(!tx.closes_a_trade(), "an entry fill closes nothing");
+        assert_eq!(tx.order_fill().unwrap().trade_opened.as_ref().unwrap().trade_id, "3999");
+    }
+
+    #[test]
+    fn exit_order_transactions_carry_the_trade_they_guard() {
+        let sl = serde_json::json!({
+            "id": "4000", "time": "2026-07-20T10:00:00Z", "type": "STOP_LOSS_ORDER",
+            "tradeID": "3999", "price": "1.08000", "reason": "ON_FILL"
+        });
+        let tp = serde_json::json!({
+            "id": "4001", "time": "2026-07-20T10:00:00Z", "type": "TAKE_PROFIT_ORDER",
+            "tradeID": "3999", "price": "1.09500", "reason": "ON_FILL"
+        });
+
+        let sl: Transaction = serde_json::from_value(sl).expect("decodes");
+        let tp: Transaction = serde_json::from_value(tp).expect("decodes");
+
+        match (&sl, &tp) {
+            (Transaction::StopLossOrder(s), Transaction::TakeProfitOrder(t)) => {
+                assert_eq!(s.trade_id, "3999");
+                assert_eq!(t.trade_id, "3999");
+                assert_eq!(t.price.as_deref(), Some("1.09500"));
+            }
+            other => panic!("expected SL/TP order transactions, got {other:?}"),
+        }
+        assert!(!sl.closes_a_trade(), "creating an exit order closes nothing");
+    }
+
+    // AC5: one unmodelled type must not take out the page it arrived on.
+    #[test]
+    fn an_unmodelled_type_is_kept_verbatim_rather_than_failing() {
+        let financing = serde_json::json!({
+            "id": "4103",
+            "time": "2026-07-20T21:00:00Z",
+            "type": "DAILY_FINANCING",
+            "financing": "-0.4500",
+            "accountBalance": "10011.9500"
+        });
+
+        let tx: Transaction = serde_json::from_value(financing.clone()).expect("does not fail");
+
+        match &tx {
+            Transaction::Unknown { transaction_type, .. } => {
+                assert_eq!(transaction_type, "DAILY_FINANCING");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        // Still addressable, and nothing about it was dropped on the way in.
+        assert_eq!(tx.id(), Some("4103"));
+        assert_eq!(tx.transaction_type(), "DAILY_FINANCING");
+        assert!(!tx.closes_a_trade());
+        assert_eq!(serde_json::to_value(&tx).unwrap(), financing, "round-trips");
+    }
+
+    #[test]
+    fn a_modelled_type_with_a_broken_shape_still_errors() {
+        // Demoting this to `Unknown` would hide a real schema change behind a
+        // feed that silently stopped decomposing anything.
+        let broken = serde_json::json!({
+            "id": "4104", "type": "ORDER_FILL", "time": "2026-07-20T21:00:00Z"
+            // no instrument / units / price
+        });
+
+        assert!(serde_json::from_value::<Transaction>(broken).is_err());
+    }
+
+    #[test]
+    fn a_page_decodes_a_mixed_feed_in_order() {
+        let page = serde_json::json!({
+            "transactions": [
+                order_fill_json(),
+                { "id": "4103", "time": "2026-07-20T21:00:00Z", "type": "DAILY_FINANCING" }
+            ],
+            "lastTransactionID": "4103"
+        });
+
+        let page: TransactionsResponse = serde_json::from_value(page).expect("decodes");
+
+        assert_eq!(page.transactions.len(), 2);
+        assert_eq!(page.last_transaction_id.as_deref(), Some("4103"));
+        assert!(page.transactions[0].closes_a_trade());
+        assert!(matches!(page.transactions[1], Transaction::Unknown { .. }));
+    }
 
     // ── strategy attribution reaches the TRADE, not just the order ─────────
 

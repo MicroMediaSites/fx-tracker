@@ -336,6 +336,121 @@ pub async fn close_position(
     parse_response(&text)
 }
 
+// ============================================================================
+// The transaction feed (AGT-779)
+// ============================================================================
+
+/// Ids per `/transactions/idrange` request. OANDA rejects a range wider than
+/// this outright ("The number of Transactions requested exceeds the maximum
+/// allowed"), so a wider walk is chunked rather than sent and refused.
+pub const TRANSACTIONS_MAX_IDS_PER_REQUEST: u64 = 1000;
+
+/// Fetch the account's transactions with ids in `from_id..=to_id`, oldest
+/// first.
+///
+/// This is what makes a multi-exit trade decomposable: `/trades` reports only
+/// the blended `averageClosePrice`, while the individual fills behind it are
+/// here (AGT-779, issue #13).
+///
+/// Ranges wider than [`TRANSACTIONS_MAX_IDS_PER_REQUEST`] are fetched in
+/// consecutive chunks and concatenated — the caller gets the whole range or an
+/// error, never a silently truncated prefix. Both bounds are `u64` rather than
+/// strings, matching [`get_trades_before`], so a query string cannot be
+/// injected through them by construction.
+///
+/// Ids OANDA has no transaction for (gaps are normal) simply do not appear.
+pub async fn get_transactions_idrange(
+    client: &OandaClient,
+    from_id: u64,
+    to_id: u64,
+) -> Result<Vec<super::types::Transaction>> {
+    if from_id > to_id {
+        return Err(Error::InvalidArgument(format!(
+            "transaction id range is inverted: from={from_id} is past to={to_id}"
+        )));
+    }
+
+    let mut out = Vec::new();
+    let mut chunk_start = from_id;
+    while chunk_start <= to_id {
+        // -1 because the range is inclusive on both ends: [1, 1000] is 1000 ids.
+        let chunk_end = to_id.min(chunk_start + TRANSACTIONS_MAX_IDS_PER_REQUEST - 1);
+        let page = fetch_transactions_page(
+            client,
+            "idrange",
+            &[("from", chunk_start.to_string()), ("to", chunk_end.to_string())],
+        )
+        .await?;
+        out.extend(page.transactions);
+
+        // Guard the wrap at u64::MAX rather than overflowing back to 0.
+        match chunk_end.checked_add(1) {
+            Some(next) => chunk_start = next,
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Fetch every transaction after `since_id`, oldest first.
+///
+/// OANDA's `sinceid` returns at most one page, so a caller that is far behind
+/// would get a truncated answer with nothing marking it as truncated. The
+/// response's `lastTransactionID` is the account's newest id, so this reads the
+/// first page and then walks any remainder through
+/// [`get_transactions_idrange`] until the feed is caught up.
+pub async fn get_transactions_since_id(
+    client: &OandaClient,
+    since_id: u64,
+) -> Result<Vec<super::types::Transaction>> {
+    let page =
+        fetch_transactions_page(client, "sinceid", &[("id", since_id.to_string())]).await?;
+
+    // The account's newest id. Without it there is no way to know whether the
+    // page was everything, so the page is all that can honestly be returned.
+    let Some(newest) = page.last_transaction_id.as_deref().and_then(|s| s.parse::<u64>().ok())
+    else {
+        return Ok(page.transactions);
+    };
+
+    let mut out = page.transactions;
+    let highest_seen = out
+        .iter()
+        .filter_map(|t| t.id().and_then(|id| id.parse::<u64>().ok()))
+        .max()
+        .unwrap_or(since_id);
+
+    if highest_seen < newest {
+        let rest = get_transactions_idrange(client, highest_seen + 1, newest).await?;
+        out.extend(rest);
+    }
+    Ok(out)
+}
+
+/// One `/transactions/<sub>` request with numeric query params already
+/// stringified by the caller. Shared by the idrange and sinceid walks so both
+/// decode and error-check identically.
+async fn fetch_transactions_page(
+    client: &OandaClient,
+    sub_path: &str,
+    query: &[(&str, String)],
+) -> Result<super::types::TransactionsResponse> {
+    let mut url = format!(
+        "{}/v3/accounts/{}/transactions/{}",
+        client.base_url(),
+        client.account_id(),
+        sub_path
+    );
+    let query_parts: Vec<String> =
+        query.iter().map(|(key, value)| format!("{key}={value}")).collect();
+    url.push('?');
+    url.push_str(&query_parts.join("&"));
+
+    let response = client.get(&url).send().await?.error_for_status()?;
+    let text = response.text().await?;
+    parse_response(&text)
+}
+
 /// Granularity options for candles
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Granularity {
@@ -827,6 +942,187 @@ mod tests {
         let ids: Vec<&str> = out.trades.iter().map(|t| t.id.as_str()).collect();
         let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
         assert_eq!(ids.len(), unique.len(), "paging must not re-request a page: {ids:?}");
+    }
+
+    // ── the transaction feed (AGT-779) ────────────────────────────────────
+
+    /// A page of `count` ORDER_FILL transactions with consecutive ids from
+    /// `first_id`, plus the account's newest id.
+    fn transaction_page(first_id: u64, count: u64, newest: u64) -> serde_json::Value {
+        let transactions: Vec<serde_json::Value> = (0..count)
+            .map(|n| {
+                json!({
+                    "id": (first_id + n).to_string(),
+                    "time": "2026-07-20T14:00:00.000000000Z",
+                    "type": "ORDER_FILL",
+                    "reason": "MARKET_ORDER",
+                    "instrument": "EUR_USD",
+                    "units": "1000",
+                    "price": "1.08500",
+                    "tradeOpened": { "tradeID": (first_id + n).to_string(), "units": "1000" }
+                })
+            })
+            .collect();
+        json!({ "transactions": transactions, "lastTransactionID": newest.to_string() })
+    }
+
+    #[tokio::test]
+    async fn idrange_returns_the_requested_window() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions/idrange"))
+            .and(query_param("from", "10"))
+            .and(query_param("to", "12"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(transaction_page(10, 3, 12)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let out = get_transactions_idrange(&client, 10, 12).await.unwrap();
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].id(), Some("10"));
+        assert_eq!(out[2].id(), Some("12"));
+    }
+
+    // AC3: a range past OANDA's per-request cap is chunked, not truncated and
+    // not sent as one request OANDA would refuse.
+    #[tokio::test]
+    async fn idrange_chunks_a_range_wider_than_the_request_cap() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        // 1..=1500 → [1, 1000] then [1001, 1500]. The bounds are asserted, so
+        // an off-by-one that re-requested or skipped an id fails here.
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions/idrange"))
+            .and(query_param("from", "1"))
+            .and(query_param("to", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(transaction_page(1, 2, 1500)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions/idrange"))
+            .and(query_param("from", "1001"))
+            .and(query_param("to", "1500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(transaction_page(1001, 2, 1500)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let out = get_transactions_idrange(&client, 1, 1500).await.unwrap();
+
+        let ids: Vec<&str> = out.iter().filter_map(|t| t.id()).collect();
+        assert_eq!(ids, ["1", "2", "1001", "1002"], "both chunks, in order");
+    }
+
+    #[tokio::test]
+    async fn idrange_rejects_an_inverted_range_without_calling_out() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+        // No mock is mounted: any request at all would 404 and fail the call
+        // for the wrong reason, so this also proves nothing was sent.
+
+        let err = get_transactions_idrange(&client, 99, 12).await.unwrap_err();
+
+        assert!(
+            format!("{err}").contains("inverted"),
+            "should name the inverted range: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sinceid_returns_the_page_when_it_is_already_caught_up() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        // The page reaches lastTransactionID, so there is nothing to walk.
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions/sinceid"))
+            .and(query_param("id", "40"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(transaction_page(41, 2, 42)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let out = get_transactions_since_id(&client, 40).await.unwrap();
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].id(), Some("42"));
+    }
+
+    // AC3 again, on the other endpoint: `sinceid` returns one page, so a caller
+    // far behind must be caught up rather than handed a silent prefix.
+    #[tokio::test]
+    async fn sinceid_walks_the_remainder_when_the_page_falls_short() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        // Page stops at 42 while the account is at 44 → the rest comes from
+        // idrange [43, 44].
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions/sinceid"))
+            .and(query_param("id", "40"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(transaction_page(41, 2, 44)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions/idrange"))
+            .and(query_param("from", "43"))
+            .and(query_param("to", "44"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(transaction_page(43, 2, 44)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let out = get_transactions_since_id(&client, 40).await.unwrap();
+
+        let ids: Vec<&str> = out.iter().filter_map(|t| t.id()).collect();
+        assert_eq!(ids, ["41", "42", "43", "44"], "the feed is caught up, in order");
+    }
+
+    #[tokio::test]
+    async fn sinceid_on_an_empty_feed_returns_nothing_and_walks_nowhere() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        // Nothing since 44, and 44 is the newest — no idrange follow-up.
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions/sinceid"))
+            .and(query_param("id", "44"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "transactions": [], "lastTransactionID": "44" }),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        assert!(get_transactions_since_id(&client, 44).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transactions_page_surfaces_an_oanda_error_rather_than_decoding_it() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions/idrange"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errorMessage": "Invalid transaction ID range specified"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let err = get_transactions_idrange(&client, 1, 5).await.unwrap_err();
+
+        assert!(
+            format!("{err}").contains("Invalid transaction ID range"),
+            "OANDA's message should reach the caller: {err}"
+        );
     }
 
     #[tokio::test]
