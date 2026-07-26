@@ -694,6 +694,84 @@ impl OrderRejectTransaction {
     }
 }
 
+/// How much of a trade to close (AGT-780).
+///
+/// OANDA's per-trade close takes either the string `"ALL"` or a **positive**
+/// magnitude — never the trade's signed units. [`CloseUnits::wire`] is the only
+/// place that distinction is encoded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CloseUnits {
+    /// The whole trade, whatever is left of it.
+    All,
+    /// Part of it — a positive magnitude, validated against the trade first.
+    Partial(rust_decimal::Decimal),
+}
+
+impl CloseUnits {
+    /// The value OANDA's `units` field takes.
+    pub fn wire(&self) -> String {
+        match self {
+            CloseUnits::All => "ALL".to_string(),
+            CloseUnits::Partial(units) => units.normalize().to_string(),
+        }
+    }
+
+    /// Reject a close that the trade cannot satisfy, before anything is sent.
+    ///
+    /// A close larger than the trade is the dangerous one: OANDA would reject
+    /// it, but only after the attempt is on the wire and in the audit log, and
+    /// the caller has probably confused units with the *position* rather than
+    /// the trade. Zero and negative are rejected because OANDA's per-trade
+    /// close takes a magnitude — a caller passing the trade's own signed units
+    /// for a short would otherwise send a negative.
+    pub fn validate_against(&self, trade: &crate::models::Trade) -> crate::error::Result<()> {
+        let CloseUnits::Partial(units) = self else {
+            return Ok(());
+        };
+        let available = trade.units.abs();
+        if *units <= rust_decimal::Decimal::ZERO {
+            return Err(crate::error::Error::InvalidArgument(format!(
+                "cannot close {units} units of trade {}: the amount must be positive \
+                 (OANDA takes a magnitude, not the trade's signed units)",
+                trade.id
+            )));
+        }
+        if *units > available {
+            return Err(crate::error::Error::InvalidArgument(format!(
+                "cannot close {units} units of trade {}: only {available} are open",
+                trade.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// What remains of `trade` after this close.
+    pub fn remaining_of(&self, trade: &crate::models::Trade) -> rust_decimal::Decimal {
+        match self {
+            CloseUnits::All => rust_decimal::Decimal::ZERO,
+            CloseUnits::Partial(units) => trade.units.abs() - units,
+        }
+    }
+}
+
+/// Body of OANDA's per-trade close (`PUT /trades/{id}/close`).
+#[derive(Debug, Clone, Serialize)]
+pub struct CloseTradeRequest {
+    pub units: String,
+}
+
+impl CloseTradeRequest {
+    pub fn new(units: CloseUnits) -> Self {
+        Self { units: units.wire() }
+    }
+}
+
+/// A single trade fetched by id (`GET /trades/{id}`).
+#[derive(Debug, Deserialize)]
+pub struct TradeResponse {
+    pub trade: OandaTrade,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClosePositionRequest {
@@ -1111,6 +1189,110 @@ pub struct TransactionsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── closing a trade by id (AGT-780) ───────────────────────────────────
+
+    fn open_trade(id: &str, units: &str) -> crate::models::Trade {
+        crate::models::Trade {
+            id: id.to_string(),
+            instrument: "EUR_USD".to_string(),
+            open_price: "1.08000".parse().unwrap(),
+            open_time: chrono::DateTime::parse_from_rfc3339("2026-07-20T10:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            units: units.parse().unwrap(),
+            realized_pl: rust_decimal::Decimal::ZERO,
+            unrealized_pl: None,
+            state: crate::models::TradeState::Open,
+            close_time: None,
+            close_price: None,
+            strategy: None,
+            exit_count: 0,
+            closing_transaction_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn close_units_go_on_the_wire_as_oanda_wants_them() {
+        assert_eq!(CloseUnits::All.wire(), "ALL");
+        assert_eq!(CloseUnits::Partial("500".parse().unwrap()).wire(), "500");
+        // Trailing zeros off a Decimal must not reach the request body.
+        assert_eq!(CloseUnits::Partial("500.00".parse().unwrap()).wire(), "500");
+    }
+
+    #[test]
+    fn a_partial_close_within_the_trade_is_allowed() {
+        let trade = open_trade("4001", "1000");
+        assert!(CloseUnits::Partial("400".parse().unwrap()).validate_against(&trade).is_ok());
+        // Exactly the whole trade is a valid partial too.
+        assert!(CloseUnits::Partial("1000".parse().unwrap()).validate_against(&trade).is_ok());
+        assert!(CloseUnits::All.validate_against(&trade).is_ok());
+    }
+
+    // AC3: rejected before the request is sent, naming the trade and what is
+    // actually open.
+    #[test]
+    fn closing_more_than_is_open_is_refused() {
+        let trade = open_trade("4001", "1000");
+
+        let err = CloseUnits::Partial("1500".parse().unwrap())
+            .validate_against(&trade)
+            .unwrap_err();
+        let msg = format!("{err}");
+
+        assert!(msg.contains("4001"), "names the trade: {msg}");
+        assert!(msg.contains("only 1000 are open"), "names what is available: {msg}");
+    }
+
+    #[test]
+    fn a_zero_or_negative_close_is_refused() {
+        let trade = open_trade("4001", "1000");
+
+        assert!(CloseUnits::Partial(rust_decimal::Decimal::ZERO)
+            .validate_against(&trade)
+            .is_err());
+        // The likely mistake: passing a short's own signed units straight
+        // through. OANDA's per-trade close takes a magnitude.
+        let short = open_trade("4002", "-1000");
+        let err = CloseUnits::Partial("-1000".parse().unwrap())
+            .validate_against(&short)
+            .unwrap_err();
+        assert!(format!("{err}").contains("magnitude"), "explains why: {err}");
+    }
+
+    #[test]
+    fn a_short_is_validated_on_magnitude_not_sign() {
+        // -1000 units open: closing 400 of them is fine, 1500 is not.
+        let short = open_trade("4002", "-1000");
+
+        assert!(CloseUnits::Partial("400".parse().unwrap()).validate_against(&short).is_ok());
+        assert!(CloseUnits::Partial("1500".parse().unwrap()).validate_against(&short).is_err());
+    }
+
+    // AC2: a partial close leaves the rest of the trade open.
+    #[test]
+    fn what_remains_after_a_close_is_reported() {
+        let trade = open_trade("4001", "1000");
+
+        assert_eq!(
+            CloseUnits::Partial("400".parse().unwrap()).remaining_of(&trade),
+            "600".parse::<rust_decimal::Decimal>().unwrap()
+        );
+        assert_eq!(CloseUnits::All.remaining_of(&trade), rust_decimal::Decimal::ZERO);
+        // A short reports what is left as a magnitude too.
+        assert_eq!(
+            CloseUnits::Partial("400".parse().unwrap()).remaining_of(&open_trade("4002", "-1000")),
+            "600".parse::<rust_decimal::Decimal>().unwrap()
+        );
+    }
+
+    #[test]
+    fn the_close_body_carries_only_the_units() {
+        let body = CloseTradeRequest::new(CloseUnits::Partial("250".parse().unwrap()));
+        let json = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(json, serde_json::json!({ "units": "250" }));
+    }
 
     // ── the transaction feed (AGT-779) ────────────────────────────────────
 
