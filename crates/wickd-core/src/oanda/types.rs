@@ -164,6 +164,12 @@ pub struct OandaAccount {
     pub unrealized_pl: String,
     #[serde(default)]
     pub open_trade_count: i32,
+    /// Whether OANDA lets this account hold opposing trades on one instrument
+    /// (AGT-781). `None` when the payload does not carry it — which is NOT the
+    /// same as `false`: see [`crate::oanda::position_mode`], which refuses a
+    /// side close only on a positive report of hedging.
+    #[serde(default)]
+    pub hedging_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

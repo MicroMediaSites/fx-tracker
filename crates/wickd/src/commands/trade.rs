@@ -57,6 +57,7 @@ use std::collections::HashMap;
 use wickd_core::config::OandaEnvironment;
 use wickd_core::models::Trade;
 use wickd_core::oanda::endpoints;
+use wickd_core::oanda::position_mode;
 use wickd_core::trade_fills::{self, TradeFills};
 use wickd_core::oanda::types::{
     EntryOptions, EntryOrderRequest, EntryOrderType, OandaAccount, OrderCreateResponse, TimeInForce,
@@ -1171,6 +1172,12 @@ async fn execute_close_armed(
             .detail(Some(format!("side={side}"))),
     )?;
     let (_, oanda) = client::resolve(env_str(env), account)?;
+    // AGT-781: this close goes by instrument+side. That is only the position
+    // the caller means on a NETTING account; with hedging enabled it would
+    // close every trade open on that side at once. Assert the assumption
+    // before submitting rather than discover it from the fills. Cached per
+    // process, so an exit does not pay a round trip for the check.
+    position_mode::ensure_netting_account(&oanda).await?;
     // AGT-595: a close is still live execution — a tripped daily-loss
     // kill-switch halts it too (size/max-open caps don't apply to a close).
     risk::enforce_live_close(&oanda).await?;

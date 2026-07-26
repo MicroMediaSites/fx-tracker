@@ -5,11 +5,13 @@
 //! - `client`: The HTTP client wrapper with authentication
 //! - `types`: OANDA API response types (their exact JSON structure)
 //! - `endpoints`: Functions for each API endpoint
+//! - `position_mode`: netting-vs-hedging guard for the close path
 //! - `streaming`: Real-time price streaming
 
 pub mod client;
 pub mod types;
 pub mod endpoints;
+pub mod position_mode;
 pub mod streaming;
 
 // Re-export the main client for convenience

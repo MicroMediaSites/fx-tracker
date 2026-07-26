@@ -469,3 +469,26 @@ The signal feed is bounded by **rotation**, not by a rewrite (AGT-777): past
 appended mid-operation — the queue has two independent writer processes
 (`signal_alert.rs`, `sink.rs`). Readers take the tail through the archives, so
 rotation is invisible to `daemon_queue_list` and `wickd queue list`.
+
+## Netting accounts, and the close path (AGT-781)
+
+**wickd assumes a netting OANDA account.** `close_position` closes by
+instrument and side, which on a netting account is exactly the position the
+caller means — one side of an instrument is one position.
+
+On a **hedging** account it is not. Several trades can be open on the same side
+at once, and a side close takes out *every one of them*, with nothing in the
+response distinguishing that from the single close the caller intended.
+
+So the live close path asserts the assumption before submitting
+(`oanda::position_mode::ensure_netting_account`): if OANDA reports
+`hedgingEnabled` on the account, the close is refused with an error naming the
+per-trade close as the alternative. The lookup is cached per process — OANDA
+fixes hedging at account creation, so it cannot flip under a running daemon,
+and an exit does not pay a round trip for the check.
+
+The guard refuses only on a **positive** report of hedging. An account that
+does not carry the field, or an account read that fails, proceeds with a
+warning: failing closed on an absent field would take out every live close the
+moment OANDA trimmed a payload. The guard protects where the broker tells us,
+and says so when it cannot.
