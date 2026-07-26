@@ -320,6 +320,35 @@ pub async fn close_position(
     instrument: &str,
     is_long: bool,
 ) -> Result<ClosePositionResponse> {
+    close_position_units(client, instrument, is_long, super::types::CloseUnits::All).await
+}
+
+/// Close `units` of one side of a position, rather than all of it (AGT-783).
+///
+/// This is what a strategy's `PartialExit` executes as. It goes against the
+/// *position* rather than a trade id ([`close_trade`]) because that is the unit
+/// the auto-executor tracks and the unit a partial exit is expressed in — "take
+/// 40% off" is a statement about the position.
+///
+/// A non-positive count is refused rather than sent: OANDA would reject it, but
+/// only after the attempt is on the wire, and a caller asking to close zero
+/// units has a bug worth surfacing where it happened.
+pub async fn close_position_units(
+    client: &OandaClient,
+    instrument: &str,
+    is_long: bool,
+    units: super::types::CloseUnits,
+) -> Result<ClosePositionResponse> {
+    if let super::types::CloseUnits::Partial(count) = units {
+        if count <= rust_decimal::Decimal::ZERO {
+            return Err(Error::InvalidArgument(format!(
+                "cannot close {count} units of the {} position on {instrument}: \
+                 the amount must be positive",
+                if is_long { "long" } else { "short" }
+            )));
+        }
+    }
+
     let url = format!(
         "{}/v3/accounts/{}/positions/{}/close",
         client.base_url(),
@@ -327,9 +356,9 @@ pub async fn close_position(
         instrument
     );
     let close_request = if is_long {
-        ClosePositionRequest::close_long()
+        ClosePositionRequest::close_long_units(units)
     } else {
-        ClosePositionRequest::close_short()
+        ClosePositionRequest::close_short_units(units)
     };
     let response = client.put(&url).json(&close_request).send().await?;
     let text = response.text().await?;

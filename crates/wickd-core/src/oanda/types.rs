@@ -783,17 +783,24 @@ pub struct ClosePositionRequest {
 
 impl ClosePositionRequest {
     pub fn close_long() -> Self {
-        Self {
-            long_units: Some("ALL".to_string()),
-            short_units: None,
-        }
+        Self::close_long_units(CloseUnits::All)
     }
 
     pub fn close_short() -> Self {
-        Self {
-            long_units: None,
-            short_units: Some("ALL".to_string()),
-        }
+        Self::close_short_units(CloseUnits::All)
+    }
+
+    /// Close part of the long side (AGT-783). OANDA's position close takes a
+    /// unit count in the same field as `"ALL"` — which is what makes a partial
+    /// exit expressible against a *position* without resolving trade ids.
+    pub fn close_long_units(units: CloseUnits) -> Self {
+        Self { long_units: Some(units.wire()), short_units: None }
+    }
+
+    /// Close part of the short side. The count is a magnitude, as everywhere
+    /// else OANDA takes units to close.
+    pub fn close_short_units(units: CloseUnits) -> Self {
+        Self { long_units: None, short_units: Some(units.wire()) }
     }
 }
 
