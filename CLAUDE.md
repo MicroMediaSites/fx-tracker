@@ -96,7 +96,10 @@ ones; versioned via `PRAGMA user_version`). See `docs/local-store.md`.
 ## NEVER Touch
 
 - **Environment files**: NEVER read, write, edit, copy, move, or modify any `.env*` files
-- **Railway**: NEVER run `railway` CLI commands (the remaining Railway project is being torn down)
+- **Railway**: not restricted (operator decision, Matt Pardini, 2026-07-25 — replaces the
+  previous blanket prohibition). Note the remaining Railway project here was being torn down, so
+  check what still exists before acting on it. `railway down`/`railway delete` are destructive —
+  confirm those first.
 - **The running daemon**: never disturb `com.openthink.wickd-*` launchd jobs or `~/.wickd` state
 
 ## Production builds (allowed — Matt, 2026-07-16)
