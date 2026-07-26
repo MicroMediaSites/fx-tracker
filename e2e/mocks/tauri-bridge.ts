@@ -319,6 +319,10 @@ export function getTauriBridgeScript() {
         count: 0,
         realized: '0',
         blended_exits: 0,
+        // AGT-784: how many blended exits the CLI broke back down into real
+        // fills. Zero here because the default history has no trades at all.
+        decomposed_exits: 0,
+        decompose_error: null,
         truncated: false,
         trades: [],
       },

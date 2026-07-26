@@ -16,8 +16,8 @@
  *  - When OANDA's fetch cap is hit, a banner says the history may be
  *    incomplete rather than letting a partial list read as the whole record.
  */
-import { useEffect } from 'react';
-import { HistoryTrade, useAccountHistory } from '../../hooks/useAccountHistory';
+import { useEffect, useState } from 'react';
+import { ExitFill, HistoryTrade, useAccountHistory } from '../../hooks/useAccountHistory';
 
 const money = (value: string | null, signed = false): string => {
   if (value === null) return '—';
@@ -32,6 +32,13 @@ const money = (value: string | null, signed = false): string => {
 };
 
 const price = (value: string | null): string => value ?? '—';
+
+/** Unit size, thousands-grouped, keeping any sign. Falls back to the raw
+ *  string rather than blanking a number we merely failed to parse. */
+const units = (value: string): string => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toLocaleString() : value;
+};
 
 const pnlColor = (value: string): string => {
   const n = Number(value);
@@ -64,8 +71,91 @@ export const formatDuration = (secs: number | null): string => {
   return remH > 0 ? `${d}d ${remH}h` : `${d}d`;
 };
 
+/** Sum a fill field, tolerating a value the backend could not parse. */
+const sumOf = (fills: ExitFill[], pick: (f: ExitFill) => string): number =>
+  fills.reduce((total, f) => {
+    const n = Number(pick(f));
+    return Number.isFinite(n) ? total + n : total;
+  }, 0);
+
+/**
+ * The real fills behind a blended exit price (AGT-782/784), one row each, with
+ * a total that reconciles against the trade's own size and P&L shown above.
+ *
+ * The backend only sends `exits` when they add up, so this cannot show a
+ * partial set — but the total is rendered anyway so the two can be checked
+ * against each other on screen rather than taken on trust.
+ */
+const ExitBreakdown = ({ trade, fills }: { trade: HistoryTrade; fills: ExitFill[] }) => {
+  const totalUnits = Math.abs(sumOf(fills, (f) => f.units));
+  const totalPl = sumOf(fills, (f) => f.realized_pl);
+
+  // The backend already refuses to send a set that does not reconcile, so this
+  // should always hold — it is rendered so the two numbers can be checked
+  // against each other on screen instead of taken on trust, and so a future
+  // regression shows up in the UI rather than hiding behind it. Tolerances
+  // absorb float display error only; these come off exact Decimals.
+  const reconciles =
+    Math.abs(totalUnits - Math.abs(Number(trade.units))) < 1e-6 &&
+    Math.abs(totalPl - Number(trade.realized_pl)) < 1e-6;
+
+  return (
+    <div
+      data-testid="history-exit-breakdown"
+      className="col-span-3 mt-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-card)]"
+    >
+      {fills.map((fill, i) => (
+        <div
+          key={fill.transaction_id}
+          data-testid="history-exit-fill"
+          className="grid grid-cols-[auto_1fr_auto_auto] items-center gap-x-3 px-3 py-1.5 text-[11px] font-mono text-[var(--color-text-secondary)] border-b border-[var(--color-border)]/50 last:border-b-0"
+        >
+          <span className="text-[var(--color-text-faint)] tabular-nums">#{i + 1}</span>
+          <span className="text-[var(--color-text-muted)]">{timeLabel(fill.time)}</span>
+          <span className="tabular-nums">
+            {price(fill.price)}
+            {/* Grouped like the total below it, so the column reads as one set
+                of numbers rather than two formats. The sign is kept: an exit is
+                signed against its trade's direction. */}
+            <span className="text-[var(--color-text-faint)]"> · {units(fill.units)}u</span>
+          </span>
+          <span className={`tabular-nums text-right ${pnlColor(fill.realized_pl)}`}>
+            {money(fill.realized_pl, true)}
+          </span>
+        </div>
+      ))}
+      <div
+        data-testid="history-exit-total"
+        className="grid grid-cols-[auto_1fr_auto_auto] items-center gap-x-3 px-3 py-1.5 text-[11px] font-mono border-t border-[var(--color-border)] text-[var(--color-text-muted)]"
+      >
+        <span aria-hidden="true" />
+        <span>
+          {fills.length} fills
+          {reconciles ? (
+            <span className="text-[var(--color-text-faint)]"> · matches the trade</span>
+          ) : (
+            <span data-testid="history-exit-mismatch" className="text-[var(--color-warning)]">
+              {' '}
+              · does NOT match the trade
+            </span>
+          )}
+        </span>
+        <span className="tabular-nums">{totalUnits.toLocaleString()}u</span>
+        <span className={`tabular-nums text-right ${pnlColor(String(totalPl))}`}>
+          {money(String(totalPl), true)}
+        </span>
+      </div>
+    </div>
+  );
+};
+
 const TradeRow = ({ trade }: { trade: HistoryTrade }) => {
   const long = trade.side === 'long';
+  // Present only when the CLI could break the blend back into real fills; the
+  // backend withholds a set that does not reconcile, so anything here is whole.
+  const fills = trade.exits ?? null;
+  const [showFills, setShowFills] = useState(false);
+
   return (
     <div
       data-testid="history-trade-row"
@@ -93,15 +183,30 @@ const TradeRow = ({ trade }: { trade: HistoryTrade }) => {
         <span title={`Entry ${timeLabel(trade.entry.time)}`}>{price(trade.entry.price)}</span>
         <span className="text-[var(--color-text-faint)]">→</span>
         <span title={`Exit ${timeLabel(trade.exit.time)}`}>{price(trade.exit.price)}</span>
-        {trade.exit.blended && (
-          <span
-            data-testid="history-blended"
-            className="px-1 py-0.5 text-[10px] rounded bg-[var(--color-warning)]/15 text-[var(--color-warning)]"
-            title={`${trade.exit.count} separate exits — this price is their average, not a single fill`}
-          >
-            {trade.exit.count} exits · avg
-          </span>
-        )}
+        {trade.exit.blended &&
+          (fills ? (
+            // Decomposed: the average is still what's shown above, but the real
+            // fills are one click away, so the badge opens them rather than
+            // just apologising for the number.
+            <button
+              type="button"
+              data-testid="history-exits-toggle"
+              aria-expanded={showFills}
+              onClick={() => setShowFills((open) => !open)}
+              className="px-1 py-0.5 text-[10px] rounded bg-[var(--color-bg-elevated)] border border-[var(--color-border)] text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:border-[var(--color-text-faint)] transition-colors"
+              title={`${trade.exit.count} separate exits — this price is their average. Show each real fill.`}
+            >
+              {trade.exit.count} exits · {showFills ? 'hide' : 'show'}
+            </button>
+          ) : (
+            <span
+              data-testid="history-blended"
+              className="px-1 py-0.5 text-[10px] rounded bg-[var(--color-warning)]/15 text-[var(--color-warning)]"
+              title={`${trade.exit.count} separate exits — this price is their average, not a single fill`}
+            >
+              {trade.exit.count} exits · avg
+            </span>
+          ))}
       </div>
 
       {/* Right: realized P&L */}
@@ -124,6 +229,8 @@ const TradeRow = ({ trade }: { trade: HistoryTrade }) => {
           </>
         )}
       </div>
+
+      {fills && showFills && <ExitBreakdown trade={trade} fills={fills} />}
     </div>
   );
 };
@@ -206,9 +313,18 @@ export const AccountHistoryModal = ({ account, onClose }: Props) => {
                 </p>
               )}
               {data.blended_exits > 0 && (
-                <p className="mb-3 text-xs text-[var(--color-text-muted)]">
+                <p data-testid="history-blended-summary" className="mb-3 text-xs text-[var(--color-text-muted)]">
                   {data.blended_exits} {data.blended_exits === 1 ? 'trade' : 'trades'} closed in
-                  multiple exits; those exit prices are averages (marked "avg").
+                  multiple exits; those exit prices are averages.{' '}
+                  {(data.decomposed_exits ?? 0) > 0 && (
+                    <>
+                      {data.decomposed_exits} broken out into the real fills — click "show" on a
+                      trade to see them.{' '}
+                    </>
+                  )}
+                  {data.blended_exits > (data.decomposed_exits ?? 0) && (
+                    <>The rest are marked "avg".</>
+                  )}
                 </p>
               )}
               <div className="space-y-1.5">
