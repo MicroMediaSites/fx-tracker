@@ -16,6 +16,18 @@ export interface TradeExit {
   blended: boolean;
 }
 
+/** One real exit fill behind a blended average (AGT-782). */
+export interface ExitFill {
+  /** The OANDA `ORDER_FILL` transaction this fill came from. */
+  transaction_id: string;
+  time: string;
+  /** The price this fill actually happened at — not the blended average. */
+  price: string;
+  /** Signed as OANDA signs it: opposite the trade's direction. */
+  units: string;
+  realized_pl: string;
+}
+
 export interface HistoryTrade {
   id: string;
   instrument: string;
@@ -24,6 +36,15 @@ export interface HistoryTrade {
   strategy: string | null;
   entry: { time: string; price: string };
   exit: TradeExit;
+  /**
+   * The fills behind `exit.price`, oldest first — or `null` when the trade was
+   * not decomposed (no transaction coverage, or fills that did not reconcile).
+   *
+   * `null` and `[]` mean different things: `null` is "we did not break this
+   * down", while an empty array would claim the trade had no exits at all.
+   * Optional because a history from an older CLI has no such field.
+   */
+  exits?: ExitFill[] | null;
   realized_pl: string;
   duration_secs: number | null;
 }
@@ -38,6 +59,13 @@ export interface AccountHistory {
   realized: string;
   /** How many trades in this window had a blended (multi-fill) exit. */
   blended_exits: number;
+  /**
+   * How many of those the transaction feed could break back down into real
+   * fills. Below `blended_exits` means some trade kept its average.
+   */
+  decomposed_exits?: number;
+  /** Why the decomposition did not run, when it was wanted but failed. */
+  decompose_error?: string | null;
   /**
    * True when the paged walk hit its page budget with history still unread —
    * the result does NOT reach back to `since`.
