@@ -67,6 +67,7 @@ use wickd_core::config::OandaEnvironment;
 use wickd_core::event_sink::EventSink;
 use wickd_core::models::Position;
 use wickd_core::oanda::streaming::{PriceUpdate, StreamError, StreamHealthStatus};
+use rust_decimal::Decimal;
 use wickd_core::shared::PositionDirection;
 use wickd_core::strategy::{
     MatchStatusUpdateEvent, MatchType, PatternMatchEvent, StrategyErrorEvent, StrategyStatusEvent,
@@ -114,6 +115,14 @@ pub enum AutoIntent {
     Close {
         instrument: String,
     },
+    /// Take part of the position off (AGT-783). Carries the fraction the
+    /// strategy asked for, as OANDA-independent percent (0 < pct < 100) — the
+    /// units it works out to depend on what is actually open, which only the
+    /// executor knows.
+    ClosePartial {
+        instrument: String,
+        close_percent: Decimal,
+    },
 }
 
 /// Classify a surfaced pattern-match event into an [`AutoIntent`], or `None` for
@@ -133,8 +142,23 @@ pub fn intent_from_match(ev: &PatternMatchEvent) -> Option<AutoIntent> {
             tp: pm.take_profit.map(|d| d.to_string()),
             strategy: ev.strategy_name.clone(),
         })
+    } else if pm.match_type == MatchType::PartialExit {
+        // AGT-783: a partial exit used to collapse to a full close here, so a
+        // strategy that backtested with partial exits did not trade that way.
+        // A percent at or above 100 IS a full close — the rules engine already
+        // routes those to `Exit`, and a missing percent is treated the same way
+        // rather than guessing a fraction.
+        match pm.close_percent.and_then(Decimal::from_f64_retain) {
+            Some(pct) if pct > Decimal::ZERO && pct < Decimal::from(100) => {
+                Some(AutoIntent::ClosePartial {
+                    instrument: pm.instrument.clone(),
+                    close_percent: pct,
+                })
+            }
+            _ => Some(AutoIntent::Close { instrument: pm.instrument.clone() }),
+        }
     } else {
-        // Exit / PartialExit: close the position we hold on this instrument.
+        // Exit: close the position we hold on this instrument.
         Some(AutoIntent::Close {
             instrument: pm.instrument.clone(),
         })
@@ -166,6 +190,10 @@ fn side_str(direction: PositionDirection) -> &'static str {
 struct OpenPosition {
     /// "long" | "short" — the side to hand the guarded close path.
     side: &'static str,
+    /// Units currently believed open, as a magnitude (AGT-783). A partial exit
+    /// is a fraction OF something, so the executor has to know how big the
+    /// position is; a full close does not care.
+    units: Decimal,
 }
 
 /// What the executor should do with an intent given the current position state.
@@ -183,6 +211,13 @@ enum ExecDecision {
     },
     /// Close the open position on `instrument` (side tracked locally).
     Close { instrument: String, side: &'static str },
+    /// Take `units` off the position, leaving the rest open (AGT-783).
+    ClosePartial { instrument: String, side: &'static str, units: Decimal },
+    /// A partial exit that works out to less than one unit of the position.
+    /// Reported rather than rounded up — and explicitly NOT downgraded to a
+    /// full close, which is what the old collapse did and what would surprise
+    /// a strategy most.
+    SkipPartialTooSmall { instrument: String, close_percent: Decimal, position_units: Decimal },
     /// An entry arrived while a position is already open on the instrument — do
     /// NOT place a second order (AC4).
     SkipDuplicateEntry { instrument: String },
@@ -262,6 +297,33 @@ impl AutoExecutor {
                     instrument: instrument.clone(),
                 },
             },
+            AutoIntent::ClosePartial { instrument, close_percent } => {
+                match self.positions.get(instrument) {
+                    Some(pos) => {
+                        // Truncated, not rounded: closing MORE than the
+                        // strategy asked for is the worse error, and a
+                        // fraction that does not reach a whole unit is a
+                        // no-op the caller should hear about.
+                        let units = (pos.units * close_percent / Decimal::from(100)).trunc();
+                        if units < Decimal::ONE {
+                            ExecDecision::SkipPartialTooSmall {
+                                instrument: instrument.clone(),
+                                close_percent: *close_percent,
+                                position_units: pos.units,
+                            }
+                        } else {
+                            ExecDecision::ClosePartial {
+                                instrument: instrument.clone(),
+                                side: pos.side,
+                                units,
+                            }
+                        }
+                    }
+                    None => ExecDecision::SkipCloseWhenFlat {
+                        instrument: instrument.clone(),
+                    },
+                }
+            }
         }
     }
 
@@ -269,10 +331,22 @@ impl AutoExecutor {
     fn record_open(&mut self, instrument: &str, units: i64) {
         self.positions.insert(
             instrument.to_string(),
-            OpenPosition {
-                side: side_of(units),
-            },
+            OpenPosition { side: side_of(units), units: Decimal::from(units.abs()) },
         );
+    }
+
+    /// Record that a partial close took `units` off (AGT-783). The position
+    /// STAYS open — that is the whole point of a partial exit, and it keeps the
+    /// AC4 duplicate-entry guard armed for the remainder. A partial that
+    /// somehow took everything is treated as a close.
+    fn record_partial_close(&mut self, instrument: &str, units: Decimal) {
+        let Some(pos) = self.positions.get_mut(instrument) else {
+            return;
+        };
+        pos.units -= units;
+        if pos.units <= Decimal::ZERO {
+            self.positions.remove(instrument);
+        }
     }
 
     /// Record that a close removed our position (AC4 state update).
@@ -286,12 +360,13 @@ impl AutoExecutor {
     /// a duplicate entry on this instrument is suppressed and a close signal
     /// routes to the guarded close path against the side we actually hold.
     /// Idempotent per instrument (a re-adopt just overwrites the side).
-    fn adopt(&mut self, instrument: &str, direction: PositionDirection) {
+    /// `units` is what OANDA reports as held, so a partial exit on an adopted
+    /// position works off the real size rather than the `--units` this run
+    /// happens to be configured with (AGT-783).
+    fn adopt(&mut self, instrument: &str, direction: PositionDirection, units: i64) {
         self.positions.insert(
             instrument.to_string(),
-            OpenPosition {
-                side: side_str(direction),
-            },
+            OpenPosition { side: side_str(direction), units: Decimal::from(units.abs()) },
         );
     }
 
@@ -425,7 +500,7 @@ fn apply_reconciliation_inner(
                        duplicate entries stay suppressed and the strategy's close logic \
                        resumes after warmup",
         }));
-        exec.adopt(&a.instrument, a.side);
+        exec.adopt(&a.instrument, a.side, a.units);
         // mode="live" here means "a real broker position" (not a paper/dry-run
         // `not_submitted` decision) — the paper-vs-real distinction the `mode`
         // column carries. Which OANDA endpoint it lives on is the separate
@@ -583,6 +658,63 @@ pub async fn run_executor(mut exec: AutoExecutor, mut rx: UnboundedReceiver<Auto
                     }
                 }
             }
+            ExecDecision::ClosePartial { instrument, side, units } => {
+                // `live: true` matches the entry and full-close arms above:
+                // under `--auto` there is no paper mode to fall back to — the
+                // mode IS autonomous submission. It is safe because
+                // `reject_auto_live` refuses `--auto` against the live env at
+                // startup and `Arming::AutoPractice` fails closed there anyway,
+                // so "live" here can only ever mean the practice endpoint.
+                match trade::execute_close_partial_auto(
+                    exec.env,
+                    &exec.account,
+                    &instrument,
+                    side,
+                    units,
+                    true,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        // The position is REDUCED, not gone: keep tracking the
+                        // remainder so the duplicate-entry guard stays armed
+                        // and the next exit still has something to close.
+                        exec.record_partial_close(&instrument, units);
+                        emit_auto_result("auto-position-partially-closed", result);
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        // A partial close that failed because we are flat means
+                        // the whole position is gone, not part of it.
+                        let definitively_flat = close_error_means_flat(&msg);
+                        if definitively_flat {
+                            exec.record_close(&instrument);
+                        }
+                        emit_auto_line(&serde_json::json!({
+                            "event": "auto-close-error",
+                            "action": "close_partial",
+                            "instrument": instrument,
+                            "side": side,
+                            "units": units.to_string(),
+                            "error": msg,
+                            "state_cleared": definitively_flat,
+                        }));
+                    }
+                }
+            }
+            ExecDecision::SkipPartialTooSmall { instrument, close_percent, position_units } => {
+                // Explicitly NOT a full close. Collapsing here is exactly the
+                // divergence AGT-783 exists to remove, so the signal is
+                // reported as unexecutable instead.
+                emit_auto_line(&serde_json::json!({
+                    "event": "auto-skip",
+                    "reason": "partial exit rounds to less than one unit — nothing closed",
+                    "action": "close_partial",
+                    "instrument": instrument,
+                    "close_percent": close_percent.to_string(),
+                    "position_units": position_units.to_string(),
+                }));
+            }
             ExecDecision::SkipDuplicateEntry { instrument } => {
                 // Trust-but-verify (2026-07-17): the tracked position may be a
                 // corpse — the broker filled its stop/TP and our map never
@@ -735,6 +867,29 @@ mod tests {
         }
     }
 
+    /// A PartialExit match asking for `close_percent` of the position — the
+    /// shape `RulesSignal::PartialExit` produces via `PatternMatch::partial_exit`.
+    fn partial_exit_event(
+        instrument: &str,
+        direction: PositionDirection,
+        close_percent: f64,
+    ) -> PatternMatchEvent {
+        let pm = PatternMatch::partial_exit(
+            "wickd-watch".to_string(),
+            "cfg-1".to_string(),
+            instrument.to_string(),
+            direction,
+            close_percent,
+            "synthetic partial exit".to_string(),
+            None,
+        );
+        PatternMatchEvent {
+            pattern_match: pm,
+            strategy_name: "revert_adx".to_string(),
+            timeframe: "H1".to_string(),
+        }
+    }
+
     fn exec() -> AutoExecutor {
         AutoExecutor::new(OandaEnvironment::Practice, "default".to_string(), UNITS)
     }
@@ -784,6 +939,217 @@ mod tests {
             intent,
             AutoIntent::Close {
                 instrument: "EUR_USD".to_string()
+            }
+        );
+    }
+
+    // --- AGT-783: a partial exit executes as a partial close ---
+
+    // AC2: PartialExit and Exit no longer map to the same intent.
+    #[test]
+    fn partial_exit_maps_to_a_partial_close_carrying_the_fraction() {
+        let intent =
+            intent_from_match(&partial_exit_event("EUR_USD", PositionDirection::Long, 40.0))
+                .unwrap();
+
+        assert_eq!(
+            intent,
+            AutoIntent::ClosePartial {
+                instrument: "EUR_USD".to_string(),
+                close_percent: dec!(40),
+            }
+        );
+        // And it is NOT what an Exit maps to.
+        assert_ne!(intent, AutoIntent::Close { instrument: "EUR_USD".to_string() });
+    }
+
+    // AC4: a full exit is untouched by any of this.
+    #[test]
+    fn a_hundred_percent_partial_is_still_a_full_close() {
+        // The rules engine routes >= 100 to Exit, but a hand-built match can
+        // still say 100 — it means the same thing and must not become a
+        // partial close of the whole position.
+        let intent =
+            intent_from_match(&partial_exit_event("EUR_USD", PositionDirection::Long, 100.0))
+                .unwrap();
+
+        assert_eq!(intent, AutoIntent::Close { instrument: "EUR_USD".to_string() });
+    }
+
+    #[test]
+    fn a_partial_exit_with_no_percent_closes_in_full_rather_than_guessing() {
+        let mut ev = partial_exit_event("EUR_USD", PositionDirection::Long, 40.0);
+        ev.pattern_match.close_percent = None;
+
+        assert_eq!(
+            intent_from_match(&ev).unwrap(),
+            AutoIntent::Close { instrument: "EUR_USD".to_string() }
+        );
+    }
+
+    // AC1/AC6: the fraction the strategy emitted is the fraction the executor
+    // requests, resolved against the position actually held.
+    #[test]
+    fn a_partial_close_takes_that_fraction_of_the_open_position() {
+        let mut exec = exec();
+        exec.record_open("EUR_USD", 1000);
+
+        let decision = exec.decide(
+            &intent_from_match(&partial_exit_event("EUR_USD", PositionDirection::Long, 40.0))
+                .unwrap(),
+        );
+
+        assert_eq!(
+            decision,
+            ExecDecision::ClosePartial {
+                instrument: "EUR_USD".to_string(),
+                side: "long",
+                units: dec!(400),
+            }
+        );
+    }
+
+    #[test]
+    fn a_partial_close_leaves_the_remainder_open() {
+        let mut exec = exec();
+        exec.record_open("EUR_USD", 1000);
+
+        exec.record_partial_close("EUR_USD", dec!(400));
+
+        // Still open: the duplicate-entry guard stays armed on the remainder...
+        assert!(exec.is_open("EUR_USD"));
+        // ...and the next partial works off what is actually left.
+        let decision = exec.decide(&AutoIntent::ClosePartial {
+            instrument: "EUR_USD".to_string(),
+            close_percent: dec!(50),
+        });
+        assert_eq!(
+            decision,
+            ExecDecision::ClosePartial {
+                instrument: "EUR_USD".to_string(),
+                side: "long",
+                units: dec!(300), // 50% of the remaining 600
+            }
+        );
+    }
+
+    #[test]
+    fn a_partial_that_takes_everything_leaves_us_flat() {
+        let mut exec = exec();
+        exec.record_open("EUR_USD", 1000);
+
+        exec.record_partial_close("EUR_USD", dec!(1000));
+
+        assert!(!exec.is_open("EUR_USD"));
+    }
+
+    // AC3: a fraction below one unit is reported, NOT rounded up and NOT
+    // downgraded to a full close — the downgrade is the bug being fixed.
+    #[test]
+    fn a_partial_below_one_unit_is_skipped_explicitly() {
+        let mut exec = exec();
+        exec.record_open("EUR_USD", 1);
+
+        let decision = exec.decide(&AutoIntent::ClosePartial {
+            instrument: "EUR_USD".to_string(),
+            close_percent: dec!(40),
+        });
+
+        assert_eq!(
+            decision,
+            ExecDecision::SkipPartialTooSmall {
+                instrument: "EUR_USD".to_string(),
+                close_percent: dec!(40),
+                position_units: dec!(1),
+            }
+        );
+    }
+
+    #[test]
+    fn units_are_truncated_so_a_partial_never_closes_more_than_asked() {
+        let mut exec = exec();
+        exec.record_open("EUR_USD", 1000);
+
+        // 33.33% of 1000 is 333.3 — closing 334 would exceed the request.
+        let decision = exec.decide(&AutoIntent::ClosePartial {
+            instrument: "EUR_USD".to_string(),
+            close_percent: dec!(33.33),
+        });
+
+        assert_eq!(
+            decision,
+            ExecDecision::ClosePartial {
+                instrument: "EUR_USD".to_string(),
+                side: "long",
+                units: dec!(333),
+            }
+        );
+    }
+
+    #[test]
+    fn a_partial_exit_while_flat_is_a_noop() {
+        let exec = exec();
+
+        assert_eq!(
+            exec.decide(&AutoIntent::ClosePartial {
+                instrument: "EUR_USD".to_string(),
+                close_percent: dec!(40),
+            }),
+            ExecDecision::SkipCloseWhenFlat { instrument: "EUR_USD".to_string() }
+        );
+    }
+
+    #[test]
+    fn a_partial_exit_on_an_adopted_position_uses_the_brokers_size() {
+        // AGT-628 adopts a pre-existing position. Its real size — not this
+        // run's --units — is what a fraction applies to.
+        let mut exec = exec();
+        exec.adopt("EUR_USD", PositionDirection::Short, -5000);
+
+        assert_eq!(
+            exec.decide(&AutoIntent::ClosePartial {
+                instrument: "EUR_USD".to_string(),
+                close_percent: dec!(20),
+            }),
+            ExecDecision::ClosePartial {
+                instrument: "EUR_USD".to_string(),
+                side: "short",
+                units: dec!(1000),
+            }
+        );
+    }
+
+    // AC6: backtest and live agree. The percent the rules engine puts on a
+    // PartialExit is the percent the executor asks OANDA to close — no
+    // reinterpretation anywhere along the chain.
+    #[test]
+    fn the_fraction_the_engine_emits_is_the_fraction_the_executor_requests() {
+        use wickd_core::backtest::rules_engine::RulesSignal;
+
+        let emitted = RulesSignal::PartialExit {
+            reason: "scale out at 1R".to_string(),
+            close_percent: 50.0,
+            new_stop_loss: None,
+        };
+        let RulesSignal::PartialExit { close_percent, .. } = &emitted else {
+            panic!("constructed a PartialExit");
+        };
+
+        // The watcher builds exactly this from that signal (`StrategySignal`
+        // is `PatternMatch`; see watcher.rs / multi_watcher.rs).
+        let ev = partial_exit_event("EUR_USD", PositionDirection::Long, *close_percent);
+
+        let mut exec = exec();
+        exec.record_open("EUR_USD", 1000);
+        let decision = exec.decide(&intent_from_match(&ev).unwrap());
+
+        assert_eq!(
+            decision,
+            ExecDecision::ClosePartial {
+                instrument: "EUR_USD".to_string(),
+                side: "long",
+                // 50% of 1000 — the backtest would have taken half off too.
+                units: dec!(500),
             }
         );
     }

@@ -752,7 +752,12 @@ fn build_paper_order(env: OandaEnvironment, instrument: &str, units: i64, plan: 
 }
 
 /// Build the would-be close payload for paper mode. Pure: no network.
-fn build_paper_close(env: OandaEnvironment, instrument: &str, side: &str) -> serde_json::Value {
+fn build_paper_close(
+    env: OandaEnvironment,
+    instrument: &str,
+    side: &str,
+    units: CloseUnits,
+) -> serde_json::Value {
     serde_json::json!({
         "ok": true,
         "mode": Mode::Paper.as_str(),
@@ -760,7 +765,19 @@ fn build_paper_close(env: OandaEnvironment, instrument: &str, side: &str) -> ser
         "environment": env_str(env),
         "instrument": instrument,
         "side": side,
+        // "ALL" for a whole-side close; a count for a partial exit (AGT-783).
+        "units": units.wire(),
     })
+}
+
+/// The audit `detail` for a close. A whole-side close keeps exactly the string
+/// it has always written; only a partial adds the count, so existing audit
+/// rows stay comparable.
+fn close_audit_detail(side: &str, units: CloseUnits) -> String {
+    match units {
+        CloseUnits::All => format!("side={side}"),
+        CloseUnits::Partial(count) => format!("side={side} units={count}"),
+    }
 }
 
 /// The paper (dry-run) shape of a close-by-trade-id. Pure, so the contract is
@@ -1140,7 +1157,7 @@ async fn close(env: OandaEnvironment, account: &str, c: CloseArgs) -> Result<ser
     // clap guarantees both are present when --trade-id is absent.
     let instrument = c.instrument.as_deref().unwrap_or_default();
     let side = c.side.as_deref().unwrap_or_default();
-    execute_close_armed(env, account, instrument, side, c.live, arming).await
+    execute_close_armed(env, account, instrument, side, c.live, arming, CloseUnits::All).await
 }
 
 /// The guarded close of ONE trade, by id, for all or part of its units
@@ -1275,7 +1292,32 @@ pub(crate) async fn execute_close_auto(
     side: &str,
     live: bool,
 ) -> Result<serde_json::Value> {
-    execute_close_armed(env, account, instrument, side, live, Arming::AutoPractice).await
+    execute_close_armed(env, account, instrument, side, live, Arming::AutoPractice, CloseUnits::All)
+        .await
+}
+
+/// AGT-783: the programmatic PARTIAL close — the same guarded sequence with a
+/// unit count instead of the whole side. This is what a strategy's
+/// `PartialExit` executes as, and it is deliberately no easier to fire than a
+/// full close: same arming, same audit ordering, same kill-switch.
+pub(crate) async fn execute_close_partial_auto(
+    env: OandaEnvironment,
+    account: &str,
+    instrument: &str,
+    side: &str,
+    units: Decimal,
+    live: bool,
+) -> Result<serde_json::Value> {
+    execute_close_armed(
+        env,
+        account,
+        instrument,
+        side,
+        live,
+        Arming::AutoPractice,
+        CloseUnits::Partial(units),
+    )
+    .await
 }
 
 /// The single guarded close sequence, shared by every close entry point. Paper by
@@ -1291,6 +1333,7 @@ async fn execute_close_armed(
     side: &str,
     live: bool,
     arming: Arming,
+    units: CloseUnits,
 ) -> Result<serde_json::Value> {
     let is_long = match side.to_lowercase().as_str() {
         "long" => true,
@@ -1304,9 +1347,9 @@ async fn execute_close_armed(
             audit::AuditEntry::now("close", Mode::Paper.as_str(), "not_submitted")
                 .env(env_str(env))
                 .instrument(instrument)
-                .detail(Some(format!("side={side}"))),
+                .detail(Some(close_audit_detail(side, units))),
         );
-        return Ok(build_paper_close(env, instrument, side));
+        return Ok(build_paper_close(env, instrument, side, units));
     }
 
     // Live: run the arming gate before unlocking the vault or touching the
@@ -1319,7 +1362,7 @@ async fn execute_close_armed(
         &audit::AuditEntry::now("close", Mode::Live.as_str(), "attempt")
             .env(env_str(env))
             .instrument(instrument)
-            .detail(Some(format!("side={side}"))),
+            .detail(Some(close_audit_detail(side, units))),
     )?;
     let (_, oanda) = client::resolve(env_str(env), account)?;
     // AGT-781: this close goes by instrument+side. That is only the position
@@ -1331,7 +1374,7 @@ async fn execute_close_armed(
     // AGT-595: a close is still live execution — a tripped daily-loss
     // kill-switch halts it too (size/max-open caps don't apply to a close).
     risk::enforce_live_close(&oanda).await?;
-    let response = match endpoints::close_position(&oanda, instrument, is_long)
+    let response = match endpoints::close_position_units(&oanda, instrument, is_long, units)
         .await
         .context("OANDA position close failed")
     {
@@ -1368,7 +1411,7 @@ async fn execute_close_armed(
         )
         .env(env_str(env))
         .instrument(instrument)
-        .detail(Some(format!("side={side}"))),
+        .detail(Some(close_audit_detail(side, units))),
     );
 
     let env_name = env_str(env);
@@ -2563,6 +2606,7 @@ mod tests {
             OandaEnvironment::Practice,
             c.instrument.as_deref().unwrap(),
             c.side.as_deref().unwrap(),
+            CloseUnits::All,
         );
         assert_eq!(v["mode"], "paper");
         assert_eq!(v["submitted"], false);
