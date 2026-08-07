@@ -36,6 +36,16 @@ const GLANCE_TIMEOUT: Duration = Duration::from_secs(90);
 ///
 /// Money crosses as strings (exact decimals, never lossy floats) — same
 /// convention as the CLI's audit ledger and backtest metrics.
+/// One open position, passed through verbatim from the CLI (exact decimal
+/// strings, same convention as everything else here).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenPosition {
+    pub instrument: String,
+    /// Net signed units (negative = short).
+    pub units: String,
+    pub unrealized_pl: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountGlance {
     /// Primary display name (the informative one when an account is aliased).
@@ -45,6 +55,16 @@ pub struct AccountGlance {
     pub names: Vec<String>,
     #[serde(default)]
     pub account_id: Option<String>,
+    /// OANDA's own account name — what the broker dashboard shows. This layer
+    /// re-serializes the CLI's JSON, so any field missing HERE is silently
+    /// stripped before the frontend sees it (how the alias went missing on
+    /// 2026-08-06).
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// Open positions; None = the CLI's fetch failed (UI falls back to the
+    /// bare count), Some([]) = genuinely flat. Keep the distinction.
+    #[serde(default)]
+    pub open_positions: Option<Vec<OpenPosition>>,
     #[serde(default)]
     pub currency: Option<String>,
     #[serde(default)]
