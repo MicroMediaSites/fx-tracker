@@ -55,7 +55,7 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 
 use wickd_core::config::OandaEnvironment;
-use wickd_core::models::Trade;
+use wickd_core::models::{Position, Trade};
 use wickd_core::oanda::endpoints;
 use wickd_core::oanda::position_mode;
 use wickd_core::oanda::types::CloseUnits;
@@ -1490,6 +1490,9 @@ struct AccountSnapshot {
     unrealized_pl: Decimal,
     currency: String,
     open_trade_count: i32,
+    /// OANDA's own account name ("CandleSight Demo MP") — what the broker's
+    /// dashboard shows, so surfaces rendering this row can match it.
+    alias: Option<String>,
 }
 
 impl AccountSnapshot {
@@ -1500,6 +1503,7 @@ impl AccountSnapshot {
             unrealized_pl: parse_dec(&a.unrealized_pl),
             currency: a.currency.clone(),
             open_trade_count: a.open_trade_count,
+            alias: a.alias.clone(),
         }
     }
 }
@@ -1709,16 +1713,37 @@ fn build_glance_row(
     account_id: &str,
     snap: &AccountSnapshot,
     closed: &[Trade],
+    open: Option<&[Position]>,
 ) -> serde_json::Value {
     let realized: Decimal = closed.iter().map(|t| t.realized_pl).sum();
     let wins = closed.iter().filter(|t| t.realized_pl > Decimal::ZERO).count();
     let losses = closed.iter().filter(|t| t.realized_pl < Decimal::ZERO).count();
     let decided = wins + losses;
 
+    // Null means "the open-positions fetch failed", which must stay
+    // distinguishable from "nothing open" ([]): the UI falls back to the bare
+    // count for the former and shows instruments for the latter.
+    let open_positions = match open {
+        None => serde_json::Value::Null,
+        Some(ps) => ps
+            .iter()
+            .filter(|p| p.units != Decimal::ZERO)
+            .map(|p| {
+                serde_json::json!({
+                    "instrument": p.instrument,
+                    "units": dec_str(p.units),
+                    "unrealized_pl": dec_str(p.unrealized_pl),
+                })
+            })
+            .collect(),
+    };
+
     serde_json::json!({
         "account": primary,
         "names": names,
         "account_id": account_id,
+        "alias": snap.alias,
+        "open_positions": open_positions,
         "currency": snap.currency,
         "nav": dec_str(snap.nav),
         "balance": dec_str(snap.balance),
@@ -1807,9 +1832,21 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
 
             match fetched {
                 Ok((acct, closed)) => {
+                    // Open instruments cost one more round trip, so only
+                    // accounts actually holding something pay it. A failure
+                    // degrades that row's open_positions to null — the count
+                    // from the account snapshot still renders.
+                    let open = if acct.open_trade_count > 0 {
+                        match endpoints::get_open_positions(&oanda).await {
+                            Ok(p) => Some(p),
+                            Err(_) => None,
+                        }
+                    } else {
+                        Some(Vec::new())
+                    };
                     let snap = AccountSnapshot::from_oanda(&acct);
                     let closed = closed_since(closed, since);
-                    build_glance_row(&primary, &names, &account_id, &snap, &closed)
+                    build_glance_row(&primary, &names, &account_id, &snap, &closed, open.as_deref())
                 }
                 Err(e) => serde_json::json!({
                     "account": primary,
@@ -2152,6 +2189,7 @@ mod tests {
             unrealized_pl: dec!(12),
             currency: "USD".into(),
             open_trade_count: 1,
+            alias: Some("CandleSight Demo MP".into()),
         }
     }
 
@@ -2177,7 +2215,8 @@ mod tests {
             closed_trade("2", "EUR_USD", dec!(100), dec!(-10), "2026-07-18T00:00:00Z", None),
             closed_trade("3", "GBP_USD", dec!(100), dec!(17.2), "2026-07-17T00:00:00Z", None),
         ];
-        let row = build_glance_row("h004", &["h004".into()], "101-1", &snap_10k(), &closed);
+        let row =
+            build_glance_row("h004", &["h004".into()], "101-1", &snap_10k(), &closed, Some(&[]));
 
         assert_eq!(row["realized"], "47.2");
         assert_eq!(row["trades"], 3);
@@ -2186,7 +2225,43 @@ mod tests {
         assert_eq!(row["win_rate"], 0.667);
         assert_eq!(row["nav"], "10012");
         assert_eq!(row["unrealized_pl"], "12");
+        assert_eq!(row["alias"], "CandleSight Demo MP");
+        assert_eq!(row["open_positions"], serde_json::json!([]));
         assert!(row["error"].is_null());
+    }
+
+    #[test]
+    fn glance_row_lists_open_instruments_and_nulls_a_failed_fetch() {
+        let open = vec![
+            Position {
+                instrument: "USD_JPY".into(),
+                units: dec!(2000),
+                average_price: dec!(147.2),
+                unrealized_pl: dec!(1.25),
+                realized_pl: dec!(0),
+            },
+            // Flat rows (net zero) come back from OANDA's /positions history —
+            // they are not open exposure and must not render as such.
+            Position {
+                instrument: "EUR_USD".into(),
+                units: dec!(0),
+                average_price: dec!(0),
+                unrealized_pl: dec!(0),
+                realized_pl: dec!(-3),
+            },
+        ];
+        let row =
+            build_glance_row("tf-m15", &["tf-m15".into()], "101-4", &snap_10k(), &[], Some(&open));
+        assert_eq!(
+            row["open_positions"],
+            serde_json::json!([
+                {"instrument": "USD_JPY", "units": "2000", "unrealized_pl": "1.25"}
+            ])
+        );
+
+        let failed =
+            build_glance_row("tf-m15", &["tf-m15".into()], "101-4", &snap_10k(), &[], None);
+        assert!(failed["open_positions"].is_null());
     }
 
     #[test]
@@ -2195,7 +2270,7 @@ mod tests {
             closed_trade("1", "EUR_USD", dec!(100), dec!(5), "2026-07-19T00:00:00Z", None),
             closed_trade("2", "EUR_USD", dec!(100), dec!(0), "2026-07-18T00:00:00Z", None),
         ];
-        let row = build_glance_row("h004", &["h004".into()], "101-1", &snap_10k(), &closed);
+        let row = build_glance_row("h004", &["h004".into()], "101-1", &snap_10k(), &closed, Some(&[]));
 
         // Counted as a trade, excluded from the win-rate denominator: 1/1, not 1/2.
         assert_eq!(row["trades"], 2);
@@ -2206,7 +2281,7 @@ mod tests {
 
     #[test]
     fn glance_row_empty_window_has_null_win_rate() {
-        let row = build_glance_row("tf-h1", &["tf-h1".into()], "101-6", &snap_10k(), &[]);
+        let row = build_glance_row("tf-h1", &["tf-h1".into()], "101-6", &snap_10k(), &[], Some(&[]));
 
         assert_eq!(row["trades"], 0);
         assert_eq!(row["realized"], "0");
@@ -2478,6 +2553,7 @@ mod tests {
             unrealized_pl: dec!(5),
             currency: "USD".into(),
             open_trade_count: 1,
+            alias: None,
         };
         // Newest-first, as `closed_since` hands them to `build_report`.
         let closed = vec![
@@ -2518,6 +2594,7 @@ mod tests {
             unrealized_pl: dec!(0),
             currency: "USD".into(),
             open_trade_count: 0,
+            alias: None,
         };
         let closed = vec![closed_trade(
             "9", "EUR_USD", dec!(1000), dec!(5), "2026-07-06T00:00:00Z", None,

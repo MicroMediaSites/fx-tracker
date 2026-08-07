@@ -112,6 +112,21 @@ export const orderedAccounts = (accounts: AccountGlance[]): AccountGlance[] => {
  * scanning the grid should surface which accounts moved without reading any
  * labels.
  */
+/** `USD_JPY` → `USD/JPY`, matching how OANDA's dashboard writes pairs. */
+export const pairLabel = (instrument: string): string => instrument.replace('_', '/');
+
+/**
+ * `+2k` / `−2k` from an exact units string — direction at a glance without
+ * spending tile width on the word "long"/"short".
+ */
+export const unitsLabel = (units: string): string => {
+  const n = Number(units);
+  if (!Number.isFinite(n) || n === 0) return '';
+  const abs = Math.abs(n);
+  const compact = abs >= 1000 && abs % 100 === 0 ? `${abs / 1000}k` : String(abs);
+  return `${n > 0 ? '+' : '−'}${compact}`;
+};
+
 const AccountTile = ({ acct, onOpen }: { acct: AccountGlance; onOpen: (account: string) => void }) => {
   const aliases = acct.names.slice(1);
   const suffix = accountSuffix(acct.account_id);
@@ -163,9 +178,29 @@ const AccountTile = ({ acct, onOpen }: { acct: AccountGlance; onOpen: (account: 
           : 'border-[var(--color-border)]'
       }`}
     >
+      {/* OANDA's own account name leads — it is what the broker dashboard
+          shows, so the tile and the OANDA UI can be matched by eye. The
+          internal config name drops to the small mono line below it. */}
       <div className="flex items-baseline gap-1.5 min-w-0">
-        <span className="text-xs font-mono text-[var(--color-text-secondary)] truncate">
-          {acct.account}
+        <span
+          data-testid="account-title"
+          className="text-xs text-[var(--color-text-secondary)] truncate"
+          title={acct.alias ? `OANDA account name: ${acct.alias}` : undefined}
+        >
+          {acct.alias || acct.account}
+        </span>
+        {aliases.length > 0 && (
+          <span
+            className="text-[11px] text-[var(--color-text-faint)] shrink-0"
+            title={`Also configured as ${aliases.join(', ')} — same OANDA account`}
+          >
+            +{aliases.length}
+          </span>
+        )}
+      </div>
+      <div className="flex items-baseline gap-1.5 min-w-0">
+        <span className="text-[10px] font-mono text-[var(--color-text-faint)] truncate">
+          {acct.alias ? acct.account : ''}
         </span>
         {suffix && (
           <span
@@ -173,14 +208,6 @@ const AccountTile = ({ acct, onOpen }: { acct: AccountGlance; onOpen: (account: 
             title={`OANDA sub-account ${suffix}`}
           >
             {suffix}
-          </span>
-        )}
-        {aliases.length > 0 && (
-          <span
-            className="text-[11px] text-[var(--color-text-faint)] shrink-0"
-            title={`Also configured as ${aliases.join(', ')} — same OANDA account`}
-          >
-            +{aliases.length}
           </span>
         )}
       </div>
@@ -200,7 +227,9 @@ const AccountTile = ({ acct, onOpen }: { acct: AccountGlance; onOpen: (account: 
         ) : (
           <>
             {acct.trades ?? 0}t · {percent(acct.win_rate)}
-            {openPl !== null && openPl !== 0 && (
+            {/* Fallback when the CLI couldn't list instruments (null) but the
+                account does hold something: the old bare open P&L. */}
+            {!acct.open_positions?.length && openPl !== null && openPl !== 0 && (
               <>
                 {' · '}
                 <span className={pnlColor(openPl)}>
@@ -211,6 +240,29 @@ const AccountTile = ({ acct, onOpen }: { acct: AccountGlance; onOpen: (account: 
           </>
         )}
       </div>
+
+      {/* Open positions by name — "open (2)" in the hero is findable here. */}
+      {(acct.open_positions?.length ?? 0) > 0 && (
+        <div data-testid="account-open-positions" className="mt-0.5 space-y-px">
+          {acct.open_positions!.slice(0, 2).map((p) => (
+            <div
+              key={p.instrument}
+              className="text-[11px] font-mono tabular-nums truncate text-[var(--color-text-muted)]"
+            >
+              {unitsLabel(p.units)} {pairLabel(p.instrument)}
+              {' · '}
+              <span className={pnlColor(parse(p.unrealized_pl))}>
+                {money(parse(p.unrealized_pl), acct.currency, true)}
+              </span>
+            </div>
+          ))}
+          {acct.open_positions!.length > 2 && (
+            <div className="text-[10px] text-[var(--color-text-faint)]">
+              +{acct.open_positions!.length - 2} more open
+            </div>
+          )}
+        </div>
+      )}
     </button>
   );
 };
@@ -283,10 +335,25 @@ export const AccountsSection = () => {
               {summary.openTrades > 0 && (
                 <>
                   {' · '}
-                  <span className={pnlColor(summary.openPl)}>
-                    {money(summary.openPl, summary.currency, true)}
-                  </span>{' '}
-                  open ({summary.openTrades})
+                  <span
+                    data-testid="accounts-open-summary"
+                    className="cursor-help"
+                    title={
+                      data?.accounts
+                        .flatMap((a) =>
+                          (a.open_positions ?? []).map(
+                            (p) =>
+                              `${a.alias || a.account}: ${unitsLabel(p.units)} ${pairLabel(p.instrument)} (${p.unrealized_pl})`
+                          )
+                        )
+                        .join('\n') || undefined
+                    }
+                  >
+                    <span className={pnlColor(summary.openPl)}>
+                      {money(summary.openPl, summary.currency, true)}
+                    </span>{' '}
+                    open ({summary.openTrades})
+                  </span>
                 </>
               )}
               {summary.errored > 0 && (

@@ -14,10 +14,24 @@ import { invoke } from '@tauri-apps/api/core';
 /** Backend TTL is 60s; polling faster just returns the same cached object. */
 const REFRESH_INTERVAL_MS = 60 * 1000;
 
+export interface OpenPosition {
+  instrument: string;
+  /** Net signed units as an exact decimal string (negative = short). */
+  units: string;
+  unrealized_pl: string;
+}
+
 export interface AccountGlance {
   account: string;
   names: string[];
   account_id: string | null;
+  /** OANDA's own account name — what the broker dashboard shows. */
+  alias?: string | null;
+  /**
+   * Open positions, [] when flat. Null/undefined when the fetch failed (or the
+   * CLI predates the field) — fall back to the bare count, never render "flat".
+   */
+  open_positions?: OpenPosition[] | null;
   currency: string | null;
   nav: string | null;
   balance: string | null;

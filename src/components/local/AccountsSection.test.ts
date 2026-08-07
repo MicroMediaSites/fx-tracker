@@ -6,7 +6,7 @@
  * at a glance instead of by scanning.
  */
 import { describe, expect, it } from 'vitest';
-import { orderedAccounts } from './AccountsSection';
+import { orderedAccounts, pairLabel, unitsLabel } from './AccountsSection';
 import type { AccountGlance } from '../../hooks/useAccountsGlance';
 
 const account = (over: Partial<AccountGlance>): AccountGlance => ({
@@ -88,5 +88,20 @@ describe('orderedAccounts', () => {
     orderedAccounts(input);
 
     expect(input.map((a) => a.account)).toEqual(['idle', 'active']);
+  });
+});
+
+describe('pairLabel / unitsLabel', () => {
+  it('writes pairs the way the OANDA dashboard does', () => {
+    expect(pairLabel('USD_JPY')).toBe('USD/JPY');
+  });
+
+  it('compacts round thousands and signs the direction', () => {
+    expect(unitsLabel('2000')).toBe('+2k');
+    expect(unitsLabel('-2000')).toBe('−2k');
+    expect(unitsLabel('-1500')).toBe('−1.5k');
+    expect(unitsLabel('250')).toBe('+250');
+    expect(unitsLabel('0')).toBe('');
+    expect(unitsLabel('garbage')).toBe('');
   });
 });
