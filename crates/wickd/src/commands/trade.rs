@@ -1508,6 +1508,18 @@ impl AccountSnapshot {
     }
 }
 
+/// Merge ledger-rebuilt closed trades into the index-provided list (issue
+/// #16). The index row wins when both have a trade — it is OANDA's own record
+/// (real `averageClosePrice`, echoed clientExtensions) — so the ledger only
+/// contributes the trades the stale index dropped. Order is left to the
+/// caller's sort. Pure.
+fn merge_ledger_closed(mut index: Vec<Trade>, ledger: Vec<Trade>) -> Vec<Trade> {
+    let seen: std::collections::HashSet<String> =
+        index.iter().map(|t| t.id.clone()).collect();
+    index.extend(ledger.into_iter().filter(|t| !seen.contains(&t.id)));
+    index
+}
+
 /// Keep only trades closed at/after `since` (the baseline instant), newest
 /// first. A CLOSED trade always has a `close_time`; anything missing one is
 /// excluded (it has no realized P&L to attribute to the window). Pure.
@@ -1643,9 +1655,27 @@ async fn report(
     let closed = endpoints::get_trade_history(&oanda, Some(r.limit), None)
         .await
         .context("OANDA closed-trade history fetch failed")?;
+
+    // Issue #16: cross-check the index against the transaction ledger — see
+    // `history` for why. Best-effort; a failure is reported, not fatal.
+    let mut ledger_error: Option<String> = None;
+    let mut ledger_unresolved = 0usize;
+    let closed = match endpoints::closed_trades_from_ledger(&oanda, since, Utc::now()).await {
+        Ok(ledger) => {
+            ledger_unresolved = ledger.unresolved;
+            merge_ledger_closed(closed, ledger.trades)
+        }
+        Err(e) => {
+            ledger_error = Some(format!("{e}"));
+            closed
+        }
+    };
     let closed = closed_since(closed, since);
 
-    Ok(build_report(account, &base, &snap, &closed))
+    let mut report = build_report(account, &base, &snap, &closed);
+    report["ledger_error"] = serde_json::json!(ledger_error);
+    report["ledger_unresolved"] = serde_json::json!(ledger_unresolved);
+    Ok(report)
 }
 
 /// Resolve the glance window's start instant: an explicit `--since` if given,
@@ -1815,18 +1845,28 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
     for (primary, names, oanda) in resolved {
         set.spawn(async move {
             let account_id = oanda.account_id().to_string();
-            // The two fetches are independent — run them concurrently so an
-            // account costs one round trip of latency, not two. With the
+            // The fetches are independent — run them concurrently so an
+            // account costs one round trip of latency, not three. With the
             // per-account fan-out above, the whole glance is ~one round trip.
-            let fetched = async {
-                let (acct, closed) = tokio::join!(
+            // The ledger read (issue #16) is the cross-check for OANDA's
+            // stale closed-trades index; its failure degrades to the index
+            // result rather than blanking the row, so it stays outside the
+            // fatal `?` chain below.
+            let (fetched, ledger) = async {
+                let (acct, closed, ledger) = tokio::join!(
                     endpoints::get_account(&oanda),
                     endpoints::get_trade_history(&oanda, Some(limit), None),
+                    endpoints::closed_trades_from_ledger(&oanda, since, now),
                 );
-                Ok::<_, anyhow::Error>((
-                    acct.context("OANDA account fetch failed")?,
-                    closed.context("OANDA closed-trade history fetch failed")?,
-                ))
+                (
+                    (|| {
+                        Ok::<_, anyhow::Error>((
+                            acct.context("OANDA account fetch failed")?,
+                            closed.context("OANDA closed-trade history fetch failed")?,
+                        ))
+                    })(),
+                    ledger,
+                )
             }
             .await;
 
@@ -1845,8 +1885,29 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
                         Some(Vec::new())
                     };
                     let snap = AccountSnapshot::from_oanda(&acct);
+                    // Merge in the closes the stale index dropped (issue #16)
+                    // before windowing, so realized/wins/losses count them.
+                    let (closed, ledger_note) = match ledger {
+                        Ok(l) => {
+                            let note = (l.unresolved > 0)
+                                .then(|| format!("{} window closes unresolved", l.unresolved));
+                            (merge_ledger_closed(closed, l.trades), note)
+                        }
+                        Err(e) => (closed, Some(format!("ledger read failed: {e:#}"))),
+                    };
                     let closed = closed_since(closed, since);
-                    build_glance_row(&primary, &names, &account_id, &snap, &closed, open.as_deref())
+                    let mut row = build_glance_row(
+                        &primary,
+                        &names,
+                        &account_id,
+                        &snap,
+                        &closed,
+                        open.as_deref(),
+                    );
+                    // Null on the ordinary path. Non-null means the realized
+                    // tally may be incomplete — degraded, not wrong-and-silent.
+                    row["ledger_error"] = serde_json::json!(ledger_note);
+                    row
                 }
                 Err(e) => serde_json::json!({
                     "account": primary,
@@ -1989,6 +2050,31 @@ async fn history(
     let pages = paged.pages;
     let fetched = paged.trades;
 
+    // Issue #16: the closed-trades index is not trustworthy — OANDA's practice
+    // environment stopped indexing closes around 2026-08-11 (the trades vanish
+    // instead of turning CLOSED) while the transaction ledger stayed complete.
+    // So when there is a concrete window, rebuild the window's closes from the
+    // ledger and merge in whatever the index dropped. Best-effort: a history
+    // the index can serve must not fail because the ledger read did not, so a
+    // failure is reported in `ledger_error` rather than swallowed or fatal.
+    let mut ledger_error: Option<String> = None;
+    let mut ledger_unresolved = 0usize;
+    let fetched = match since {
+        Some(s) => match endpoints::closed_trades_from_ledger(&oanda, s, Utc::now()).await {
+            Ok(ledger) => {
+                ledger_unresolved = ledger.unresolved;
+                merge_ledger_closed(fetched, ledger.trades)
+            }
+            Err(e) => {
+                ledger_error = Some(format!("{e}"));
+                fetched
+            }
+        },
+        // No window (no baseline, no --since): the ledger cannot be walked
+        // unboundedly, so the index result stands alone as before.
+        None => fetched,
+    };
+
     // `closed_since` already returns newest-first; the no-window branch sorts
     // to match, so there is one sort on each path and none after.
     let trades = match since {
@@ -2054,6 +2140,12 @@ async fn history(
         // Why the decomposition did not run, when it was wanted but failed.
         // Null on the ordinary paths — nothing to decompose, or it worked.
         "decompose_error": decompose_error,
+        // Issue #16: why the ledger cross-check did not run (null when it did
+        // or when there was no window to run it over), and how many closes the
+        // ledger saw but could not fully reconstruct. Non-zero `unresolved`
+        // means the list may be missing trades — say so, don't imply complete.
+        "ledger_error": ledger_error,
+        "ledger_unresolved": ledger_unresolved,
         "truncated": truncated,
         // How many OANDA requests the walk took — surfaced so a slow response
         // is explicable rather than mysterious.
@@ -2539,6 +2631,26 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].id, "3");
         assert_eq!(out[1].id, "2");
+    }
+
+    #[test]
+    fn merge_ledger_closed_adds_only_what_the_index_dropped() {
+        // Issue #16: trade "2" is in both — the index row must win (it is
+        // OANDA's own record); "9" is only in the ledger and must be added.
+        let index = vec![
+            closed_trade("2", "EUR_USD", dec!(1000), dec!(10), "2026-07-06T00:00:00Z", Some("from-index")),
+        ];
+        let ledger = vec![
+            closed_trade("2", "EUR_USD", dec!(1000), dec!(10), "2026-07-06T00:00:00Z", Some("from-ledger")),
+            closed_trade("9", "USD_JPY", dec!(-2000), dec!(7.7071), "2026-08-19T17:15:00Z", Some("rahagod")),
+        ];
+
+        let out = merge_ledger_closed(index, ledger);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "2");
+        assert_eq!(out[0].strategy.as_deref(), Some("from-index"), "index row wins");
+        assert_eq!(out[1].id, "9");
     }
 
     #[test]

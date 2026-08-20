@@ -504,6 +504,131 @@ pub async fn get_transactions_since_id(
     Ok(out)
 }
 
+/// Fetch every transaction in a UTC time window, oldest first.
+///
+/// OANDA's time-based `/transactions` endpoint returns no transactions — only
+/// the `/transactions/idrange` page URLs that cover the window. This reads
+/// that index, takes the covering id span, and walks it through
+/// [`get_transactions_idrange`] (which chunks requests itself).
+pub async fn get_transactions_window(
+    client: &OandaClient,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<super::types::Transaction>> {
+    let url = format!(
+        "{}/v3/accounts/{}/transactions?from={}&to={}&pageSize=1000",
+        client.base_url(),
+        client.account_id(),
+        // to_rfc3339 can emit '+00:00', which must be %-escaped in a query
+        // string; use the 'Z' form instead.
+        from.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        to.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    );
+    let response = client.get(&url).send().await?.error_for_status()?;
+    let text = response.text().await?;
+    let window: super::types::TransactionsWindowResponse = parse_response(&text)?;
+
+    // The pages jointly cover [min from, max to]; one idrange walk over that
+    // span fetches the same ids in the same number of requests.
+    let mut span: Option<(u64, u64)> = None;
+    for page in &window.pages {
+        if let Some((f, t)) = parse_idrange_page_url(page) {
+            span = Some(match span {
+                None => (f, t),
+                Some((lo, hi)) => (lo.min(f), hi.max(t)),
+            });
+        }
+    }
+    match span {
+        Some((from_id, to_id)) => get_transactions_idrange(client, from_id, to_id).await,
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The `from`/`to` ids off one of the page URLs the time-window index returns,
+/// e.g. `…/transactions/idrange?from=447&to=476`. `None` when either id is
+/// missing or non-numeric — that page is skipped rather than guessed at.
+fn parse_idrange_page_url(url: &str) -> Option<(u64, u64)> {
+    let query = url.split_once('?')?.1;
+    let mut from = None;
+    let mut to = None;
+    for pair in query.split('&') {
+        match pair.split_once('=') {
+            Some(("from", v)) => from = v.parse::<u64>().ok(),
+            Some(("to", v)) => to = v.parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    Some((from?, to?))
+}
+
+/// Closed trades rebuilt from the transaction ledger for a time window
+/// (issue #16), including the backfill of entries that predate the window.
+#[derive(Debug, Clone, Default)]
+pub struct LedgerClosed {
+    /// The rebuilt closed trades. Feed order; the caller sorts and filters.
+    pub trades: Vec<Trade>,
+    /// Trades that closed in the window but could not be fully reconstructed
+    /// even after backfill (entry unfetchable, or exits that predate the
+    /// window and exceeded the backfill budget). Non-zero means the rebuilt
+    /// list is incomplete and the caller must say so rather than present it
+    /// as everything.
+    pub unresolved: usize,
+}
+
+/// How many out-of-window opening fills [`closed_trades_from_ledger`] will
+/// fetch individually. A trade's id is its opening transaction's id, so each
+/// costs exactly one precise idrange request; the cap only guards against a
+/// pathological window where hundreds of long-held trades all closed at once.
+const LEDGER_ENTRY_BACKFILL_MAX: usize = 20;
+
+/// Rebuild the closed trades of `[from, to]` from the transaction ledger —
+/// the fallback for OANDA's stale closed-trades index (issue #16).
+///
+/// `/trades?state=CLOSED` on the practice environment stopped covering trades
+/// closed after ~2026-08-11 (and `/trades/{id}` 404s them) while the ledger
+/// kept every fill, so this path derives what `/trades` should have said:
+/// window fetch → [`crate::trade_fills::rebuild_closed_trades`] → one precise
+/// fetch per entry that predates the window → rebuild again.
+pub async fn closed_trades_from_ledger(
+    client: &OandaClient,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> Result<LedgerClosed> {
+    let mut transactions = get_transactions_window(client, from, to).await?;
+    let first = crate::trade_fills::rebuild_closed_trades(&transactions);
+    if first.missing_entries.is_empty() {
+        return Ok(LedgerClosed { trades: first.trades, unresolved: 0 });
+    }
+
+    // Entries older than the window: each trade id is the exact transaction
+    // id of its opening fill, so fetch precisely those — never a spanning
+    // range, which could drag in an unbounded stretch of unrelated feed.
+    let mut budget = LEDGER_ENTRY_BACKFILL_MAX;
+    for trade_id in &first.missing_entries {
+        if budget == 0 {
+            break;
+        }
+        if let Ok(id) = trade_id.parse::<u64>() {
+            budget -= 1;
+            let opening = get_transactions_idrange(client, id, id).await?;
+            transactions.extend(opening);
+        }
+    }
+
+    let mut second = crate::trade_fills::rebuild_closed_trades(&transactions);
+    // A backfilled opening fill can itself close *other* trades (a netting
+    // fill), whose closes predate the window — drop those rather than let a
+    // widened fetch smuggle out-of-window rows into the result.
+    second
+        .trades
+        .retain(|t| t.close_time.is_some_and(|ct| ct >= from && ct <= to));
+    Ok(LedgerClosed {
+        unresolved: second.missing_entries.len(),
+        trades: second.trades,
+    })
+}
+
 /// One `/transactions/<sub>` request with numeric query params already
 /// stringified by the caller. Shared by the idrange and sinceid walks so both
 /// decode and error-check identically.
@@ -1309,6 +1434,163 @@ mod tests {
             .await;
 
         assert!(get_transactions_since_id(&client, 44).await.unwrap().is_empty());
+    }
+
+    // ── the time-window walk and the ledger rebuild (issue #16) ─────────────
+
+    #[test]
+    fn idrange_page_urls_parse_and_junk_ones_do_not() {
+        assert_eq!(
+            parse_idrange_page_url(
+                "https://api-fxpractice.oanda.com/v3/accounts/x/transactions/idrange?from=447&to=476"
+            ),
+            Some((447, 476))
+        );
+        assert_eq!(parse_idrange_page_url("https://x/transactions/idrange?to=476"), None);
+        assert_eq!(parse_idrange_page_url("https://x/idrange?from=nope&to=476"), None);
+        assert_eq!(parse_idrange_page_url("no-query-at-all"), None);
+    }
+
+    fn window_ts(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    #[tokio::test]
+    async fn a_time_window_is_read_via_its_page_index_then_one_idrange_walk() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        // The index returns two pages; the walk covers their joint span in one
+        // idrange request (chunked internally if it were wide).
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "pages": [
+                    "https://api/v3/accounts/x/transactions/idrange?from=10&to=11",
+                    "https://api/v3/accounts/x/transactions/idrange?from=12&to=12"
+                ],
+                "count": 3
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions/idrange"))
+            .and(query_param("from", "10"))
+            .and(query_param("to", "12"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(transaction_page(10, 3, 12)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let out = get_transactions_window(
+            &client,
+            window_ts("2026-08-19T00:00:00Z"),
+            window_ts("2026-08-20T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_empty_time_window_fetches_no_idranges() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        // Only the index is mocked: an idrange request would 404 and fail the
+        // call, so success proves none was made.
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "pages": [], "count": 0 })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let out = get_transactions_window(
+            &client,
+            window_ts("2026-08-19T00:00:00Z"),
+            window_ts("2026-08-20T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_ledger_rebuild_backfills_an_entry_older_than_the_window() {
+        let mock_server = MockServer::start().await;
+        let client = setup_mock_client(&mock_server).await;
+
+        // The window holds only the closing fill of trade 453 — the entry is
+        // older. The rebuild must fetch exactly transaction 453 (a trade's id
+        // is its opening transaction's id) and produce the full row.
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "pages": ["https://api/x/transactions/idrange?from=462&to=462"],
+                "count": 1
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions/idrange"))
+            .and(query_param("from", "462"))
+            .and(query_param("to", "462"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "transactions": [{
+                    "id": "462", "time": "2026-08-19T17:15:00Z", "type": "ORDER_FILL",
+                    "reason": "MARKET_ORDER_POSITION_CLOSEOUT", "instrument": "USD_JPY",
+                    "units": "2000", "price": "157.800",
+                    "tradesClosed": [
+                        { "tradeID": "453", "units": "2000", "realizedPL": "7.7071" }
+                    ]
+                }],
+                "lastTransactionID": "477"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/accounts/test-account-123/transactions/idrange"))
+            .and(query_param("from", "453"))
+            .and(query_param("to", "453"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "transactions": [{
+                    "id": "453", "time": "2026-08-19T06:30:00Z", "type": "ORDER_FILL",
+                    "reason": "MARKET_ORDER", "instrument": "USD_JPY",
+                    "units": "-2000", "price": "158.400",
+                    "tradeOpened": {
+                        "tradeID": "453", "units": "-2000", "price": "158.400",
+                        "clientExtensions": { "tag": "rahagod" }
+                    }
+                }],
+                "lastTransactionID": "477"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let out = closed_trades_from_ledger(
+            &client,
+            window_ts("2026-08-19T12:00:00Z"),
+            window_ts("2026-08-20T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.unresolved, 0);
+        assert_eq!(out.trades.len(), 1);
+        let t = &out.trades[0];
+        assert_eq!(t.id, "453");
+        assert_eq!(t.instrument, "USD_JPY");
+        assert_eq!(t.strategy.as_deref(), Some("rahagod"));
+        assert_eq!(t.realized_pl.to_string(), "7.7071");
     }
 
     #[tokio::test]
