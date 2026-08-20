@@ -258,7 +258,7 @@ pub struct MarketOrderRequest {
 // names the strategy that placed it. `trade report` reads `tag` off each closed
 // trade to attribute realized P&L by strategy. `#[serde(default)]` on each
 // member keeps deserialization tolerant of OANDA omitting either field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientExtensions {
     /// Tag associated with the order (the strategy name).
@@ -635,6 +635,18 @@ pub struct TradeOpened {
     #[serde(rename = "tradeID")]
     pub trade_id: String,
     pub units: String,
+    /// The price the trade opened at. Usually equal to the fill's own `price`,
+    /// but carried separately by OANDA — and needed when one fill nets against
+    /// several trades. Optional because older fixtures (and some rejects)
+    /// omit it; a rebuild falls back to the fill's price.
+    #[serde(default)]
+    pub price: Option<String>,
+    /// The trade's clientExtensions as OANDA echoes them onto the opening
+    /// fill — the `tag` is the strategy attribution (AGT-630). This is the
+    /// only place a ledger rebuild can recover attribution from, since the
+    /// trade row itself may be gone (issue #16).
+    #[serde(default, rename = "clientExtensions")]
+    pub client_extensions: Option<ClientExtensions>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -1179,6 +1191,20 @@ impl Serialize for Transaction {
             Transaction::Unknown { raw, .. } => raw.serialize(serializer),
         }
     }
+}
+
+/// The time-window index of the transaction feed (`/transactions?from=&to=`).
+///
+/// OANDA does not return transactions on this endpoint — it returns the id
+/// ranges that cover the window, as ready-made `/transactions/idrange` URLs
+/// in `pages`. The ids are parsed off those URLs and fetched through
+/// [`crate::oanda::endpoints::get_transactions_idrange`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransactionsWindowResponse {
+    #[serde(default)]
+    pub pages: Vec<String>,
+    #[serde(default)]
+    pub count: u64,
 }
 
 /// A page of the transaction feed (`/transactions/idrange`, `/transactions/sinceid`).

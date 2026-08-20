@@ -190,6 +190,162 @@ pub fn covering_id_range(trades: &[Trade]) -> Option<(u64, u64)> {
     Some((low, high.max(low)))
 }
 
+/// Closed trades rebuilt from the transaction feed alone (issue #16).
+#[derive(Debug, Clone, Default)]
+pub struct RebuiltClosed {
+    /// Fully reconstructed closed trades — entry and every exit were in the
+    /// feed slice. Feed order (oldest close first); the caller sorts.
+    pub trades: Vec<Trade>,
+    /// Trade ids the slice shows closing but not opening — the entry fill
+    /// predates the slice. A trade's id IS its opening transaction's id, so
+    /// the caller can fetch exactly these and rebuild again.
+    pub missing_entries: Vec<String>,
+}
+
+/// Rebuild closed trades from `ORDER_FILL` transactions, without `/trades`.
+///
+/// Exists because OANDA's practice environment stopped indexing closed trades
+/// around 2026-08-11 (issue #16): `/trades?state=CLOSED` omits them and
+/// `/trades/{id}` 404s, while the transaction ledger stays complete. The
+/// ledger is the authoritative record, so a closed trade can be reconstructed
+/// from the fill that opened it (`tradeOpened`) plus the fills that took
+/// units out (`tradeReduced` / `tradesClosed`).
+///
+/// A trade is emitted only when some fill's `tradesClosed` names it — a
+/// reduced-but-open trade has no business in a closed-trades list. Fidelity
+/// to `/trades` rows:
+///   * `realized_pl` sums every exit's `realizedPL` (reduces + the close);
+///   * `close_price` is the exit-units-weighted average, which is what
+///     OANDA's `averageClosePrice` is;
+///   * `close_time` is the closing fill's time;
+///   * `strategy` comes from the opening fill's echoed clientExtensions tag.
+///
+/// **Pure**: no I/O, like [`decompose`]. Unparseable numbers drop the trade
+/// into `missing_entries` rather than fabricating zeros.
+pub fn rebuild_closed_trades(transactions: &[Transaction]) -> RebuiltClosed {
+    /// Per-trade accumulator while walking the feed.
+    #[derive(Default)]
+    struct Acc {
+        entry: Option<(String, Decimal, Decimal, Option<String>)>, // (time, price, units, strategy)
+        exits: Vec<Fill>,
+        /// From whichever fill touched the trade first — every fill against a
+        /// trade names the same instrument.
+        instrument: String,
+        /// Time of the fill whose `tradesClosed` named this trade.
+        closed_at: Option<String>,
+        /// An exit had an unparseable number — the money cannot be trusted.
+        corrupt: bool,
+    }
+
+    fn touch<'a>(
+        acc: &'a mut HashMap<String, Acc>,
+        trade_id: &str,
+        instrument: &str,
+    ) -> &'a mut Acc {
+        let a = acc.entry(trade_id.to_string()).or_default();
+        if a.instrument.is_empty() {
+            a.instrument = instrument.to_string();
+        }
+        a
+    }
+
+    let mut acc: HashMap<String, Acc> = HashMap::new();
+    // Feed order, so "first close wins" and exits read oldest-first.
+    let mut order: Vec<String> = Vec::new();
+
+    for fill in transactions.iter().filter_map(Transaction::order_fill) {
+        if let Some(opened) = &fill.trade_opened {
+            let a = touch(&mut acc, &opened.trade_id, &fill.instrument);
+            // The trade's own price when OANDA carried it, else the fill's.
+            let price = opened.price.as_deref().unwrap_or(&fill.price);
+            match (price.parse::<Decimal>(), opened.units.parse::<Decimal>()) {
+                (Ok(p), Ok(u)) => {
+                    a.entry = Some((
+                        fill.time.clone(),
+                        p,
+                        u,
+                        opened.client_extensions.as_ref().and_then(|c| c.tag.clone()),
+                    ));
+                }
+                _ => a.corrupt = true,
+            }
+        }
+        if let Some(reduced) = &fill.trade_reduced {
+            let a = touch(&mut acc, &reduced.trade_id, &fill.instrument);
+            match build_fill(fill, &reduced.units, &reduced.realized_pl) {
+                Some(exit) => a.exits.push(exit),
+                None => a.corrupt = true,
+            }
+        }
+        for closed in &fill.trades_closed {
+            let a = touch(&mut acc, &closed.trade_id, &fill.instrument);
+            match build_fill(fill, &closed.units, &closed.realized_pl) {
+                Some(exit) => a.exits.push(exit),
+                None => a.corrupt = true,
+            }
+            if a.closed_at.is_none() {
+                a.closed_at = Some(fill.time.clone());
+                order.push(closed.trade_id.clone());
+            }
+        }
+    }
+
+    let mut out = RebuiltClosed::default();
+    for trade_id in order {
+        let Some(a) = acc.get(&trade_id) else { continue };
+        // Only trades the slice saw close; `closed_at` guards that already.
+        let Some(closed_at) = &a.closed_at else { continue };
+
+        let (entry, close_time) = match (&a.entry, parse_time(closed_at)) {
+            (Some(e), Some(ct)) if !a.corrupt => (e, ct),
+            // Entry not in the slice, or numbers that cannot be trusted:
+            // report the id so the caller can widen the fetch, never emit a
+            // row with invented values.
+            _ => {
+                out.missing_entries.push(trade_id);
+                continue;
+            }
+        };
+        let (open_time_raw, open_price, units, strategy) = entry;
+        let Some(open_time) = parse_time(open_time_raw) else {
+            out.missing_entries.push(trade_id);
+            continue;
+        };
+
+        let exited: Decimal = a.exits.iter().map(|f| f.units.abs()).sum();
+        if exited != units.abs() || exited.is_zero() {
+            // The slice starts after a partial exit — the money would be
+            // incomplete. Same remedy as a missing entry: refetch wider.
+            out.missing_entries.push(trade_id);
+            continue;
+        }
+        let realized: Decimal = a.exits.iter().map(|f| f.realized_pl).sum();
+        let close_price =
+            a.exits.iter().map(|f| f.price * f.units.abs()).sum::<Decimal>() / exited;
+
+        out.trades.push(Trade {
+            id: trade_id,
+            instrument: a.instrument.clone(),
+            open_price: *open_price,
+            open_time,
+            units: *units,
+            realized_pl: realized,
+            unrealized_pl: None,
+            state: crate::models::TradeState::Closed,
+            close_time: Some(close_time),
+            close_price: Some(close_price),
+            strategy: strategy.clone(),
+            exit_count: a.exits.len(),
+            closing_transaction_ids: a.exits.iter().map(|f| f.transaction_id.clone()).collect(),
+        });
+    }
+    out
+}
+
+fn parse_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,5 +596,148 @@ mod tests {
         odd.closing_transaction_ids = vec!["also-not".to_string()];
 
         assert_eq!(covering_id_range(&[odd]), None);
+    }
+
+    // ── rebuilding closed trades from the ledger alone (issue #16) ──────────
+
+    /// An opening ORDER_FILL that also carries the trade's clientExtensions
+    /// tag, the way OANDA echoes attribution onto the fill.
+    fn opening_tagged(id: &str, trade_id: &str, units: &str, price: &str, tag: &str) -> Transaction {
+        fill_tx(serde_json::json!({
+            "id": id, "time": "2026-08-19T06:01:00Z", "type": "ORDER_FILL",
+            "reason": "MARKET_ORDER", "instrument": "EUR_USD",
+            "units": units, "price": price,
+            "tradeOpened": {
+                "tradeID": trade_id, "units": units, "price": price,
+                "clientExtensions": { "tag": tag, "comment": "wickd strategy=x" }
+            }
+        }))
+    }
+
+    #[test]
+    fn a_clean_open_and_close_rebuilds_the_trade_the_index_dropped() {
+        let feed = vec![
+            opening_tagged("453", "453", "-2000", "158.400", "rahagod"),
+            closing("462", "453", "2000", "157.800", "7.7071"),
+        ];
+
+        let out = rebuild_closed_trades(&feed);
+
+        assert!(out.missing_entries.is_empty());
+        assert_eq!(out.trades.len(), 1);
+        let t = &out.trades[0];
+        assert_eq!(t.id, "453");
+        assert_eq!(t.instrument, "EUR_USD");
+        assert_eq!(t.units, dec("-2000"));
+        assert_eq!(t.open_price, dec("158.400"));
+        assert_eq!(t.realized_pl, dec("7.7071"));
+        assert_eq!(t.close_price, Some(dec("157.800")));
+        assert_eq!(t.state, TradeState::Closed);
+        assert_eq!(t.strategy.as_deref(), Some("rahagod"));
+        assert_eq!(t.exit_count, 1);
+        assert_eq!(t.closing_transaction_ids, vec!["462".to_string()]);
+        assert_eq!(t.open_time, ts("2026-08-19T06:01:00Z"));
+        assert_eq!(t.close_time, Some(ts("2026-07-20T15:00:00Z")));
+    }
+
+    #[test]
+    fn a_multi_exit_rebuild_sums_the_money_and_blends_the_close_price() {
+        let feed = vec![
+            opening("4001", "4001", "1000", "1.08000"),
+            reducing("4050", "4001", "-400", "1.08500", "4.0000"),
+            closing("4090", "4001", "-600", "1.09400", "8.4000"),
+        ];
+
+        let out = rebuild_closed_trades(&feed);
+
+        let t = &out.trades[0];
+        assert_eq!(t.realized_pl, dec("12.4000"));
+        assert_eq!(t.exit_count, 2);
+        // Units-weighted: (1.08500·400 + 1.09400·600) / 1000
+        assert_eq!(t.close_price, Some(dec("1.09040")));
+        // The close time is the closing fill's, not the earlier reduce's.
+        assert_eq!(t.close_time, Some(ts("2026-07-20T15:00:00Z")));
+        assert_eq!(t.closing_transaction_ids, vec!["4050".to_string(), "4090".to_string()]);
+    }
+
+    #[test]
+    fn a_close_whose_entry_predates_the_slice_is_reported_not_invented() {
+        let feed = vec![closing("462", "453", "2000", "157.800", "7.7071")];
+
+        let out = rebuild_closed_trades(&feed);
+
+        assert!(out.trades.is_empty(), "no entry, no fabricated row");
+        assert_eq!(out.missing_entries, vec!["453".to_string()]);
+    }
+
+    #[test]
+    fn a_reduced_but_still_open_trade_is_not_emitted_as_closed() {
+        let feed = vec![
+            opening("4001", "4001", "1000", "1.08000"),
+            reducing("4050", "4001", "-400", "1.08500", "4.0000"),
+        ];
+
+        let out = rebuild_closed_trades(&feed);
+
+        assert!(out.trades.is_empty());
+        assert!(out.missing_entries.is_empty(), "an open trade is not missing anything");
+    }
+
+    #[test]
+    fn exits_that_predate_the_slice_make_the_trade_unresolved() {
+        // The close is in the slice but an earlier partial exit is not: the
+        // exits do not account for the entry's units, so the money would be
+        // incomplete — report, never under-state realized P&L.
+        let feed = vec![
+            opening("4001", "4001", "1000", "1.08000"),
+            closing("4090", "4001", "-600", "1.09400", "8.4000"),
+        ];
+
+        let out = rebuild_closed_trades(&feed);
+
+        assert!(out.trades.is_empty());
+        assert_eq!(out.missing_entries, vec!["4001".to_string()]);
+    }
+
+    #[test]
+    fn an_unparseable_number_makes_the_rebuild_report_rather_than_zero_fill() {
+        let feed = vec![
+            opening("4001", "4001", "1000", "1.08000"),
+            fill_tx(serde_json::json!({
+                "id": "4090", "time": "2026-07-20T15:00:00Z", "type": "ORDER_FILL",
+                "instrument": "EUR_USD", "units": "-1000", "price": "not-a-price",
+                "tradesClosed": [{ "tradeID": "4001", "units": "-1000", "realizedPL": "12.4" }]
+            })),
+        ];
+
+        let out = rebuild_closed_trades(&feed);
+
+        assert!(out.trades.is_empty());
+        assert_eq!(out.missing_entries, vec!["4001".to_string()]);
+    }
+
+    #[test]
+    fn a_netting_fill_that_opens_one_trade_and_closes_another_serves_both() {
+        let feed = vec![
+            opening("4001", "4001", "1000", "1.08000"),
+            fill_tx(serde_json::json!({
+                "id": "4090", "time": "2026-07-20T15:00:00Z", "type": "ORDER_FILL",
+                "reason": "MARKET_ORDER", "instrument": "EUR_USD",
+                "units": "-1500", "price": "1.09000",
+                "tradeOpened": { "tradeID": "4090", "units": "-500" },
+                "tradesClosed": [{ "tradeID": "4001", "units": "-1000", "realizedPL": "10.0000" }]
+            })),
+            closing("4120", "4090", "500", "1.08800", "1.0000"),
+        ];
+
+        let out = rebuild_closed_trades(&feed);
+
+        assert_eq!(out.trades.len(), 2);
+        assert_eq!(out.trades[0].id, "4001");
+        assert_eq!(out.trades[0].realized_pl, dec("10.0000"));
+        let netted = &out.trades[1];
+        assert_eq!(netted.id, "4090");
+        assert_eq!(netted.units, dec("-500"), "the trade's units, not the order's -1500");
+        assert_eq!(netted.realized_pl, dec("1.0000"));
     }
 }
