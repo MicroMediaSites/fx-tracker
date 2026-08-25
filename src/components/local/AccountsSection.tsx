@@ -18,29 +18,157 @@
  *     as-of-now, never folded into the window total.
  *  2. A null win rate renders "—", never "0%": nothing decided is not the
  *     same as losing everything.
+ *  3. An account the window cannot measure renders "no baseline", never
+ *     "$0.00" (D3). $0.00 means "traded flat"; this account is unmeasured.
  */
-import { useState } from 'react';
+import { Fragment, ReactNode, useEffect, useState } from 'react';
 import { AccountHistoryModal } from './AccountHistoryModal';
 import {
   AccountGlance,
   GlanceWindow,
+  defaultWindow,
+  localDateRangeToInstants,
+  persistWindow,
+  readStoredWindow,
   useAccountsGlance,
+  windowLabel,
 } from '../../hooks/useAccountsGlance';
 import { summarizeAccounts } from './accountsSummary';
 
-// `wickd_` prefix, not the retired `candlesight_` brand.
-const WINDOW_STORAGE_KEY = 'wickd_accounts_window';
+/**
+ * Picker order is D7's: since baseline · today · 7d · 30d · (custom…, which
+ * is not a preset — it reveals the two date inputs below).
+ *
+ * "Today" is deliberately not `24h`: before mid-afternoon those are very
+ * different spans, and the one you want is the calendar day.
+ */
+const PRESETS: { id: string; label: string; window: GlanceWindow; title: string }[] = [
+  {
+    id: 'baseline',
+    label: 'since baseline',
+    window: { kind: 'baseline' },
+    title: "Each account from its own recorded baseline (wickd trade baseline)",
+  },
+  { id: 'today', label: 'today', window: { kind: 'today' }, title: 'Since your local midnight' },
+  { id: '7d', label: '7d', window: { kind: 'days', days: 7 }, title: 'The last 7 days' },
+  { id: '30d', label: '30d', window: { kind: 'days', days: 30 }, title: 'The last 30 days' },
+];
+
+/** Which picker button reads as pressed for a given window (`custom` for a range). */
+export const presetId = (w: GlanceWindow): string => {
+  switch (w.kind) {
+    case 'baseline':
+      return 'baseline';
+    case 'today':
+      return 'today';
+    case 'days':
+      return `${w.days}d`;
+    case 'range':
+      return 'custom';
+  }
+};
 
 /**
- * "Today" leads and is the default: the cold-boot question is "has today been
- * profitable, per account". Deliberately not `24h` — before mid-afternoon
- * those are very different spans, and the one you want is the calendar day.
+ * D6, first half: what the section shows before any glance has landed.
+ *
+ * A persisted choice always wins. With nothing persisted we open on
+ * `baseline` — the answer to "does any account actually have one" only exists
+ * in a since-baseline response, so the first fetch doubles as the probe and
+ * `defaultWindow` decides from its rows (see the resolution effect below).
  */
-const WINDOWS: { id: string; label: string; window: GlanceWindow }[] = [
-  { id: 'today', label: 'today', window: { kind: 'today' } },
-  { id: '7d', label: '7d', window: { kind: 'days', days: 7 } },
-  { id: '30d', label: '30d', window: { kind: 'days', days: 30 } },
-];
+export const initialWindow = (stored: GlanceWindow | null): GlanceWindow =>
+  stored ?? { kind: 'baseline' };
+
+/**
+ * D3: a healthy row the window has no figure for — under `--since-baseline`,
+ * an account with no baseline recorded. The CLI pairs this with a `note`
+ * ("no baseline recorded"); the null realized is the load-bearing signal,
+ * because it is the same one the hero total excludes on, and the tile and the
+ * hero must never disagree about which accounts count.
+ */
+export const isUnmeasured = (a: AccountGlance): boolean => !a.error && a.realized === null;
+
+/** The one-line fix a "no baseline" tile tells you to run (D3). */
+export const baselineHint = (account: string): string =>
+  `wickd trade baseline set --account ${account}`;
+
+const dayMonth = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
+
+/**
+ * A tile's own window start as "since Aug 25" (D5) — under `baseline` every
+ * tile's start differs, which is the point of the footer. Null when the row
+ * carries no start (unmeasured, or a CLI that predates the field), so the
+ * footer is omitted rather than guessed at.
+ */
+export const sinceLabel = (windowStart: string | null | undefined): string | null => {
+  if (!windowStart) return null;
+  const at = new Date(windowStart);
+  return Number.isNaN(at.getTime()) ? null : `since ${dayMonth.format(at)}`;
+};
+
+/** A `Date` as the local `YYYY-MM-DD` an `<input type="date">` holds. */
+export const toDateInput = (d: Date): string => {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+
+/**
+ * `YYYY-MM-DD` → local midnight of that day, or null if it isn't a real date.
+ *
+ * Deliberately not `new Date(value)`: the bare-date form is specified to
+ * parse as UTC, which lands on the previous calendar day for every viewer
+ * west of Greenwich — exactly the off-by-one D4 exists to avoid.
+ */
+export const parseDateInput = (value: string): Date | null => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) return null;
+  const [year, month, day] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const date = new Date(year, month - 1, day);
+  // Rejects the overflow `new Date` is happy to roll over (2026-02-31 → Mar 3).
+  return date.getMonth() === month - 1 && date.getDate() === day ? date : null;
+};
+
+/**
+ * The two date inputs → a `range` window, or null when they don't make one
+ * (either is unparseable, or the start is after the end). The instants come
+ * from `localDateRangeToInstants`, so the end date stays inclusive for the
+ * human who picked it (D4).
+ */
+export const rangeFromInputs = (start: string, end: string): GlanceWindow | null => {
+  const from = parseDateInput(start);
+  const to = parseDateInput(end);
+  if (!from || !to || from.getTime() > to.getTime()) return null;
+  return { kind: 'range', ...localDateRangeToInstants(from, to) };
+};
+
+/**
+ * The inverse: the two local dates a `range` window came from, so reopening
+ * `custom…` shows what is actually on screen. `to` is the exclusive
+ * day-after-end instant, so the end input is one local day before it.
+ */
+export const rangeToInputs = (w: GlanceWindow): { start: string; end: string } | null => {
+  if (w.kind !== 'range') return null;
+  const end = new Date(w.to);
+  end.setDate(end.getDate() - 1);
+  return { start: toDateInput(new Date(w.from)), end: toDateInput(end) };
+};
+
+/** A week ending today — what `custom…` opens on before anything is picked. */
+const defaultRangeInputs = (): { start: string; end: string } => {
+  const end = new Date();
+  const start = new Date();
+  start.setDate(start.getDate() - 6);
+  return { start: toDateInput(start), end: toDateInput(end) };
+};
+
+/** Interleave " · " between the parts of the hero's count line that apply. */
+const separated = (parts: ReactNode[]): ReactNode[] =>
+  parts.map((part, i) => (
+    <Fragment key={i}>
+      {i > 0 && ' · '}
+      {part}
+    </Fragment>
+  ));
 
 /**
  * Exact decimal strings cross from the CLI; parsed to numbers for DISPLAY
@@ -163,17 +291,22 @@ const AccountTile = ({ acct, onOpen }: { acct: AccountGlance; onOpen: (account: 
 
   const realized = parse(acct.realized);
   const openPl = parse(acct.unrealized_pl);
-  const idle = isIdle(acct);
+  const unmeasured = isUnmeasured(acct);
+  const idle = !unmeasured && isIdle(acct);
+  // Both states recede the same way: neither has a number worth scanning for.
+  const muted = idle || unmeasured;
+  const since = sinceLabel(acct.window_start);
 
   return (
     <button
       type="button"
       data-testid="account-tile"
       data-idle={idle || undefined}
+      data-unmeasured={unmeasured || undefined}
       onClick={() => onOpen(acct.account)}
       title="View trade history"
       className={`text-left px-3 py-2.5 rounded-lg border bg-[var(--color-bg-elevated)] min-w-0 transition-colors hover:border-[var(--color-info)]/50 hover:bg-[var(--color-bg-elevated)]/80 focus:outline-none focus:border-[var(--color-info)] ${
-        idle
+        muted
           ? 'border-[var(--color-border)]/60 opacity-50 hover:opacity-80'
           : 'border-[var(--color-border)]'
       }`}
@@ -212,17 +345,33 @@ const AccountTile = ({ acct, onOpen }: { acct: AccountGlance; onOpen: (account: 
         )}
       </div>
 
-      {/* The tile's headline. Tabular figures so a column of tiles aligns. */}
-      <div
-        data-testid="account-realized"
-        className={`mt-0.5 text-lg font-semibold font-mono tabular-nums truncate ${pnlColor(realized)}`}
-        title="Realized P&L over the selected window"
-      >
-        {money(realized, acct.currency, true)}
-      </div>
+      {/* The tile's headline. Tabular figures so a column of tiles aligns.
+          Unmeasured accounts get words instead: there is no figure, and
+          "$0.00" would claim the account traded flat (D3). */}
+      {unmeasured ? (
+        <div
+          data-testid="account-no-baseline"
+          className="mt-0.5 text-lg font-semibold text-[var(--color-text-muted)] truncate"
+          title={`run ${baselineHint(acct.account)}`}
+        >
+          no baseline
+        </div>
+      ) : (
+        <div
+          data-testid="account-realized"
+          className={`mt-0.5 text-lg font-semibold font-mono tabular-nums truncate ${pnlColor(realized)}`}
+          title="Realized P&L over the selected window"
+        >
+          {money(realized, acct.currency, true)}
+        </div>
+      )}
 
       <div className="mt-0.5 text-[11px] text-[var(--color-text-muted)] truncate">
-        {idle ? (
+        {unmeasured ? (
+          <span className="font-mono" title={`run ${baselineHint(acct.account)}`}>
+            {baselineHint(acct.account)}
+          </span>
+        ) : idle ? (
           'no activity'
         ) : (
           <>
@@ -263,22 +412,62 @@ const AccountTile = ({ acct, onOpen }: { acct: AccountGlance; onOpen: (account: 
           )}
         </div>
       )}
+
+      {/* This tile's OWN window start (D5). Under "since baseline" every tile
+          starts somewhere different, so the section label alone can't say
+          what a given figure covers — the exact instant is on hover. */}
+      {since && (
+        <div
+          data-testid="account-since"
+          className="mt-1 text-[10px] text-[var(--color-text-faint)] truncate"
+          title={acct.window_start ?? undefined}
+        >
+          {since}
+        </div>
+      )}
     </button>
   );
 };
 
 export const AccountsSection = () => {
-  const [windowId, setWindowId] = useState<string>(() => {
-    const stored = localStorage.getItem(WINDOW_STORAGE_KEY);
-    return WINDOWS.some((w) => w.id === stored) ? (stored as string) : 'today';
-  });
-  const selected = WINDOWS.find((w) => w.id === windowId) ?? WINDOWS[0];
-  const { data, error, loading, refresh } = useAccountsGlance(selected.window);
+  // Read storage once, on mount: the same value decides both the opening
+  // window and whether the D6 default still needs resolving.
+  const [stored] = useState<GlanceWindow | null>(readStoredWindow);
+  const opening = initialWindow(stored);
 
-  const selectWindow = (next: string) => {
-    setWindowId(next);
-    localStorage.setItem(WINDOW_STORAGE_KEY, next);
+  const [selected, setSelected] = useState<GlanceWindow>(opening);
+  const [defaultResolved, setDefaultResolved] = useState(stored !== null);
+
+  const { data, error, loading, refresh } = useAccountsGlance(selected);
+
+  // D6, second half. Whether any account has a baseline is only knowable from
+  // a since-baseline response, so the opening fetch doubles as the probe and
+  // `defaultWindow` drops back to `today` when its rows show none. Deliberately
+  // NOT persisted — this is a derived default, not a choice, so a later boot
+  // re-derives it against whatever baselines exist by then.
+  const accounts = data?.accounts;
+  useEffect(() => {
+    if (defaultResolved || !accounts) return;
+    setSelected(defaultWindow(accounts));
+    setDefaultResolved(true);
+  }, [defaultResolved, accounts]);
+
+  const selectWindow = (next: GlanceWindow) => {
+    setSelected(next);
+    persistWindow(next);
+    // An explicit choice always wins — including one made before the probe
+    // lands, which would otherwise be overwritten by the derived default.
+    setDefaultResolved(true);
   };
+
+  // The custom-range editor: open when a range is already selected, so
+  // reopening the section shows the dates actually on screen.
+  const [customOpen, setCustomOpen] = useState(opening.kind === 'range');
+  const [rangeInputs, setRangeInputs] = useState(
+    () => rangeToInputs(opening) ?? defaultRangeInputs()
+  );
+  const pendingRange = rangeFromInputs(rangeInputs.start, rangeInputs.end);
+  const activeId = presetId(selected);
 
   // Which account's trade-history drill-down is open (null = none).
   const [openAccount, setOpenAccount] = useState<string | null>(null);
@@ -297,16 +486,25 @@ export const AccountsSection = () => {
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <h2 className="text-[11px] font-medium uppercase tracking-wider text-[var(--color-text-muted)]">
-              {selected.id === 'today' ? 'Today' : `Last ${selected.label}`}
+            <h2
+              data-testid="accounts-window-label"
+              className="text-[11px] font-medium uppercase tracking-wider text-[var(--color-text-muted)]"
+            >
+              {windowLabel(selected)}
             </h2>
             {loading && (
               <span className="text-[11px] text-[var(--color-text-faint)]">updating…</span>
             )}
           </div>
 
-          {summary === null ? (
-            <div className="mt-1 text-4xl font-semibold font-mono text-[var(--color-text-faint)]">
+          {/* No measured account means no total to show. "$0.00" across zero
+              contributing accounts would read as a flat day rather than as
+              nothing to add up (D3). */}
+          {summary === null || summary.measured === 0 ? (
+            <div
+              data-testid="accounts-hero-none"
+              className="mt-1 text-4xl font-semibold font-mono text-[var(--color-text-faint)]"
+            >
               —
             </div>
           ) : summary.mixedCurrency ? (
@@ -328,54 +526,86 @@ export const AccountsSection = () => {
           )}
 
           {summary && !summary.mixedCurrency && (
-            <div className="mt-2 text-xs text-[var(--color-text-muted)]">
-              realized across {summary.accounts}{' '}
-              {summary.accounts === 1 ? 'account' : 'accounts'} · {summary.trades}{' '}
-              {summary.trades === 1 ? 'trade' : 'trades'} · {percent(summary.winRate)} won
-              {summary.openTrades > 0 && (
-                <>
-                  {' · '}
-                  <span
-                    data-testid="accounts-open-summary"
-                    className="cursor-help"
-                    title={
-                      data?.accounts
-                        .flatMap((a) =>
-                          (a.open_positions ?? []).map(
-                            (p) =>
-                              `${a.alias || a.account}: ${unitsLabel(p.units)} ${pairLabel(p.instrument)} (${p.unrealized_pl})`
-                          )
-                        )
-                        .join('\n') || undefined
-                    }
-                  >
-                    <span className={pnlColor(summary.openPl)}>
-                      {money(summary.openPl, summary.currency, true)}
-                    </span>{' '}
-                    open ({summary.openTrades})
-                  </span>
-                </>
-              )}
-              {summary.errored > 0 && (
-                <span className="text-[var(--color-sell)]">
-                  {' · '}
-                  {summary.errored} unavailable
-                </span>
-              )}
+            <div
+              data-testid="accounts-summary-line"
+              className="mt-2 text-xs text-[var(--color-text-muted)]"
+            >
+              {separated([
+                // Only the accounts actually behind the total are named here —
+                // an unmeasured or unreachable account contributed nothing to
+                // it, so counting them would overstate what the figure covers.
+                ...(summary.measured > 0
+                  ? [
+                      <>
+                        realized across {summary.measured}{' '}
+                        {summary.measured === 1 ? 'account' : 'accounts'}
+                      </>,
+                      <>
+                        {summary.trades} {summary.trades === 1 ? 'trade' : 'trades'}
+                      </>,
+                      <>{percent(summary.winRate)} won</>,
+                    ]
+                  : []),
+                ...(summary.openTrades > 0
+                  ? [
+                      <span
+                        data-testid="accounts-open-summary"
+                        className="cursor-help"
+                        title={
+                          data?.accounts
+                            .flatMap((a) =>
+                              (a.open_positions ?? []).map(
+                                (p) =>
+                                  `${a.alias || a.account}: ${unitsLabel(p.units)} ${pairLabel(p.instrument)} (${p.unrealized_pl})`
+                              )
+                            )
+                            .join('\n') || undefined
+                        }
+                      >
+                        <span className={pnlColor(summary.openPl)}>
+                          {money(summary.openPl, summary.currency, true)}
+                        </span>{' '}
+                        open ({summary.openTrades})
+                      </span>,
+                    ]
+                  : []),
+                ...(summary.unmeasured > 0
+                  ? [
+                      <span
+                        data-testid="accounts-unmeasured-summary"
+                        className="cursor-help"
+                        title="No baseline recorded — this window has no figure for them, so they are excluded from the total"
+                      >
+                        {summary.unmeasured} no baseline
+                      </span>,
+                    ]
+                  : []),
+                ...(summary.errored > 0
+                  ? [
+                      <span className="text-[var(--color-sell)]">
+                        {summary.errored} unavailable
+                      </span>,
+                    ]
+                  : []),
+              ])}
             </div>
           )}
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
           <div className="flex items-center gap-0.5" role="group" aria-label="Performance window">
-            {WINDOWS.map((w) => (
+            {PRESETS.map((w) => (
               <button
                 key={w.id}
                 data-testid={`accounts-window-${w.id}`}
-                onClick={() => selectWindow(w.id)}
-                aria-pressed={w.id === windowId}
+                onClick={() => {
+                  setCustomOpen(false);
+                  selectWindow(w.window);
+                }}
+                aria-pressed={w.id === activeId}
+                title={w.title}
                 className={`px-2 py-0.5 text-xs rounded font-mono transition-colors ${
-                  w.id === windowId
+                  w.id === activeId
                     ? 'bg-[var(--color-info)]/15 text-[var(--color-info)]'
                     : 'text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)]'
                 }`}
@@ -383,6 +613,22 @@ export const AccountsSection = () => {
                 {w.label}
               </button>
             ))}
+            {/* Not a preset: it reveals the two date inputs below rather than
+                selecting a window, because a range needs both ends first. */}
+            <button
+              data-testid="accounts-window-custom"
+              onClick={() => setCustomOpen((open) => !open)}
+              aria-pressed={activeId === 'custom'}
+              aria-expanded={customOpen}
+              title="A custom date range"
+              className={`px-2 py-0.5 text-xs rounded font-mono transition-colors ${
+                activeId === 'custom'
+                  ? 'bg-[var(--color-info)]/15 text-[var(--color-info)]'
+                  : 'text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)]'
+              }`}
+            >
+              custom…
+            </button>
           </div>
           <button
             data-testid="accounts-refresh"
@@ -395,6 +641,50 @@ export const AccountsSection = () => {
           </button>
         </div>
       </div>
+
+      {/* ── Custom range: two local calendar dates, end inclusive (D4) ────── */}
+      {customOpen && (
+        <div
+          data-testid="accounts-range"
+          className="mt-3 flex items-center gap-2 flex-wrap text-xs text-[var(--color-text-muted)]"
+        >
+          <label className="flex items-center gap-1.5">
+            <span>from</span>
+            <input
+              type="date"
+              data-testid="accounts-range-start"
+              aria-label="Range start date"
+              value={rangeInputs.start}
+              onChange={(e) => setRangeInputs((r) => ({ ...r, start: e.target.value }))}
+              className="px-1.5 py-0.5 rounded font-mono bg-[var(--color-bg-elevated)] border border-[var(--color-border)] text-[var(--color-text-secondary)]"
+            />
+          </label>
+          <label className="flex items-center gap-1.5">
+            <span title="Inclusive — the whole of this day counts">to</span>
+            <input
+              type="date"
+              data-testid="accounts-range-end"
+              aria-label="Range end date (inclusive)"
+              value={rangeInputs.end}
+              onChange={(e) => setRangeInputs((r) => ({ ...r, end: e.target.value }))}
+              className="px-1.5 py-0.5 rounded font-mono bg-[var(--color-bg-elevated)] border border-[var(--color-border)] text-[var(--color-text-secondary)]"
+            />
+          </label>
+          <button
+            data-testid="accounts-range-apply"
+            onClick={() => pendingRange && selectWindow(pendingRange)}
+            disabled={pendingRange === null}
+            className="px-2 py-0.5 rounded font-mono text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)] disabled:opacity-40 disabled:hover:text-[var(--color-text-muted)] transition-colors"
+          >
+            apply
+          </button>
+          {pendingRange === null && (
+            <span data-testid="accounts-range-invalid" className="text-[var(--color-text-faint)]">
+              pick a start on or before the end
+            </span>
+          )}
+        </div>
+      )}
 
       {/* ── Per-account breakdown: a grid, not a list ─────────────────────── */}
       <div className="mt-3">
