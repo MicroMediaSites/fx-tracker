@@ -2905,6 +2905,105 @@ mod tests {
         }
     }
 
+    /// AGT-1129 composed with AGT-1128 (D2 + D4): `--since-baseline` and
+    /// `--to` are NOT in conflict — clap must accept them together, unlike
+    /// `--since`/`--days` which `--since-baseline` does conflict with.
+    #[test]
+    fn since_baseline_and_to_are_not_a_conflict() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct Wrap {
+            #[command(flatten)]
+            g: GlanceArgs,
+        }
+
+        let ok = Wrap::try_parse_from([
+            "glance",
+            "--since-baseline",
+            "--to",
+            "2026-08-24T00:00:00Z",
+        ])
+        .unwrap();
+        assert!(ok.g.since_baseline);
+        assert_eq!(ok.g.to.as_deref(), Some("2026-08-24T00:00:00Z"));
+    }
+
+    /// AGT-1129 composed with AGT-1128 (D2 + D4): under `--since-baseline`,
+    /// `--to` closes every account's window at the SAME shared instant while
+    /// each account still starts at its OWN recorded baseline. This exercises
+    /// the same pure functions `glance()` calls, end to end, for two accounts
+    /// with different baselines sharing one `--to`.
+    #[test]
+    fn since_baseline_composes_with_to_shared_end_per_account_start() {
+        let now = dt("2026-08-24T09:00:00Z");
+
+        // Mirrors glance()'s own call shape: PerBaseline mode, `to` resolved
+        // with no single `since` to validate against yet (the per-account
+        // check happens later, against each account's own resolved start).
+        let mode = glance_window_mode(now, 7, None, true).unwrap();
+        assert_eq!(mode, GlanceWindowMode::PerBaseline);
+        let to = resolve_to(now, None, Some("2026-08-24T00:00:00Z")).unwrap();
+        assert_eq!(to, dt("2026-08-24T00:00:00Z"));
+
+        // Two accounts, two different baselines, one shared `to`.
+        let (h028_start, h028_source) =
+            resolve_account_window(mode, Some("2026-08-01T12:30:00Z")).unwrap().unwrap();
+        let (h029_start, h029_source) =
+            resolve_account_window(mode, Some("2026-08-10T00:00:00Z")).unwrap().unwrap();
+        assert_eq!(h028_start, dt("2026-08-01T12:30:00Z"));
+        assert_eq!(h029_start, dt("2026-08-10T00:00:00Z"));
+        assert_eq!(h028_source, WindowSource::Baseline);
+        assert_eq!(h029_source, WindowSource::Baseline);
+        // The per-account `to > start` degrade check glance() runs would pass
+        // for both — same shared `to`, different starts.
+        assert!(to > h028_start && to > h029_start);
+
+        // Each account's trades are windowed [its own start, the shared to).
+        let h028_trades = vec![
+            closed_trade("1", "EUR_USD", dec!(100), dec!(5), "2026-08-05T00:00:00Z", None),
+            // Closed exactly at the shared `to` → excluded for EVERY account.
+            closed_trade("2", "EUR_USD", dec!(100), dec!(9), "2026-08-24T00:00:00Z", None),
+        ];
+        let h028_windowed = closed_before(closed_since(h028_trades, h028_start), to);
+        assert_eq!(
+            h028_windowed.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["1"]
+        );
+
+        let h029_trades = vec![
+            // Before h029's own (later) baseline → excluded for h029, even
+            // though it is after h028's baseline.
+            closed_trade("3", "EUR_USD", dec!(100), dec!(5), "2026-08-05T00:00:00Z", None),
+            closed_trade("4", "EUR_USD", dec!(100), dec!(11), "2026-08-15T00:00:00Z", None),
+        ];
+        let h029_windowed = closed_before(closed_since(h029_trades, h029_start), to);
+        assert_eq!(
+            h029_windowed.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["4"]
+        );
+    }
+
+    /// AGT-1128's un-baselined-account rule (D3) survives composition with
+    /// `--to`: a `NoBaseline` row stays `NoBaseline` no matter what `--to` is.
+    #[test]
+    fn since_baseline_no_baseline_row_ignores_to() {
+        let mode =
+            glance_window_mode(dt("2026-08-24T09:00:00Z"), 7, None, true).unwrap();
+        assert_eq!(resolve_account_window(mode, None).unwrap(), None);
+
+        let row = build_glance_row(
+            "h030",
+            &["h030".into()],
+            "101-9",
+            &snap_10k(),
+            RowWindow::NoBaseline,
+            Some(&[]),
+        );
+        assert!(row["window_start"].is_null());
+        assert_eq!(row["note"], "no baseline recorded");
+    }
+
     // ── trade history rows (entry/exit detail + blended-exit honesty) ──────
 
     fn trade_with_exits(
