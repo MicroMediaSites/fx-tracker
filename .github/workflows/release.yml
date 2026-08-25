@@ -367,10 +367,18 @@ jobs:
       - name: Cleanup runner state
         if: always()
         run: |
-          # Restore original keychain search list (saved during import step).
+          # Restore original keychain search list (saved during import step),
+          # THEN delete the temp keychain. Order matters: the import step puts
+          # app-signing.keychain-db at the FRONT of the user search list, so
+          # deleting it first destroys the active/default keychain and leaves
+          # SecurityAgent with none - which pops a "Keychain Not Found / a
+          # keychain cannot be found to store <user>" dialog at whoever is
+          # logged into the runner box. (Its "Reset To Defaults" button can
+          # create a fresh empty login keychain shadowing the real one, so this
+          # is worth more than a cosmetic fix.) Restoring the list first means
+          # the temp keychain is never the default at the moment it is removed.
           # Only touch the keychain list if the import step actually ran
           # (unsigned builds never modify it).
-          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
           if [ -f "$RUNNER_TEMP/original-keychains.txt" ]; then
             KEYCHAINS=()
             while IFS= read -r kc; do
@@ -378,6 +386,7 @@ jobs:
             done < "$RUNNER_TEMP/original-keychains.txt"
             security list-keychain -d user -s "${KEYCHAINS[@]}"
           fi
+          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
 
           # Force-detach any stale DMG mounts
           for dir in /private/tmp/dmg.*; do
