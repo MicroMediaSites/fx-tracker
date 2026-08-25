@@ -4,9 +4,14 @@
  * The drill-down behind an account tile. Like the glance it reaches OANDA
  * through the CLI, so it takes a few seconds and is fetched on demand (when the
  * modal opens), never on a timer.
+ *
+ * The fetch honours the SAME window the tile grid is showing (D8 of
+ * `wickd-account-windows`) — the tile and its drill-down must agree or the
+ * numbers can't be reconciled. See `windowToHistoryArgs` for the mapping.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { GlanceWindow, localMidnightIso } from './useAccountsGlance';
 
 export interface TradeExit {
   time: string | null;
@@ -83,25 +88,103 @@ export interface UseAccountHistory {
   reload: () => void;
 }
 
-/** `account === null` means the drill-down is closed — no fetch is issued. */
-export const useAccountHistory = (account: string | null): UseAccountHistory => {
+/**
+ * `N` days back from `now` as an RFC3339 instant — the `account_history`
+ * equivalent of `accounts_glance`'s `--days N`, which the CLI computes as
+ * `now - N days` itself (`glance_window()` in `trade.rs`). `wickd trade
+ * history` has no `--days` flag (only `--since`/`--to`), so for a `days`
+ * window the frontend must supply the instant. Exact wall-clock subtraction
+ * (not calendar/local-midnight math, unlike `localMidnightIso`) to match the
+ * CLI's own arithmetic exactly.
+ */
+export const daysAgoIso = (days: number, now: Date = new Date()): string =>
+  new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
+
+/**
+ * D8: map the section's active `GlanceWindow` to the `since`/`to` args
+ * `account_history` takes.
+ *
+ * - `baseline` → neither: `trade history` already defaults to since-baseline
+ *   per account when `since` is omitted, which is exactly this window.
+ * - `range` → both, verbatim (closed window, `since` inclusive / `to`
+ *   exclusive — same convention the CLI itself uses).
+ * - `today` → `since` = the viewer's local midnight, recomputed per call so a
+ *   long-open modal follows the date over, same as the glance hook.
+ * - `days` → `since` = `daysAgoIso(days)`; no `to` (open-ended to now).
+ *
+ * Pure and exported so the mapping is tested independently of the fetch.
+ */
+export const windowToHistoryArgs = (
+  w: GlanceWindow,
+  now: Date = new Date()
+): { since: string | null; to: string | null } => {
+  switch (w.kind) {
+    case 'baseline':
+      return { since: null, to: null };
+    case 'range':
+      return { since: w.from, to: w.to };
+    case 'today':
+      return { since: localMidnightIso(now), to: null };
+    case 'days':
+      return { since: daysAgoIso(w.days, now), to: null };
+  }
+};
+
+/**
+ * `account === null` means the drill-down is closed — no fetch is issued.
+ *
+ * Param is `glanceWindow`, not `window` — shadowing the global would make any
+ * later `window.*` access in this hook fail in a confusing way (same reason
+ * `useAccountsGlance` avoids it).
+ */
+export const useAccountHistory = (
+  account: string | null,
+  glanceWindow: GlanceWindow
+): UseAccountHistory => {
   const [data, setData] = useState<AccountHistory | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  // Depend on the window's primitive fields, not the object, so an inline
+  // `{ kind: 'days', days: 7 }` literal at the call site doesn't rebuild
+  // `load` (and refetch) on every render — same pattern as useAccountsGlance.
+  const kind = glanceWindow.kind;
+  const days = glanceWindow.kind === 'days' ? glanceWindow.days : null;
+  const from = glanceWindow.kind === 'range' ? glanceWindow.from : null;
+  const to = glanceWindow.kind === 'range' ? glanceWindow.to : null;
+
+  // Recombined from the primitives above rather than used directly, so the
+  // reference is stable across renders unless one of those fields actually
+  // changes (see the note on `load`'s deps).
+  const stableWindow = useMemo<GlanceWindow>(() => {
+    switch (kind) {
+      case 'days':
+        return { kind, days: days as number };
+      case 'range':
+        return { kind, from: from as string, to: to as string };
+      default:
+        return { kind };
+    }
+  }, [kind, days, from, to]);
 
   const load = useCallback(async () => {
     if (account === null) return;
     setLoading(true);
     setError(null);
     try {
-      const result = await invoke<AccountHistory>('account_history', { account });
+      const { since, to: toArg } = windowToHistoryArgs(stableWindow, new Date());
+      const result = await invoke<AccountHistory>('account_history', {
+        account,
+        since,
+        to: toArg,
+      });
       setData(result);
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
     }
-  }, [account]);
+  }, [account, stableWindow]);
 
   useEffect(() => {
     // Clear the prior account's trades immediately so an open modal never shows

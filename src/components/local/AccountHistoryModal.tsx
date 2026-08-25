@@ -15,9 +15,15 @@
  *    the data can't lie once it happens.)
  *  - When OANDA's fetch cap is hit, a banner says the history may be
  *    incomplete rather than letting a partial list read as the whole record.
+ *
+ * The window it fetches over is whatever the accounts section is currently
+ * showing (D8 of `wickd-account-windows`) — the header repeats that window's
+ * label (via `windowLabel`, not a re-implementation of the label strings) so
+ * it's never ambiguous which span the trades below belong to.
  */
 import { useEffect, useState } from 'react';
 import { ExitFill, HistoryTrade, useAccountHistory } from '../../hooks/useAccountHistory';
+import { GlanceWindow, windowLabel } from '../../hooks/useAccountsGlance';
 
 const money = (value: string | null, signed = false): string => {
   if (value === null) return '—';
@@ -238,11 +244,18 @@ const TradeRow = ({ trade }: { trade: HistoryTrade }) => {
 interface Props {
   /** The account name to show; `null` closes the modal. */
   account: string | null;
+  /**
+   * The section's active window (D8) — what the fetch is scoped to and what
+   * the header repeats. Named `glanceWindow`, not `window`: shadowing the
+   * global would break this file's own `window.*` calls (keydown listener,
+   * etc.) in a confusing way.
+   */
+  glanceWindow: GlanceWindow;
   onClose: () => void;
 }
 
-export const AccountHistoryModal = ({ account, onClose }: Props) => {
-  const { data, error, loading } = useAccountHistory(account);
+export const AccountHistoryModal = ({ account, glanceWindow, onClose }: Props) => {
+  const { data, error, loading } = useAccountHistory(account, glanceWindow);
 
   useEffect(() => {
     if (account === null) return;
@@ -270,7 +283,17 @@ export const AccountHistoryModal = ({ account, onClose }: Props) => {
       >
         <div className="flex items-baseline justify-between px-5 py-3 border-b border-[var(--color-border)] gap-3">
           <div className="min-w-0">
-            <h3 className="text-base font-semibold font-mono">{account}</h3>
+            <div className="flex items-baseline gap-2">
+              <h3 className="text-base font-semibold font-mono">{account}</h3>
+              {/* Repeats the section's active window (D8) — the tile and the
+                  drill-down must visibly agree on what span they're showing. */}
+              <span
+                data-testid="history-window-label"
+                className="text-[11px] font-medium uppercase tracking-wider text-[var(--color-text-muted)]"
+              >
+                {windowLabel(glanceWindow)}
+              </span>
+            </div>
             {data && (
               <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
                 {data.count} {data.count === 1 ? 'trade' : 'trades'}
