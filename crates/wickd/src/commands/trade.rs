@@ -132,6 +132,14 @@ struct GlanceArgs {
     /// the CLI cannot infer (it has no idea what timezone the reader is in).
     #[arg(long)]
     since: Option<String>,
+    /// Start each account's window at ITS OWN recorded baseline (its experiment
+    /// start) instead of one shared instant. Per-account by construction, so
+    /// there is no single window start: the top-level `since` is null and each
+    /// row carries its own `window_start`. An account that has never been
+    /// baselined reports nulls plus `note: "no baseline recorded"` — never 0.
+    /// Mutually exclusive with --since and --days.
+    #[arg(long, conflicts_with_all = ["since", "days"])]
+    since_baseline: bool,
     /// How many recent closed trades to pull per account before filtering to
     /// the window. Default 200 — the glance is a summary, not an audit; raise
     /// it for a high-frequency account whose window truncates.
@@ -1695,6 +1703,90 @@ fn glance_window(
     }
 }
 
+/// Which input decided a glance row's window start. Reported per row as
+/// `window_source` so a reader never has to infer it from the flags it passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowSource {
+    /// `--since-baseline`: the account's own recorded baseline.
+    Baseline,
+    /// `--since <instant>`: one explicit start shared by every account.
+    Since,
+    /// `--days N` (the default): N days back from now, shared by every account.
+    Days,
+}
+
+impl WindowSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            WindowSource::Baseline => "baseline",
+            WindowSource::Since => "since",
+            WindowSource::Days => "days",
+        }
+    }
+}
+
+/// How the glance derives each account's window start (D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlanceWindowMode {
+    /// One start instant for every account, from `--since` or `--days`.
+    Shared(DateTime<Utc>, WindowSource),
+    /// Per-account: each account starts at its own latest baseline. There is no
+    /// single start, which is why the top-level `since` is null in this mode.
+    PerBaseline,
+}
+
+/// Resolve the glance's window *mode* from the flags. Pure and unit-tested.
+///
+/// `--since-baseline` is `conflicts_with` `--since`/`--days` at the clap layer,
+/// so reaching here with both is a programming error, not user input; the mode
+/// simply takes precedence. Otherwise this defers to [`glance_window`] for the
+/// shared start (`--since` wins over `--days` — see its note on clap defaults).
+fn glance_window_mode(
+    now: DateTime<Utc>,
+    days: u32,
+    since: Option<&str>,
+    since_baseline: bool,
+) -> Result<GlanceWindowMode> {
+    if since_baseline {
+        return Ok(GlanceWindowMode::PerBaseline);
+    }
+    let source = if since.is_some() { WindowSource::Since } else { WindowSource::Days };
+    Ok(GlanceWindowMode::Shared(glance_window(now, days, since)?, source))
+}
+
+/// Resolve ONE account's window from the mode plus that account's latest
+/// recorded `baseline_date` (`None` = the account has never been baselined).
+///
+/// Returns `None` only in the per-baseline mode for an un-baselined account —
+/// the honest "unmeasured" state (D3), which the caller renders as nulls rather
+/// than as a zero window. Pure and unit-tested.
+fn resolve_account_window(
+    mode: GlanceWindowMode,
+    baseline_date: Option<&str>,
+) -> Result<Option<(DateTime<Utc>, WindowSource)>> {
+    match mode {
+        GlanceWindowMode::Shared(start, source) => Ok(Some((start, source))),
+        GlanceWindowMode::PerBaseline => match baseline_date {
+            None => Ok(None),
+            Some(d) => {
+                let start = parse_baseline_date(d)
+                    .context("stored baseline_date is not a valid date")?;
+                Ok(Some((start, WindowSource::Baseline)))
+            }
+        },
+    }
+}
+
+/// Pick the account group's effective baseline. Baselines are recorded per
+/// *name* but a glance row is per broker account, and a group can carry several
+/// aliases of the same account (`default` + `tf-m30`). The most recently
+/// recorded row wins — the same latest-wins rule [`baseline::latest`] applies
+/// within a single name, generalised across the group's names. Pure.
+fn pick_group_baseline(mut found: Vec<baseline::Baseline>) -> Option<baseline::Baseline> {
+    found.sort_by_key(|b| b.id);
+    found.pop()
+}
+
 /// Group every configured account name in `env_cfg` by the OANDA account id it
 /// resolves to, so accounts aliased to the same broker account are fetched once
 /// and rendered as one row. (Matt's practice config has `default` and `tf-m30`
@@ -1730,6 +1822,23 @@ fn group_accounts_by_id(
     groups
 }
 
+/// What one glance row knows about its window: either a resolved start plus the
+/// trades closed inside it, or — under `--since-baseline` for an account that
+/// has never been baselined — nothing at all.
+#[derive(Debug, Clone, Copy)]
+enum RowWindow<'a> {
+    /// The window resolved; `closed` is what fell inside it.
+    Measured {
+        start: DateTime<Utc>,
+        source: WindowSource,
+        closed: &'a [Trade],
+    },
+    /// D3: no baseline recorded, so this account is **unmeasured**, not flat.
+    /// Every window-derived field is null and the row carries a `note`.
+    /// Rendering `0` here would be a lie — `0` means "traded flat".
+    NoBaseline,
+}
+
 /// Build one account's glance row from its OANDA snapshot and the trades closed
 /// inside the window. Pure (no network) so the realized sum, win/loss tally, and
 /// win rate are unit-tested directly.
@@ -1737,18 +1846,38 @@ fn group_accounts_by_id(
 /// Scratch trades (exactly zero realized P&L) count toward `trades` but are
 /// excluded from the win-rate denominator — a break-even fill is neither a win
 /// nor a loss, and folding it into either skews a low-count window.
+///
+/// The account-level fields (`nav`, `balance`, `open_positions`, …) are not
+/// window-derived and are reported in every case, including [`RowWindow::NoBaseline`].
 fn build_glance_row(
     primary: &str,
     names: &[String],
     account_id: &str,
     snap: &AccountSnapshot,
-    closed: &[Trade],
+    window: RowWindow<'_>,
     open: Option<&[Position]>,
 ) -> serde_json::Value {
+    let closed: &[Trade] = match window {
+        RowWindow::Measured { closed, .. } => closed,
+        RowWindow::NoBaseline => &[],
+    };
     let realized: Decimal = closed.iter().map(|t| t.realized_pl).sum();
     let wins = closed.iter().filter(|t| t.realized_pl > Decimal::ZERO).count();
     let losses = closed.iter().filter(|t| t.realized_pl < Decimal::ZERO).count();
     let decided = wins + losses;
+    let measured = matches!(window, RowWindow::Measured { .. });
+
+    // `window_source` is known even when the window is not: under
+    // `--since-baseline` an un-baselined account's source is still "baseline".
+    let (window_start, window_source) = match window {
+        RowWindow::Measured { start, source, .. } => {
+            (serde_json::json!(start.to_rfc3339()), source)
+        }
+        RowWindow::NoBaseline => (serde_json::Value::Null, WindowSource::Baseline),
+    };
+
+    // Null when the window is unmeasured (D3), the tallied value otherwise.
+    let windowed = |v: serde_json::Value| if measured { v } else { serde_json::Value::Null };
 
     // Null means "the open-positions fetch failed", which must stay
     // distinguishable from "nothing open" ([]): the UI falls back to the bare
@@ -1779,28 +1908,43 @@ fn build_glance_row(
         "balance": dec_str(snap.balance),
         "unrealized_pl": dec_str(snap.unrealized_pl),
         "open_trade_count": snap.open_trade_count,
-        "realized": dec_str(realized),
-        "trades": closed.len(),
-        "wins": wins,
-        "losses": losses,
+        // This row's own window (D2). `window_start` is null exactly when the
+        // window is unmeasured; `window_source` always says which input decided.
+        "window_start": window_start,
+        "window_source": window_source.as_str(),
+        "realized": windowed(serde_json::json!(dec_str(realized))),
+        "trades": windowed(serde_json::json!(closed.len())),
+        "wins": windowed(serde_json::json!(wins)),
+        "losses": windowed(serde_json::json!(losses)),
         // Null (not 0) when nothing decided in the window — the UI must render
         // "—", not a misleading 0%.
-        "win_rate": if decided > 0 {
+        "win_rate": windowed(if decided > 0 {
             serde_json::json!((wins as f64 / decided as f64 * 1000.0).round() / 1000.0)
         } else {
             serde_json::Value::Null
+        }),
+        // Why the window is unmeasured, when it is. Null on the ordinary path.
+        "note": match window {
+            RowWindow::Measured { .. } => serde_json::Value::Null,
+            RowWindow::NoBaseline => serde_json::json!("no baseline recorded"),
         },
         "error": serde_json::Value::Null,
     })
 }
 
-/// `wickd trade glance [--days N]`: a one-line performance summary for every
-/// account configured in `--env`, over a rolling window ending now.
+/// `wickd trade glance [--days N | --since <instant> | --since-baseline]`: a
+/// one-line performance summary for every account configured in `--env`.
 ///
-/// Deliberately different from `report`: no baseline is required (the window is
-/// fixed and recent, not since-inception), and it spans all accounts rather than
-/// one. That makes it the cheap "how is the whole ladder doing" surface the
-/// desktop dashboard polls.
+/// Deliberately different from `report`: it spans all accounts rather than one,
+/// and no baseline is *required* — the default window is fixed and recent. That
+/// makes it the cheap "how is the whole ladder doing" surface the desktop
+/// dashboard polls.
+///
+/// `--since-baseline` (D2) starts each account at its own recorded baseline
+/// instead, which is the "how is each experiment doing" question. This is the
+/// ONLY place a per-account start is computed; the desktop app is a reader of
+/// this command and never opens `baselines.db` itself. An account with no
+/// baseline is reported as unmeasured (nulls + a `note`), never as zero (D3).
 ///
 /// A per-account failure (revoked key, OANDA 5xx) is captured *into that row's
 /// `error` field* rather than failing the command — one bad account must not
@@ -1822,16 +1966,51 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
     }
 
     let now = Utc::now();
-    let since = glance_window(now, g.days, g.since.as_deref())?;
+    let mode = glance_window_mode(now, g.days, g.since.as_deref(), g.since_baseline)?;
+
+    // `--since-baseline` is the ONLY place a per-account start is computed
+    // (D2): the desktop app never opens baselines.db itself. Open the store
+    // once, and only when the mode actually needs it.
+    let baselines = match mode {
+        GlanceWindowMode::PerBaseline => Some(baseline::open()?),
+        GlanceWindowMode::Shared(..) => None,
+    };
 
     // Resolve credentials up front and serially: keychain reads are local and
     // fast, and keeping them off the worker threads avoids concurrent access to
-    // the same keychain item. Only the network fetches fan out.
+    // the same keychain item. The baseline lookups are local SQLite reads and
+    // ride along here for the same reason. Only the network fetches fan out.
     let mut resolved = Vec::new();
     let mut rows: Vec<serde_json::Value> = Vec::new();
     for (primary, names) in groups {
+        // A corrupt stored baseline_date is that row's problem, not the whole
+        // panel's — same rule the OANDA fetches below follow.
+        let window = match &baselines {
+            None => resolve_account_window(mode, None),
+            Some(conn) => {
+                let mut found = Vec::new();
+                for name in &names {
+                    if let Some(b) = baseline::latest(conn, name)? {
+                        found.push(b);
+                    }
+                }
+                let picked = pick_group_baseline(found);
+                resolve_account_window(mode, picked.as_ref().map(|b| b.baseline_date.as_str()))
+            }
+        };
+        let window = match window {
+            Ok(w) => w,
+            Err(e) => {
+                rows.push(serde_json::json!({
+                    "account": primary,
+                    "names": names,
+                    "error": format!("{e:#}"),
+                }));
+                continue;
+            }
+        };
         match client::resolve(env_raw, &primary) {
-            Ok((_, oanda)) => resolved.push((primary, names, oanda)),
+            Ok((_, oanda)) => resolved.push((primary, names, oanda, window)),
             Err(e) => rows.push(serde_json::json!({
                 "account": primary,
                 "names": names,
@@ -1842,9 +2021,13 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
 
     let limit = g.limit;
     let mut set = tokio::task::JoinSet::new();
-    for (primary, names, oanda) in resolved {
+    for (primary, names, oanda, window) in resolved {
         set.spawn(async move {
             let account_id = oanda.account_id().to_string();
+            // No baseline (D3): the account still has a NAV, so fetch the
+            // snapshot, but there is no window to sum trades over. Skip the
+            // history and ledger reads entirely.
+            let since = window.map(|(start, _)| start);
             // The fetches are independent — run them concurrently so an
             // account costs one round trip of latency, not three. With the
             // per-account fan-out above, the whole glance is ~one round trip.
@@ -1852,11 +2035,27 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
             // stale closed-trades index; its failure degrades to the index
             // result rather than blanking the row, so it stays outside the
             // fatal `?` chain below.
+            // With no window (D3) there is nothing to window trades against, so
+            // both trade reads are skipped and only the account snapshot runs.
             let (fetched, ledger) = async {
                 let (acct, closed, ledger) = tokio::join!(
                     endpoints::get_account(&oanda),
-                    endpoints::get_trade_history(&oanda, Some(limit), None),
-                    endpoints::closed_trades_from_ledger(&oanda, since, now),
+                    async {
+                        match since {
+                            Some(_) => {
+                                endpoints::get_trade_history(&oanda, Some(limit), None).await
+                            }
+                            None => Ok(Vec::new()),
+                        }
+                    },
+                    async {
+                        match since {
+                            Some(s) => {
+                                Some(endpoints::closed_trades_from_ledger(&oanda, s, now).await)
+                            }
+                            None => None,
+                        }
+                    },
                 );
                 (
                     (|| {
@@ -1888,20 +2087,31 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
                     // Merge in the closes the stale index dropped (issue #16)
                     // before windowing, so realized/wins/losses count them.
                     let (closed, ledger_note) = match ledger {
-                        Ok(l) => {
+                        // Not fetched — there is no window to cross-check.
+                        None => (Vec::new(), None),
+                        Some(Ok(l)) => {
                             let note = (l.unresolved > 0)
                                 .then(|| format!("{} window closes unresolved", l.unresolved));
                             (merge_ledger_closed(closed, l.trades), note)
                         }
-                        Err(e) => (closed, Some(format!("ledger read failed: {e:#}"))),
+                        Some(Err(e)) => (closed, Some(format!("ledger read failed: {e:#}"))),
                     };
-                    let closed = closed_since(closed, since);
+                    let closed = match since {
+                        Some(s) => closed_since(closed, s),
+                        None => Vec::new(),
+                    };
+                    let row_window = match window {
+                        Some((start, source)) => {
+                            RowWindow::Measured { start, source, closed: &closed }
+                        }
+                        None => RowWindow::NoBaseline,
+                    };
                     let mut row = build_glance_row(
                         &primary,
                         &names,
                         &account_id,
                         &snap,
-                        &closed,
+                        row_window,
                         open.as_deref(),
                     );
                     // Null on the ordinary path. Non-null means the realized
@@ -1931,11 +2141,19 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
 
     Ok(serde_json::json!({
         "environment": env_str(env),
-        // Null when --since drove the window: reporting the unused --days
-        // default alongside an explicit instant would misdescribe the result.
-        // `since` below is always the authoritative window start.
-        "days": if g.since.is_some() { serde_json::Value::Null } else { g.days.into() },
-        "since": since.to_rfc3339(),
+        // Null when --since or --since-baseline drove the window: reporting the
+        // unused --days default alongside them would misdescribe the result.
+        "days": match mode {
+            GlanceWindowMode::Shared(_, WindowSource::Days) => g.days.into(),
+            _ => serde_json::Value::Null,
+        },
+        // The shared window start. Null under --since-baseline: the window is
+        // per-account there, so each row's `window_start` is authoritative and
+        // no single top-level start exists (D2).
+        "since": match mode {
+            GlanceWindowMode::Shared(start, _) => serde_json::json!(start.to_rfc3339()),
+            GlanceWindowMode::PerBaseline => serde_json::Value::Null,
+        },
         "generated_at": now.to_rfc3339(),
         "count": rows.len(),
         "accounts": rows,
@@ -2300,6 +2518,16 @@ mod tests {
         }
     }
 
+    /// The ordinary `--days` window, for the row tests that are not about
+    /// window resolution.
+    fn days_window(closed: &[Trade]) -> RowWindow<'_> {
+        RowWindow::Measured {
+            start: dt("2026-07-17T00:00:00Z"),
+            source: WindowSource::Days,
+            closed,
+        }
+    }
+
     #[test]
     fn glance_row_sums_realized_and_tallies_wins() {
         let closed = vec![
@@ -2308,7 +2536,7 @@ mod tests {
             closed_trade("3", "GBP_USD", dec!(100), dec!(17.2), "2026-07-17T00:00:00Z", None),
         ];
         let row =
-            build_glance_row("h004", &["h004".into()], "101-1", &snap_10k(), &closed, Some(&[]));
+            build_glance_row("h004", &["h004".into()], "101-1", &snap_10k(), days_window(&closed), Some(&[]));
 
         assert_eq!(row["realized"], "47.2");
         assert_eq!(row["trades"], 3);
@@ -2343,7 +2571,7 @@ mod tests {
             },
         ];
         let row =
-            build_glance_row("tf-m15", &["tf-m15".into()], "101-4", &snap_10k(), &[], Some(&open));
+            build_glance_row("tf-m15", &["tf-m15".into()], "101-4", &snap_10k(), days_window(&[]), Some(&open));
         assert_eq!(
             row["open_positions"],
             serde_json::json!([
@@ -2352,7 +2580,7 @@ mod tests {
         );
 
         let failed =
-            build_glance_row("tf-m15", &["tf-m15".into()], "101-4", &snap_10k(), &[], None);
+            build_glance_row("tf-m15", &["tf-m15".into()], "101-4", &snap_10k(), days_window(&[]), None);
         assert!(failed["open_positions"].is_null());
     }
 
@@ -2362,7 +2590,7 @@ mod tests {
             closed_trade("1", "EUR_USD", dec!(100), dec!(5), "2026-07-19T00:00:00Z", None),
             closed_trade("2", "EUR_USD", dec!(100), dec!(0), "2026-07-18T00:00:00Z", None),
         ];
-        let row = build_glance_row("h004", &["h004".into()], "101-1", &snap_10k(), &closed, Some(&[]));
+        let row = build_glance_row("h004", &["h004".into()], "101-1", &snap_10k(), days_window(&closed), Some(&[]));
 
         // Counted as a trade, excluded from the win-rate denominator: 1/1, not 1/2.
         assert_eq!(row["trades"], 2);
@@ -2373,12 +2601,201 @@ mod tests {
 
     #[test]
     fn glance_row_empty_window_has_null_win_rate() {
-        let row = build_glance_row("tf-h1", &["tf-h1".into()], "101-6", &snap_10k(), &[], Some(&[]));
+        let row = build_glance_row("tf-h1", &["tf-h1".into()], "101-6", &snap_10k(), days_window(&[]), Some(&[]));
 
         assert_eq!(row["trades"], 0);
         assert_eq!(row["realized"], "0");
         // Null, never 0 — the UI must render "—" for "nothing decided yet".
         assert!(row["win_rate"].is_null());
+    }
+
+    // ── AGT-1128: per-account since-baseline windows ───────────────────────
+
+    /// AC2: every row reports the window it was measured over, and which input
+    /// decided it.
+    #[test]
+    fn glance_row_reports_its_own_window_start_and_source() {
+        let closed = vec![closed_trade(
+            "1",
+            "EUR_USD",
+            dec!(100),
+            dec!(40),
+            "2026-08-20T00:00:00Z",
+            None,
+        )];
+        let row = build_glance_row(
+            "h028",
+            &["h028".into()],
+            "101-7",
+            &snap_10k(),
+            RowWindow::Measured {
+                start: dt("2026-08-01T12:30:00Z"),
+                source: WindowSource::Baseline,
+                closed: &closed,
+            },
+            Some(&[]),
+        );
+
+        assert_eq!(row["window_start"], "2026-08-01T12:30:00+00:00");
+        assert_eq!(row["window_source"], "baseline");
+        assert_eq!(row["realized"], "40");
+        // Nothing is unmeasured here, so no note.
+        assert!(row["note"].is_null());
+    }
+
+    /// AC3 / D3: an un-baselined account is UNMEASURED, not flat. Every
+    /// window-derived field is null — a `0` here would read as "traded flat".
+    #[test]
+    fn glance_row_without_a_baseline_is_null_never_zero() {
+        let row = build_glance_row(
+            "h029",
+            &["h029".into()],
+            "101-8",
+            &snap_10k(),
+            RowWindow::NoBaseline,
+            Some(&[]),
+        );
+
+        assert!(row["window_start"].is_null());
+        // The *source* is still known: the reader asked for baseline windows.
+        assert_eq!(row["window_source"], "baseline");
+        assert_eq!(row["note"], "no baseline recorded");
+
+        for field in ["realized", "trades", "wins", "losses", "win_rate"] {
+            assert!(
+                row[field].is_null(),
+                "{field} must be null for an un-baselined account, got {}",
+                row[field]
+            );
+        }
+
+        // Account-level facts are NOT window-derived and still render.
+        assert_eq!(row["nav"], "10012");
+        assert_eq!(row["balance"], "10000");
+        assert_eq!(row["currency"], "USD");
+        assert_eq!(row["open_positions"], serde_json::json!([]));
+        assert!(row["error"].is_null());
+    }
+
+    /// AC4: the pure window resolution, for all three sources.
+    #[test]
+    fn window_mode_resolves_days_since_and_baseline() {
+        let now = dt("2026-08-24T09:00:00Z");
+
+        // --days (the default) — one shared start, N days back.
+        let m = glance_window_mode(now, 7, None, false).unwrap();
+        assert_eq!(
+            m,
+            GlanceWindowMode::Shared(dt("2026-08-17T09:00:00Z"), WindowSource::Days)
+        );
+        // Shared modes ignore the account's baseline entirely.
+        assert_eq!(
+            resolve_account_window(m, Some("2026-01-01")).unwrap(),
+            Some((dt("2026-08-17T09:00:00Z"), WindowSource::Days))
+        );
+
+        // --since — one shared start at the given instant.
+        let m = glance_window_mode(now, 7, Some("2026-08-20T06:00:00Z"), false).unwrap();
+        assert_eq!(
+            m,
+            GlanceWindowMode::Shared(dt("2026-08-20T06:00:00Z"), WindowSource::Since)
+        );
+
+        // --since-baseline — per account, from that account's own baseline.
+        let m = glance_window_mode(now, 7, None, true).unwrap();
+        assert_eq!(m, GlanceWindowMode::PerBaseline);
+        assert_eq!(
+            resolve_account_window(m, Some("2026-08-01T12:30:00Z")).unwrap(),
+            Some((dt("2026-08-01T12:30:00Z"), WindowSource::Baseline))
+        );
+        // …and a bare ISO date reads as UTC midnight, as `baseline set` stores.
+        assert_eq!(
+            resolve_account_window(m, Some("2026-08-01")).unwrap(),
+            Some((dt("2026-08-01T00:00:00Z"), WindowSource::Baseline))
+        );
+    }
+
+    /// D3 at the resolution layer: no baseline resolves to "no window", which
+    /// is distinct from resolving to `now` or to the epoch.
+    #[test]
+    fn window_mode_per_baseline_yields_no_window_without_a_baseline() {
+        let m = glance_window_mode(dt("2026-08-24T09:00:00Z"), 7, None, true).unwrap();
+        assert_eq!(resolve_account_window(m, None).unwrap(), None);
+    }
+
+    /// A corrupt stored `baseline_date` is an error, not a silently-zeroed
+    /// window. The caller turns it into that row's `error`.
+    #[test]
+    fn window_mode_rejects_a_corrupt_stored_baseline_date() {
+        let m = glance_window_mode(dt("2026-08-24T09:00:00Z"), 7, None, true).unwrap();
+        let err = resolve_account_window(m, Some("last tuesday")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("baseline_date"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Aliases of one broker account can each carry a baseline; the most
+    /// recently recorded row wins, matching `baseline::latest`'s rule.
+    #[test]
+    fn group_baseline_picks_the_most_recently_recorded_alias() {
+        let mut older = baseline::Baseline::new(
+            "default",
+            Some("practice".into()),
+            "10000",
+            Some("USD".into()),
+            "2026-07-01T00:00:00Z".into(),
+        );
+        older.id = 3;
+        let mut newer = baseline::Baseline::new(
+            "tf-m30",
+            Some("practice".into()),
+            "10250",
+            Some("USD".into()),
+            "2026-08-01T00:00:00Z".into(),
+        );
+        newer.id = 9;
+
+        // Insertion order must not matter — the id does.
+        let picked = pick_group_baseline(vec![newer.clone(), older.clone()]).unwrap();
+        assert_eq!(picked.id, 9);
+        let picked = pick_group_baseline(vec![older, newer]).unwrap();
+        assert_eq!(picked.baseline_date, "2026-08-01T00:00:00Z");
+
+        assert!(pick_group_baseline(Vec::new()).is_none());
+    }
+
+    /// AC1: `--since-baseline` is mutually exclusive with `--since` and
+    /// `--days`, and clap's own defaults must not trip the conflict.
+    #[test]
+    fn since_baseline_conflicts_with_since_and_days() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct Wrap {
+            #[command(flatten)]
+            g: GlanceArgs,
+        }
+
+        // Alone: fine, and --days keeps its default without conflicting.
+        let ok = Wrap::try_parse_from(["glance", "--since-baseline"]).unwrap();
+        assert!(ok.g.since_baseline);
+        assert_eq!(ok.g.days, 7);
+
+        for argv in [
+            vec!["glance", "--since-baseline", "--days", "7"],
+            vec!["glance", "--since-baseline", "--since", "2026-08-01"],
+            vec!["glance", "--days", "7", "--since-baseline"],
+        ] {
+            let err = Wrap::try_parse_from(&argv)
+                .unwrap_err()
+                .kind();
+            assert_eq!(
+                err,
+                clap::error::ErrorKind::ArgumentConflict,
+                "expected a conflict for {argv:?}"
+            );
+        }
     }
 
     // ── trade history rows (entry/exit detail + blended-exit honesty) ──────
