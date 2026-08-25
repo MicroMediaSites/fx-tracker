@@ -47,10 +47,10 @@ const localMidnight = (d: Date): string => {
  * this window, giving the test a single deterministic `accounts_glance` call
  * instead of the cold-boot probe-then-fallback pair.
  */
-const seedWindow = async (page: Page, window: unknown) => {
+const seedWindow = async (page: Page, glanceWindow: unknown) => {
   await page.addInitScript((serialized) => {
     localStorage.setItem('wickd_accounts_window', serialized);
-  }, JSON.stringify(window));
+  }, JSON.stringify(glanceWindow));
 };
 
 /**
@@ -119,7 +119,7 @@ const BASELINE_GLANCE = {
     {
       account: 'tf-m1',
       names: ['tf-m1'],
-      account_id: '101-001-26151603-002',
+      account_id: '101-001-00000000-002',
       currency: 'USD',
       nav: '99976.89',
       balance: '99976.89',
@@ -138,7 +138,7 @@ const BASELINE_GLANCE = {
     {
       account: 'h004',
       names: ['h004'],
-      account_id: '101-001-26151603-001',
+      account_id: '101-001-00000000-001',
       currency: 'USD',
       nav: null,
       balance: null,
@@ -169,7 +169,7 @@ const TODAY_GLANCE = {
     {
       account: 'tf-m1',
       names: ['tf-m1'],
-      account_id: '101-001-26151603-002',
+      account_id: '101-001-00000000-002',
       currency: 'USD',
       nav: '10012.00',
       balance: '10012.00',
@@ -190,7 +190,7 @@ const TODAY_GLANCE = {
 
 const HISTORY_BASELINE = {
   account: 'tf-m1',
-  account_id: '101-001-26151603-002',
+  account_id: '101-001-00000000-002',
   environment: 'practice',
   baseline: { balance: '100000', date: '2026-08-25T00:36:00Z' },
   since: '2026-08-25T00:36:00Z',
