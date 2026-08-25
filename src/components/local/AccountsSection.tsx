@@ -714,7 +714,15 @@ export const AccountsSection = () => {
         )}
       </div>
 
-      <AccountHistoryModal account={openAccount} onClose={() => setOpenAccount(null)} />
+      {/* D8 (AGT-1133): the drill-down honours the same window the tiles show.
+          `selected` is the section's active GlanceWindow, set by the picker
+          above; passing it here is what keeps the modal and the tiles in
+          agreement. */}
+      <AccountHistoryModal
+        account={openAccount}
+        glanceWindow={selected}
+        onClose={() => setOpenAccount(null)}
+      />
     </section>
   );
 };
