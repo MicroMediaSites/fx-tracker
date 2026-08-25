@@ -23,6 +23,9 @@ const account = (over: Partial<AccountGlance>): AccountGlance => ({
   wins: 0,
   losses: 0,
   win_rate: null,
+  window_start: null,
+  window_source: null,
+  note: null,
   error: null,
   ...over,
 });
