@@ -17,7 +17,10 @@ permissions:
 jobs:
   verify-update-endpoint:
     name: Verify Update Endpoint
-    runs-on: [self-hosted, Linux, ARM64]
+    # GitHub-hosted: this job only calls the gh CLI (preinstalled) with
+    # github.token. See release.yml's version job - the org's Linux ARM64
+    # self-hosted runners are gone, so this workflow had never actually run.
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Determine tag
         id: tag

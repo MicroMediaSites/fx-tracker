@@ -28,7 +28,11 @@ permissions:
 jobs:
   check-label:
     name: Check Label
-    runs-on: [self-hosted, Linux, ARM64]
+    # GitHub-hosted: this job is pure shell over the event payload. See the
+    # note on release.yml's version job - the org's Linux ARM64 self-hosted
+    # runners are gone, and a job nothing can service stalls the whole
+    # workflow silently (runs sit "pending" with zero jobs).
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
     # Run if: (PR was merged AND has build:staging label) OR manual workflow_dispatch
@@ -68,7 +72,12 @@ jobs:
     name: Bump Version
     needs: check-label
     if: needs.check-label.outputs.should_build == 'true' && needs.check-label.outputs.bump_type != 'none'
-    runs-on: [self-hosted, Linux, ARM64]
+    # GitHub-hosted (see check-label). This job needs only git + node, both
+    # preinstalled. It still authenticates its push with GH_RUNNER_TOKEN; the
+    # residual-risk note below is unchanged by the move, except that an
+    # ephemeral hosted VM holds that credential for the life of one run rather
+    # than a long-lived box holding it continuously.
+    runs-on: ubuntu-24.04-arm
     # AGT-658 AC4: this is the only staging job that needs write access (it
     # pushes the version-bump commit to main).
     permissions:
