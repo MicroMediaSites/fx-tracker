@@ -101,6 +101,10 @@ describe('summarizeAccounts', () => {
     ]);
 
     expect(s.realized).toBeCloseTo(25, 2);
+    // A malformed measurement is still a measurement — only an ABSENT one
+    // (`realized: null`, D3) means the window has no figure for the account.
+    expect(s.measured).toBe(2);
+    expect(s.unmeasured).toBe(0);
   });
 
   it('handles an empty account list', () => {
