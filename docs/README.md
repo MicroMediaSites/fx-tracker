@@ -7,6 +7,7 @@
 | [architecture.md](architecture.md) | System design, data flow, and component overview (HISTORICAL — predates the local-first conversion) |
 | [local-store.md](local-store.md) | The local SQLite store: schema, migrations, layers |
 | [strategy-store.md](strategy-store.md) | Strategy store layout |
+| [account-windows.md](account-windows.md) | Account P&L windows: since-baseline, calendar presets, custom range, no-baseline state |
 
 ## Integration Guides
 
