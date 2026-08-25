@@ -37,7 +37,16 @@ concurrency:
 jobs:
   version:
     name: Compute Version
-    runs-on: [self-hosted, Linux, ARM64]
+    # GitHub-hosted on purpose. This job only reads git history and runs
+    # git/jq/shell, so it has no reason to occupy a self-hosted runner - and
+    # keeping it hosted means a dead Linux runner can no longer stall the whole
+    # release queue (concurrency below is cancel-in-progress: false, so a job
+    # nothing can service blocks every later merge behind it). fx-tracker is a
+    # public repo, so hosted minutes are free. Only build-macos still needs a
+    # self-hosted runner, because it signs and notarizes with local Apple creds.
+    # ubuntu-24.04-arm matches pr.yml's hosted-runner choice and the ARM64 this
+    # job used to ask for.
+    runs-on: ubuntu-24.04-arm
     # Read-only: this job only reads git history to compute the next version.
     permissions:
       contents: read
