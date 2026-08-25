@@ -137,9 +137,19 @@ struct GlanceArgs {
     /// there is no single window start: the top-level `since` is null and each
     /// row carries its own `window_start`. An account that has never been
     /// baselined reports nulls plus `note: "no baseline recorded"` — never 0.
-    /// Mutually exclusive with --since and --days.
+    /// Mutually exclusive with --since and --days — but NOT with --to: the two
+    /// compose, closing every account's own window at the same shared instant.
     #[arg(long, conflicts_with_all = ["since", "days"])]
     since_baseline: bool,
+    /// Window end — an ISO date (YYYY-MM-DD) or RFC3339 instant. Defaults to
+    /// now. The window this closes is [start, --to), where `start` is
+    /// `--since`, `--days` back, or — under `--since-baseline` — EACH
+    /// account's own baseline instant. A trade closed exactly at --to is
+    /// excluded from the tally; one closed exactly at `start` is included.
+    /// Under `--since-baseline`, an account with no recorded baseline stays
+    /// unmeasured (D3) regardless of --to.
+    #[arg(long)]
+    to: Option<String>,
     /// How many recent closed trades to pull per account before filtering to
     /// the window. Default 200 — the glance is a summary, not an audit; raise
     /// it for a high-frequency account whose window truncates.
@@ -153,6 +163,11 @@ struct HistoryArgs {
     /// the account's recorded baseline (its experiment start).
     #[arg(long)]
     since: Option<String>,
+    /// Window end — an ISO date (YYYY-MM-DD) or RFC3339 instant. Defaults to
+    /// now. Same [--since, --to) convention as `trade glance`: the end
+    /// instant is excluded, the start instant is included.
+    #[arg(long)]
+    to: Option<String>,
     /// Trades per OANDA request. Capped at 500 by the API; the walk pages with
     /// `beforeID` until the window is covered, so this is a page size, not a
     /// ceiling on the result.
@@ -1537,6 +1552,16 @@ fn closed_since(mut trades: Vec<Trade>, since: DateTime<Utc>) -> Vec<Trade> {
     trades
 }
 
+/// Keep only trades closed strictly before `to` — the exclusive end of the
+/// `[since, to)` window (AGT-1129 D4). A CLOSED trade always has a
+/// `close_time`; anything missing one is excluded, same as `closed_since`.
+/// Does not re-sort: callers apply this after `closed_since` (or their own
+/// ordering), and `retain` preserves order. Pure.
+fn closed_before(mut trades: Vec<Trade>, to: DateTime<Utc>) -> Vec<Trade> {
+    trades.retain(|t| t.close_time.map(|ct| ct < to).unwrap_or(false));
+    trades
+}
+
 /// Build the report JSON from the recorded baseline, the OANDA account
 /// snapshot, and the closed trades since the baseline. Pure (no network) so the
 /// realized sum, NAV-vs-baseline, per-strategy grouping, and reconciliation
@@ -1787,6 +1812,39 @@ fn pick_group_baseline(mut found: Vec<baseline::Baseline>) -> Option<baseline::B
     found.pop()
 }
 
+/// Resolve `--to`, defaulting to `now`; parsed exactly like `--since`
+/// (`parse_baseline_date`: an ISO date or an RFC3339 instant). When a window
+/// start is known (glance's shared `--since`/`--days` modes; history may not —
+/// no baseline and no `--since`), validates `to` falls strictly after it,
+/// naming both instants in the error so a bad range is diagnosable without
+/// re-running with `--json` to see what was actually parsed.
+///
+/// Under glance's `--since-baseline` (per-account) mode there is no single
+/// shared start to validate against here — callers pass `None` and instead
+/// validate `to` against EACH account's own resolved baseline start, so a bad
+/// range degrades that one row to an `error` (AGT-1128's rule) rather than
+/// failing the whole panel. Pure and unit-tested.
+fn resolve_to(
+    now: DateTime<Utc>,
+    since: Option<DateTime<Utc>>,
+    to: Option<&str>,
+) -> Result<DateTime<Utc>> {
+    let to = match to {
+        Some(t) => parse_baseline_date(t).context("invalid --to")?,
+        None => now,
+    };
+    if let Some(s) = since {
+        if to <= s {
+            bail!(
+                "--to ({}) must be after --since ({})",
+                to.to_rfc3339(),
+                s.to_rfc3339()
+            );
+        }
+    }
+    Ok(to)
+}
+
 /// Group every configured account name in `env_cfg` by the OANDA account id it
 /// resolves to, so accounts aliased to the same broker account are fetched once
 /// and rendered as one row. (Matt's practice config has `default` and `tf-m30`
@@ -1976,6 +2034,20 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
         GlanceWindowMode::Shared(..) => None,
     };
 
+    // AGT-1129 D4: --to closes the window at ONE shared exclusive upper bound,
+    // regardless of mode — including --since-baseline, where each account
+    // still starts at its own baseline but every account's window closes at
+    // this same instant. In Shared mode there is a single `since` to validate
+    // `to` against, so that happens up front here. In PerBaseline mode there
+    // is no single start to check against yet — `to` is resolved (parsed and
+    // defaulted to `now`) here, and the `to` > this-account's-start check
+    // happens per account below, so a bad range degrades only that row to an
+    // `error` (AGT-1128's rule) instead of failing the whole panel.
+    let to = match mode {
+        GlanceWindowMode::Shared(start, _) => resolve_to(now, Some(start), g.to.as_deref())?,
+        GlanceWindowMode::PerBaseline => resolve_to(now, None, g.to.as_deref())?,
+    };
+
     // Resolve credentials up front and serially: keychain reads are local and
     // fast, and keeping them off the worker threads avoids concurrent access to
     // the same keychain item. The baseline lookups are local SQLite reads and
@@ -2009,6 +2081,25 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
                 continue;
             }
         };
+        // AGT-1129 D4, composed with --since-baseline: `to` was validated
+        // against a single shared `since` above only in Shared mode. In
+        // PerBaseline mode this is the first point a concrete start exists
+        // for THIS account, so the `to` > start check happens here —
+        // degrading just this row to an error rather than failing the panel.
+        if let Some((start, _)) = window {
+            if to <= start {
+                rows.push(serde_json::json!({
+                    "account": primary,
+                    "names": names,
+                    "error": format!(
+                        "--to ({}) must be after this account's window start ({})",
+                        to.to_rfc3339(),
+                        start.to_rfc3339()
+                    ),
+                }));
+                continue;
+            }
+        }
         match client::resolve(env_raw, &primary) {
             Ok((_, oanda)) => resolved.push((primary, names, oanda, window)),
             Err(e) => rows.push(serde_json::json!({
@@ -2048,10 +2139,13 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
                             None => Ok(Vec::new()),
                         }
                     },
+                    // AGT-1129 D4: the ledger cross-check's upper edge is
+                    // bounded at `to`, not `now` — a custom range must not
+                    // pull in closes that fell outside the requested window.
                     async {
                         match since {
                             Some(s) => {
-                                Some(endpoints::closed_trades_from_ledger(&oanda, s, now).await)
+                                Some(endpoints::closed_trades_from_ledger(&oanda, s, to).await)
                             }
                             None => None,
                         }
@@ -2096,8 +2190,11 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
                         }
                         Some(Err(e)) => (closed, Some(format!("ledger read failed: {e:#}"))),
                     };
+                    // AGT-1129 D4: the exclusive upper bound applies on every
+                    // path — including no-window (D3) rows, where `closed`
+                    // stays empty and `closed_before` is a no-op.
                     let closed = match since {
-                        Some(s) => closed_since(closed, s),
+                        Some(s) => closed_before(closed_since(closed, s), to),
                         None => Vec::new(),
                     };
                     let row_window = match window {
@@ -2154,6 +2251,10 @@ async fn glance(env: OandaEnvironment, env_raw: &str, g: GlanceArgs) -> Result<s
             GlanceWindowMode::Shared(start, _) => serde_json::json!(start.to_rfc3339()),
             GlanceWindowMode::PerBaseline => serde_json::Value::Null,
         },
+        // The shared exclusive upper bound (D4) — always present regardless of
+        // mode. Under --since-baseline this is the ONE instant every account's
+        // own-baseline window closes at.
+        "to": to.to_rfc3339(),
         "generated_at": now.to_rfc3339(),
         "count": rows.len(),
         "accounts": rows,
@@ -2255,6 +2356,7 @@ async fn history(
         ),
         (None, None) => None,
     };
+    let to = resolve_to(Utc::now(), since, h.to.as_deref())?;
 
     let (_, oanda) = client::resolve(env_raw, account)?;
     // Pages with `beforeID` until the window is covered. A single request caps
@@ -2278,7 +2380,7 @@ async fn history(
     let mut ledger_error: Option<String> = None;
     let mut ledger_unresolved = 0usize;
     let fetched = match since {
-        Some(s) => match endpoints::closed_trades_from_ledger(&oanda, s, Utc::now()).await {
+        Some(s) => match endpoints::closed_trades_from_ledger(&oanda, s, to).await {
             Ok(ledger) => {
                 ledger_unresolved = ledger.unresolved;
                 merge_ledger_closed(fetched, ledger.trades)
@@ -2303,6 +2405,9 @@ async fn history(
             all
         }
     };
+    // AGT-1129 D4: --to is always defined (defaults to now), so the exclusive
+    // upper bound applies regardless of which branch above produced `trades`.
+    let trades = closed_before(trades, to);
 
     let realized: Decimal = trades.iter().map(|t| t.realized_pl).sum();
     let blended = trades.iter().filter(|t| t.exit_count > 1).count();
@@ -2346,6 +2451,7 @@ async fn history(
             "date": b.baseline_date,
         })),
         "since": since.map(|s| s.to_rfc3339()),
+        "to": to.to_rfc3339(),
         "count": trades.len(),
         "realized": dec_str(realized),
         // Non-zero means at least one trade's exit price is an average across
@@ -2982,6 +3088,80 @@ mod tests {
     }
 
     #[test]
+    fn resolve_to_defaults_to_now() {
+        let now = dt("2026-07-20T15:00:00Z");
+        let since = dt("2026-07-13T15:00:00Z");
+
+        let to = resolve_to(now, Some(since), None).unwrap();
+
+        assert_eq!(to, now);
+    }
+
+    #[test]
+    fn resolve_to_parses_an_explicit_instant() {
+        let now = dt("2026-07-20T15:00:00Z");
+        let since = dt("2026-07-13T15:00:00Z");
+
+        let to = resolve_to(now, Some(since), Some("2026-07-18T00:00:00Z")).unwrap();
+
+        assert_eq!(to, dt("2026-07-18T00:00:00Z"));
+    }
+
+    #[test]
+    fn resolve_to_accepts_a_bare_iso_date() {
+        let now = dt("2026-07-20T15:00:00Z");
+
+        let to = resolve_to(now, None, Some("2026-07-18")).unwrap();
+
+        assert_eq!(to, dt("2026-07-18T00:00:00Z"));
+    }
+
+    #[test]
+    fn resolve_to_rejects_a_malformed_to() {
+        let now = dt("2026-07-20T15:00:00Z");
+
+        let err = resolve_to(now, None, Some("next tuesday")).unwrap_err();
+
+        assert!(format!("{err:#}").contains("--to"), "unhelpful error: {err:#}");
+    }
+
+    #[test]
+    fn resolve_to_rejects_to_equal_to_since() {
+        // AC1: `to <= since` errors — equality is the boundary, not just `<`.
+        let now = dt("2026-07-20T15:00:00Z");
+        let since = dt("2026-07-13T15:00:00Z");
+
+        let err = resolve_to(now, Some(since), Some("2026-07-13T15:00:00Z")).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--to"), "error should name --to: {msg}");
+        assert!(msg.contains("--since"), "error should name --since: {msg}");
+    }
+
+    #[test]
+    fn resolve_to_rejects_to_before_since() {
+        let now = dt("2026-07-20T15:00:00Z");
+        let since = dt("2026-07-13T15:00:00Z");
+
+        let err = resolve_to(now, Some(since), Some("2026-07-10T00:00:00Z")).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--to"), "error should name --to: {msg}");
+        assert!(msg.contains("--since"), "error should name --since: {msg}");
+    }
+
+    #[test]
+    fn resolve_to_skips_validation_when_since_is_unknown() {
+        // history() with no baseline and no --since: --to still bounds the
+        // window but has nothing to be validated against.
+        let now = dt("2026-07-20T15:00:00Z");
+
+        let to = resolve_to(now, None, Some("2026-01-01T00:00:00Z")).unwrap();
+
+        assert_eq!(to, dt("2026-01-01T00:00:00Z"));
+    }
+
+    #[test]
     fn glance_groups_aliases_of_the_same_oanda_account() {
         // Matt's real practice shape: `default` (v1 slot) and `tf-m30` both
         // resolve to …-005, so they are one broker account under two names.
@@ -3048,6 +3228,45 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].id, "3");
         assert_eq!(out[1].id, "2");
+    }
+
+    #[test]
+    fn closed_before_excludes_a_trade_closed_exactly_at_to() {
+        let to = dt("2026-07-08T00:00:00Z");
+        let trades = vec![
+            closed_trade("1", "EUR_USD", dec!(1000), dec!(5), "2026-07-06T00:00:00Z", None),
+            // Closed exactly at `to` → excluded (exclusive end).
+            closed_trade("2", "EUR_USD", dec!(1000), dec!(10), "2026-07-08T00:00:00Z", None),
+            closed_trade("3", "GBP_USD", dec!(-500), dec!(-3), "2026-07-09T00:00:00Z", None),
+        ];
+
+        let out = closed_before(trades, to);
+
+        assert_eq!(out.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), vec!["1"]);
+    }
+
+    #[test]
+    fn closed_window_includes_since_and_excludes_to() {
+        // AC3: a trade closed exactly at `since` is included; one closed
+        // exactly at `to` is excluded. [since, to).
+        let since = dt("2026-07-05T00:00:00Z");
+        let to = dt("2026-07-08T00:00:00Z");
+        let trades = vec![
+            // Before the window → excluded.
+            closed_trade("1", "EUR_USD", dec!(1000), dec!(5), "2026-07-04T00:00:00Z", None),
+            // Exactly at `since` → included.
+            closed_trade("2", "EUR_USD", dec!(1000), dec!(10), "2026-07-05T00:00:00Z", None),
+            // Inside the window → included.
+            closed_trade("3", "GBP_USD", dec!(-500), dec!(-3), "2026-07-06T00:00:00Z", None),
+            // Exactly at `to` → excluded.
+            closed_trade("4", "USD_JPY", dec!(2000), dec!(7), "2026-07-08T00:00:00Z", None),
+            // After `to` → excluded.
+            closed_trade("5", "USD_JPY", dec!(2000), dec!(7), "2026-07-09T00:00:00Z", None),
+        ];
+
+        let out = closed_before(closed_since(trades, since), to);
+
+        assert_eq!(out.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), vec!["3", "2"]);
     }
 
     #[test]
