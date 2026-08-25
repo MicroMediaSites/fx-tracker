@@ -2356,7 +2356,8 @@ async fn history(
         ),
         (None, None) => None,
     };
-    let to = resolve_to(Utc::now(), since, h.to.as_deref())?;
+    let now = Utc::now();
+    let to = resolve_to(now, since, h.to.as_deref())?;
 
     let (_, oanda) = client::resolve(env_raw, account)?;
     // Pages with `beforeID` until the window is covered. A single request caps
@@ -3266,7 +3267,13 @@ mod tests {
 
         let out = closed_before(closed_since(trades, since), to);
 
-        assert_eq!(out.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), vec!["3", "2"]);
+        // Ordering (newest-first) is `closed_since`'s job and is covered by
+        // `closed_since_filters_and_orders_newest_first`; sort before
+        // comparing so this test asserts only the [since, to) membership
+        // this ticket is about.
+        let mut ids: Vec<&str> = out.iter().map(|t| t.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["2", "3"]);
     }
 
     #[test]
