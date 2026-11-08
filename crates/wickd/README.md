@@ -78,7 +78,9 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   `v c`, `v r` and `v a` sort by biggest move, relative volume or volume, and
   `v f` toggles the price ≥ $5 filter. `w a` adds the selected name to the
   watchlist, and `enter` opens its chart. A side pane shows Alpaca/Benzinga
-  headlines for the selected symbol. Sources your plan doesn't include show a
+  headlines for the selected symbol. `r` rebuilds the list and refreshes the
+  selected name's headlines; the others keep a 10-minute cache. A failed
+  refresh keeps the headlines already shown. Sources your plan doesn't include show a
   note instead of breaking the screen. Top movers only reset at the open, so
   before then the gap column is the useful one.
 
@@ -88,7 +90,10 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   ←** load the next or previous linked headline, and a corner badge shows
   where you are (`NVDA · 3 of 12`). The TUI's `j`/`k` also drive it. `x`
   closes the window, and `tab` or `esc` returns to the list. If you close
-  the window yourself, the next article just opens a new one. wickd drives the window over Chrome's DevTools
+  the window yourself, the next article just opens a new one. The
+  reader holds onto the headline list it opened with, so list refreshes
+  don't move it. At the ends, or when headlines are unavailable, the badge
+  says so briefly. wickd drives the window over Chrome's DevTools
   protocol, on a random loopback port with a throwaway Chrome profile, because
   Benzinga pages refuse to be embedded in another page. That port has no
   authentication while the window is open, so only use it on your own machine.
@@ -119,7 +124,9 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 - **Data**. Quotes poll every 15s (`--refresh`). On the free plan, live quotes
   are IEX-only (about 3% of volume). `--feed delayed-sip` trades that for
   all-exchange quotes 15 minutes behind. History is always consolidated and
-  split-adjusted, and runs 15 minutes behind on the free plan. On the free
+  split-adjusted, and runs 15 minutes behind on the free plan. The header
+  shows the remaining Alpaca market-data budget (`api 183/200`, from Alpaca's
+  own rate-limit headers), and turns yellow under 20%. On the free
   plan the chart title says `15m delayed`, and a dotted marker joins the
   newest candle to the live price tag, so the gap reads as "moved since".
   Times are shown in the local zone.
