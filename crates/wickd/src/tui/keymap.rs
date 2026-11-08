@@ -6,7 +6,7 @@
 //!   g  go to       g g top · g e end · g w watchlist · g <n> g row n
 //!   w  watchlist   w a add · w d remove · w u undo · w j / w k move
 //!   t  time range  t d 1D · t w 5D · t m 1M · t 6 6M · t y 1Y · t 5 5Y · t a MAX
-//!   v  view        v c candles · v l line · v t table
+//!   v  view        v c candles · v l line · v t table · v e extended hours
 //!
 //! While a prefix is pending the key panel lists its second keys. `esc`
 //! cancels it, and so does any key that isn't one of its second keys (which
@@ -44,6 +44,14 @@ pub enum Cmd {
     ToggleView,
     PrevRange,
     NextRange,
+    CursorLeft,
+    CursorRight,
+    PanLeft,
+    PanRight,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    ToggleExtended,
     Range(HistoryRange),
     GoTop,
     GoEnd,
@@ -180,13 +188,15 @@ pub static BINDINGS: &[Binding] = &[
         "open symbol",
         W,
     ),
-    bare(
-        &[K::Left, K::Char('h')],
-        Cmd::PrevRange,
-        "previous range",
-        D,
-    ),
-    bare(&[K::Right, K::Char('l')], Cmd::NextRange, "next range", D),
+    bare(&[K::Left, K::Char('h')], Cmd::CursorLeft, "cursor ←", D),
+    bare(&[K::Right, K::Char('l')], Cmd::CursorRight, "cursor →", D),
+    bare(&[K::Char('H')], Cmd::PanLeft, "pan back", D),
+    bare(&[K::Char('L')], Cmd::PanRight, "pan forward", D),
+    bare(&[K::Char('+'), K::Char('=')], Cmd::ZoomIn, "zoom in", D),
+    bare(&[K::Char('-')], Cmd::ZoomOut, "zoom out", D),
+    bare(&[K::Char('0')], Cmd::ZoomReset, "reset zoom", D),
+    bare(&[K::Char('[')], Cmd::PrevRange, "previous range", D),
+    bare(&[K::Char(']')], Cmd::NextRange, "next range", D),
     bare(&[K::Char('1')], Cmd::Range(HistoryRange::Day1), "1D", D),
     bare(&[K::Char('2')], Cmd::Range(HistoryRange::Day5), "5D", D),
     bare(&[K::Char('3')], Cmd::Range(HistoryRange::Month1), "1M", D),
@@ -265,6 +275,13 @@ pub static BINDINGS: &[Binding] = &[
     // ── v: view ──
     pre('v', &[K::Char('c')], Cmd::ViewCandles, "candles", D),
     pre('v', &[K::Char('l')], Cmd::ViewLine, "line", D),
+    pre(
+        'v',
+        &[K::Char('e')],
+        Cmd::ToggleExtended,
+        "extended hours",
+        D,
+    ),
     pre('v', &[K::Char('t')], Cmd::ViewTable, "price table", D),
 ];
 

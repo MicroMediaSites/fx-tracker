@@ -4,22 +4,20 @@
 use chrono::{DateTime, Local, Utc};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table,
-    TableState, Tabs,
-};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs};
 use ratatui::Frame;
 
 use wickd_core::equities::{Bar, HistoryRange, Snapshot};
 
 use super::app::{App, DetailState, DetailView, Mode};
-use super::candles::{self, CandleChart};
+use super::chart::{ChartWidget, Palette, Style2, Zoom};
 use super::keymap::{self, Ctx, Entry};
 
-const UP: Color = Color::Green;
-const DOWN: Color = Color::Red;
+// Same teal/red as the wickd desktop app (TradingView/OANDA palette).
+const UP: Color = Color::Rgb(8, 153, 129);
+const DOWN: Color = Color::Rgb(242, 54, 69);
+const GRID: Color = Color::Rgb(48, 54, 66);
 const DIM: Color = Color::DarkGray;
 const ACCENT: Color = Color::Cyan;
 
@@ -34,7 +32,7 @@ pub fn fmt_price(p: f64) -> String {
 }
 
 pub fn fmt_change(c: f64) -> String {
-    if c.abs() >= 1.0 || c == 0.0 {
+    if c.abs() >= 0.01 || c == 0.0 {
         format!("{c:+.2}")
     } else {
         format!("{c:+.4}")
@@ -585,8 +583,8 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, d: &DetailState) {
             );
         }
         Some(bars) => match d.view {
-            DetailView::Candles => render_candles(frame, body, d.range, bars, snap),
-            DetailView::Line => render_chart(frame, body, d.range, bars, snap),
+            DetailView::Candles => render_chart_view(frame, body, d, snap, Style2::Candles),
+            DetailView::Line => render_chart_view(frame, body, d, snap, Style2::Line),
             DetailView::Table => render_bar_table(frame, body, d.range, bars, d.scroll),
         },
     }
@@ -673,136 +671,145 @@ fn bar_time_label(range: HistoryRange, t: DateTime<Utc>) -> String {
     }
 }
 
-fn render_candles(
+/// Readout timestamp for a candle starting at `t`.
+fn readout_time(range: HistoryRange, t: DateTime<Utc>) -> String {
+    let d = wickd_core::equities::eastern_date(t);
+    match range {
+        HistoryRange::Day1 | HistoryRange::Day5 | HistoryRange::Month1 => {
+            local(t).format("%a %b %-d %-I:%M %p").to_string()
+        }
+        HistoryRange::Month6 | HistoryRange::Year1 => d.format("%a %b %-d %Y").to_string(),
+        HistoryRange::Year5 => d.format("wk of %b %-d %Y").to_string(),
+        HistoryRange::Max => d.format("%b %Y").to_string(),
+    }
+}
+
+/// Time-axis label when `t` starts a new period vs `prev` (hour on 1D, day
+/// on 5D/1M, month on 6M/1Y, quarter on 5Y, year on MAX). `true` = strong
+/// boundary, drawn as a separator.
+fn axis_boundary(
+    range: HistoryRange,
+    prev: Option<DateTime<Utc>>,
+    t: DateTime<Utc>,
+) -> Option<(String, bool)> {
+    use chrono::{Datelike, Timelike};
+    let ed = wickd_core::equities::eastern_date;
+    match range {
+        HistoryRange::Day1 => {
+            let (lt, lp) = (local(t), prev.map(local));
+            (lp.is_none_or(|p| p.hour() != lt.hour()))
+                .then(|| (lt.format("%-I %p").to_string(), false))
+        }
+        HistoryRange::Day5 | HistoryRange::Month1 => {
+            if prev.is_none_or(|p| ed(p) != ed(t)) {
+                Some((ed(t).format("%b %-d").to_string(), true))
+            } else if prev.is_some_and(|p| local(p).hour() != local(t).hour()) {
+                Some((local(t).format("%-I %p").to_string(), false))
+            } else {
+                None
+            }
+        }
+        HistoryRange::Month6 | HistoryRange::Year1 => {
+            let (d, p) = (ed(t), prev.map(ed));
+            if p.is_none_or(|p| p.year() != d.year()) {
+                Some((d.format("%Y").to_string(), true))
+            } else if p.is_some_and(|p| p.month() != d.month()) {
+                Some((d.format("%b").to_string(), false))
+            } else {
+                None
+            }
+        }
+        HistoryRange::Year5 => {
+            let (d, p) = (ed(t), prev.map(ed));
+            let q = |d: chrono::NaiveDate| (d.year(), (d.month() - 1) / 3);
+            if p.is_none_or(|p| p.year() != d.year()) {
+                Some((d.format("%Y").to_string(), true))
+            } else if p.is_some_and(|p| q(p) != q(d)) {
+                Some((d.format("%b").to_string(), false))
+            } else {
+                None
+            }
+        }
+        HistoryRange::Max => {
+            let (d, p) = (ed(t), prev.map(ed));
+            (p.is_none_or(|p| p.year() != d.year())).then(|| (d.format("%Y").to_string(), false))
+        }
+    }
+}
+
+fn render_chart_view(
     frame: &mut Frame,
     area: Rect,
-    range: HistoryRange,
-    bars: &[Bar],
+    d: &DetailState,
     snap: Option<&Snapshot>,
+    style: Style2,
 ) {
+    let range = d.range;
     let reference = (range == HistoryRange::Day1)
         .then(|| snap.and_then(Snapshot::prev_close))
         .flatten();
-    let block = Block::default().borders(Borders::ALL);
-    let inner = block.inner(area);
-    let k = candles::bars_per_candle(bars, reference, inner.width, fmt_price);
-    let mut title = format!(" candles · {}", range.timeframe());
-    if k > 1 {
+    let Some((candles, extended)) = d.candles() else {
+        return;
+    };
+    let zoom = d.chart.zoom_level();
+    let mut title = format!(
+        " {} · {}",
+        if style == Style2::Candles {
+            "candles"
+        } else {
+            "line"
+        },
+        range.timeframe()
+    );
+    let merged = candles.iter().map(|c| c.bars).max().unwrap_or(1);
+    if d.chart.fit {
+        if merged > 1 {
+            title.push_str(&format!(" × {merged}"));
+        }
+        title.push_str(" · fit");
+    } else if let Zoom::Merge(k) = zoom {
         title.push_str(&format!(" × {k}"));
+    }
+    if range.intraday() {
+        title.push_str(if extended {
+            " · extended hours"
+        } else {
+            " · regular hours"
+        });
     }
     if let Some(p) = reference {
         title.push_str(&format!(" · prev close {}", fmt_price(p)));
     }
-    title.push(' ');
+    title.push_str(" · −/+ zoom  h/l cursor  H/L pan ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(GRID))
+        .title(Span::styled(title, Style::default().fg(DIM)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let time_label = move |t: DateTime<Utc>| readout_time(range, t);
+    let boundary = move |p: Option<DateTime<Utc>>, t: DateTime<Utc>| axis_boundary(range, p, t);
     frame.render_widget(
-        block.title(Span::styled(title, Style::default().fg(DIM))),
-        area,
-    );
-    let label = |i: usize| {
-        bars.get(i)
-            .map(|b| bar_time_label(range, b.time))
-            .unwrap_or_default()
-    };
-    frame.render_widget(
-        CandleChart {
-            bars,
+        ChartWidget {
+            candles: &candles,
+            view: &d.chart,
+            style,
             reference,
+            last_price: snap.and_then(Snapshot::last),
             fmt_price,
-            time_label: &label,
-            up: UP,
-            down: DOWN,
-            dim: DIM,
+            fmt_volume,
+            time_label: &time_label,
+            boundary: &boundary,
+            palette: Palette {
+                up: UP,
+                down: DOWN,
+                dim: DIM,
+                grid: GRID,
+                text: Color::Reset,
+            },
         },
         inner,
     );
-}
-
-fn render_chart(
-    frame: &mut Frame,
-    area: Rect,
-    range: HistoryRange,
-    bars: &[Bar],
-    snap: Option<&Snapshot>,
-) {
-    // X is the bar index, not time, so overnight/weekend gaps don't flatten
-    // the line into long horizontal runs.
-    let points: Vec<(f64, f64)> = bars
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (i as f64, b.close))
-        .collect();
-    let mut lo = bars.iter().map(|b| b.low).fold(f64::INFINITY, f64::min);
-    let mut hi = bars
-        .iter()
-        .map(|b| b.high)
-        .fold(f64::NEG_INFINITY, f64::max);
-
-    // On 1D, draw the prior close as a reference line (like most tickers).
-    let prev_close = (range == HistoryRange::Day1)
-        .then(|| snap.and_then(Snapshot::prev_close))
-        .flatten();
-    if let Some(p) = prev_close {
-        lo = lo.min(p);
-        hi = hi.max(p);
-    }
-    let pad = ((hi - lo) * 0.05).max(hi.abs() * 0.001);
-    let (y0, y1) = (lo - pad, hi + pad);
-    let x1 = (points.len().saturating_sub(1)).max(1) as f64;
-
-    let up = bars.last().map(|b| b.close).unwrap_or(0.0)
-        >= prev_close.unwrap_or_else(|| bars.first().map(|b| b.open).unwrap_or(0.0));
-    let line_color = if up { UP } else { DOWN };
-
-    let ref_points: Vec<(f64, f64)> = prev_close
-        .map(|p| vec![(0.0, p), (x1, p)])
-        .unwrap_or_default();
-
-    let mut datasets = vec![];
-    if !ref_points.is_empty() {
-        datasets.push(
-            Dataset::default()
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(Style::default().fg(DIM))
-                .data(&ref_points),
-        );
-    }
-    datasets.push(
-        Dataset::default()
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(line_color))
-            .data(&points),
-    );
-
-    let n = bars.len();
-    let x_labels: Vec<Span> = [0, n / 2, n - 1]
-        .iter()
-        .map(|&i| {
-            Span::styled(
-                bar_time_label(range, bars[i].time),
-                Style::default().fg(DIM),
-            )
-        })
-        .collect();
-    let y_labels: Vec<Span> = [y0, (y0 + y1) / 2.0, y1]
-        .iter()
-        .map(|&v| Span::styled(fmt_price(v), Style::default().fg(DIM)))
-        .collect();
-
-    let title = match prev_close {
-        Some(p) => format!(" line · prev close {} ", fmt_price(p)),
-        None => " line · close ".to_string(),
-    };
-    let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(title, Style::default().fg(DIM))),
-        )
-        .x_axis(Axis::default().bounds([0.0, x1]).labels(x_labels))
-        .y_axis(Axis::default().bounds([y0, y1]).labels(y_labels));
-    frame.render_widget(chart, area);
 }
 
 fn render_bar_table(
@@ -1075,7 +1082,8 @@ mod tests {
         app.set_history("NVDA", HistoryRange::Day1, Ok(bars));
         let chart = draw(&app, 120, 24);
         assert!(
-            chart.contains("candles · 5Min · prev close 182.00")
+            chart.contains("regular hours · prev close 182.00")
+                && chart.contains("· fit")
                 && chart.contains("1 1D")
                 && chart.contains("vol"),
             "{chart}"
@@ -1095,7 +1103,7 @@ mod tests {
         }
 
         press(&mut app, KeyCode::Char('?'));
-        let help = draw(&app, 120, 30);
+        let help = draw(&app, 120, 50);
         assert!(
             help.contains("chart ↔ table") && help.contains("t · time range"),
             "{help}"
@@ -1168,21 +1176,216 @@ mod tests {
         press(&mut app, KeyCode::Enter); // SPY
         app.set_history("SPY", HistoryRange::Day1, Ok(walk(78, 684.0)));
         let c = draw(&app, 120, 26);
-        assert!(c.contains("candles · 5Min") && c.contains("vol"), "{c}");
+        assert!(
+            c.contains("candles · 5Min") && c.contains("vol") && c.contains(" O "),
+            "{c}"
+        );
         if std::env::var("WICKD_TUI_DUMP").is_ok() {
             println!("{c}\n");
         }
         // Many bars on a narrow screen are merged, and the title says so.
         press(&mut app, KeyCode::Char('6'));
         app.set_history("SPY", HistoryRange::Year5, Ok(walk(260, 400.0)));
+        // Fit shows the whole range, merging to fit (260 weeks in ~80 columns).
+        // (The first frame measures the plot width; fit settles on the next.)
+        draw(&app, 90, 20);
+        let fit = draw(&app, 90, 20);
+        assert!(fit.contains("candles · 1Week × 4 · fit"), "{fit}");
+        // Zooming out from fit merges further.
+        press(&mut app, KeyCode::Char('-'));
         let y5 = draw(&app, 90, 20);
-        assert!(y5.contains("candles · 1Week × 4"), "{y5}");
+        assert!(y5.contains("candles · 1Week × 8"), "{y5}");
         if std::env::var("WICKD_TUI_DUMP").is_ok() {
             println!("{y5}\n");
         }
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('l'));
-        assert!(draw(&app, 90, 20).contains("line · close"));
+        assert!(draw(&app, 90, 20).contains("line · 1Week"));
+    }
+
+    // ── visual snapshots (opt-in) ────────────────────────────────────────────
+
+    /// Deterministic pseudo-random walk of 5-minute regular-session bars over
+    /// `days` trading days ending 2026-11-06, with a U-shaped volume profile.
+    fn session_walk(days: usize, start: f64, seed: u64) -> Vec<Bar> {
+        let mut rng = seed;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rng >> 33) as f64 / (1u64 << 31) as f64) - 0.5
+        };
+        let mut out = Vec::new();
+        let mut price = start;
+        for day in 0..days {
+            let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 6).unwrap()
+                - chrono::Duration::days(((days - 1 - day) * 7 / 5) as i64);
+            let open_utc = date.and_hms_opt(14, 30, 0).unwrap().and_utc();
+            for i in 0..78 {
+                let o = price + next() * 0.4;
+                let c = o + next() * 1.4 + (i as f64 / 78.0 - 0.5) * 0.05;
+                let hi = o.max(c) + next().abs() * 0.8;
+                let lo = o.min(c) - next().abs() * 0.8;
+                price = c;
+                let u = (i as f64 / 77.0 - 0.5).abs() * 2.0; // 1 at open/close, 0 midday
+                out.push(Bar {
+                    time: open_utc + chrono::Duration::minutes(5 * i as i64),
+                    open: o,
+                    high: hi,
+                    low: lo,
+                    close: c,
+                    volume: 20_000.0 * (1.0 + 4.0 * u * u + next().abs() * 2.0)
+                        + if i == 77 { 400_000.0 } else { 0.0 },
+                    vwap: None,
+                });
+            }
+        }
+        out
+    }
+
+    fn daily_walk(n: usize, start: f64, seed: u64) -> Vec<Bar> {
+        let mut rng = seed;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rng >> 33) as f64 / (1u64 << 31) as f64) - 0.5
+        };
+        let mut price = start;
+        let end = chrono::NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
+        (0..n)
+            .map(|i| {
+                let o = price + next() * 1.5;
+                let c = o + next() * 6.0 + 0.15;
+                price = c;
+                let d = end - chrono::Duration::days(((n - 1 - i) * 7 / 5) as i64);
+                Bar {
+                    time: d.and_hms_opt(5, 0, 0).unwrap().and_utc(),
+                    open: o,
+                    high: o.max(c) + next().abs() * 3.0,
+                    low: o.min(c) - next().abs() * 3.0,
+                    close: c,
+                    volume: 4e6 * (1.0 + next().abs() * 3.0),
+                    vwap: None,
+                }
+            })
+            .collect()
+    }
+
+    fn css_color(c: Color, fallback: &str) -> String {
+        match c {
+            Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+            Color::Black => "#0b0f14".into(),
+            Color::Red => "#ef4444".into(),
+            Color::Green => "#22c55e".into(),
+            Color::Yellow => "#eab308".into(),
+            Color::Cyan => "#22d3ee".into(),
+            Color::DarkGray => "#6b7280".into(),
+            Color::Gray => "#9ca3af".into(),
+            Color::White => "#f3f4f6".into(),
+            _ => fallback.into(),
+        }
+    }
+
+    /// Render a buffer as a coloured HTML page (dark terminal look).
+    fn to_html(buf: &ratatui::buffer::Buffer, title: &str) -> String {
+        const FG: &str = "#d1d5db";
+        const BG: &str = "#151a22";
+        let mut h = format!(
+            "<!doctype html><meta charset=utf-8><title>{title}</title><style>\
+             body{{margin:0;background:{BG}}}pre{{margin:0;padding:12px;font:13px/1.18 Menlo,monospace;color:{FG}}}\
+             span{{white-space:pre;display:inline-block;width:1ch;overflow:hidden}}</style><pre>"
+        );
+        let a = buf.area;
+        for y in 0..a.height {
+            for x in 0..a.width {
+                let cell = &buf[(x, y)];
+                let mut fg = css_color(cell.fg, FG);
+                let mut bg = css_color(cell.bg, "transparent");
+                if cell.modifier.contains(Modifier::REVERSED) {
+                    std::mem::swap(&mut fg, &mut bg);
+                    if fg == "transparent" {
+                        fg = BG.into();
+                    }
+                    if bg == "transparent" {
+                        bg = FG.into();
+                    }
+                }
+                let mut style = format!("color:{fg};background:{bg};");
+                if cell.modifier.contains(Modifier::BOLD) {
+                    style.push_str("font-weight:bold;");
+                }
+                if cell.modifier.contains(Modifier::DIM) {
+                    style.push_str("opacity:.55;");
+                }
+                let sym = cell
+                    .symbol()
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;");
+                h.push_str(&format!("<span style=\"{style}\">{sym}</span>"));
+            }
+            h.push('\n');
+        }
+        h.push_str("</pre>");
+        h
+    }
+
+    /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_charts -- --ignored`
+    /// writes HTML renders of the chart views for visual review.
+    #[test]
+    #[ignore]
+    fn snapshot_charts() {
+        let dir = std::env::var("WICKD_TUI_SNAPSHOT_DIR").expect("set WICKD_TUI_SNAPSHOT_DIR");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (158u16, 50u16);
+        let shoot = |app: &App, name: &str| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, app)).unwrap(); // measure
+            term.draw(|f| render(f, app)).unwrap();
+            let html = to_html(term.backend().buffer(), name);
+            std::fs::write(format!("{dir}/{name}.html"), html).unwrap();
+        };
+        let mut app = sample_app();
+        press(&mut app, KeyCode::Enter); // SPY
+        let day = session_walk(1, 684.0, 7);
+        app.snapshots
+            .get_mut("SPY")
+            .unwrap()
+            .prev_daily_bar
+            .as_mut()
+            .unwrap()
+            .close = 684.0;
+        app.snapshots
+            .get_mut("SPY")
+            .unwrap()
+            .latest_trade
+            .as_mut()
+            .unwrap()
+            .price = day.last().unwrap().close;
+        app.set_history("SPY", HistoryRange::Day1, Ok(day));
+        shoot(&app, "1-1d-candles-default");
+
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Char('+'));
+        }
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Char('h'));
+        }
+        shoot(&app, "2-1d-zoomed-in-cursor");
+
+        press(&mut app, KeyCode::Char('0'));
+        press(&mut app, KeyCode::Char('2'));
+        app.set_history("SPY", HistoryRange::Day5, Ok(session_walk(5, 670.0, 11)));
+        shoot(&app, "3-5d-day-separators");
+
+        press(&mut app, KeyCode::Char('5'));
+        app.set_history("SPY", HistoryRange::Year1, Ok(daily_walk(252, 560.0, 3)));
+        shoot(&app, "4-1y-daily");
+
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('l'));
+        shoot(&app, "5-1y-line");
     }
 
     #[test]
@@ -1205,7 +1408,8 @@ mod tests {
         assert_eq!(fmt_price(271.456), "271.46");
         assert_eq!(fmt_price(0.12345), "0.1235");
         assert_eq!(fmt_change(3.5), "+3.50");
-        assert_eq!(fmt_change(-0.0123), "-0.0123");
+        assert_eq!(fmt_change(-0.6445), "-0.64");
+        assert_eq!(fmt_change(-0.0012), "-0.0012");
         assert_eq!(fmt_change(0.0), "+0.00");
     }
 

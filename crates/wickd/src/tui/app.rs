@@ -9,6 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use wickd_core::equities::{Asset, Bar, HistoryRange, MarketClock, Snapshot};
 
+use super::chart::{self, Candle, ChartView};
 use super::keymap::{self, Cmd, Ctx, Pending, Step};
 use super::search;
 use super::store::normalize_symbol;
@@ -54,6 +55,8 @@ pub struct DetailState {
     pub view: DetailView,
     /// Chart style `tab` returns to from the table.
     pub last_chart: DetailView,
+    /// Zoom / pan / cursor / session state for the chart.
+    pub chart: ChartView,
     /// Loaded history per range (kept so flipping back is instant).
     pub history: HashMap<HistoryRange, Vec<Bar>>,
     /// Ranges with a request in flight.
@@ -72,6 +75,7 @@ impl DetailState {
             range: HistoryRange::Day1,
             view: DetailView::Candles,
             last_chart: DetailView::Candles,
+            chart: ChartView::default(),
             history: HashMap::new(),
             loading: Vec::new(),
             error: None,
@@ -82,6 +86,17 @@ impl DetailState {
 
     pub fn bars(&self) -> Option<&Vec<Bar>> {
         self.history.get(&self.range)
+    }
+
+    /// Candles the chart draws for the current range, zoom and session
+    /// setting, plus whether extended hours are included.
+    pub fn candles(&self) -> Option<(Vec<Candle>, bool)> {
+        let bars = self.bars()?;
+        let (bars, extended) = chart::session_bars(bars, self.range, self.chart.extended);
+        Some((
+            chart::build(&bars, self.chart.merge_for(bars.len())),
+            extended,
+        ))
     }
 
     pub fn is_loading(&self) -> bool {
@@ -434,8 +449,41 @@ impl App {
             d.range = range;
             d.scroll = 0;
             d.error = None;
+            d.chart.jump_end();
         }
         self.request_history(range).into_iter().collect()
+    }
+
+    /// Change zoom or the session filter, keeping the cursor on the same
+    /// moment in time.
+    fn reshape_chart(&mut self, cmd: Cmd) {
+        let Some(d) = self.detail.as_mut() else {
+            return;
+        };
+        let before = d.candles().map(|(c, _)| c).unwrap_or_default();
+        let n_bars = d.bars().map_or(0, |b| {
+            chart::session_bars(b, d.range, d.chart.extended).0.len()
+        });
+        match cmd {
+            Cmd::ZoomIn => d.chart.zoom_in(n_bars),
+            Cmd::ZoomOut => {
+                if !d.chart.zoom_out(n_bars) {
+                    self.flash = Some("fully zoomed out".into());
+                    return;
+                }
+            }
+            Cmd::ZoomReset => d.chart.zoom_fit(),
+            Cmd::ToggleExtended => {
+                if !d.range.intraday() {
+                    self.flash = Some("extended hours only apply to 1D, 5D and 1M".into());
+                    return;
+                }
+                d.chart.extended = !d.chart.extended;
+            }
+            _ => return,
+        }
+        let after = d.candles().map(|(c, _)| c).unwrap_or_default();
+        d.chart.reanchor(&before, &after);
     }
 
     fn exec_detail(&mut self, cmd: Cmd) -> Vec<Action> {
@@ -451,6 +499,8 @@ impl App {
         let last_row = rows.saturating_sub(1);
         let sym = d.symbol.clone();
         let back = d.back_to;
+        let is_chart = d.view != DetailView::Table;
+        let n_candles = d.candles().map_or(0, |(c, _)| c.len());
         let scroll = |app: &mut App, f: &dyn Fn(usize) -> usize| {
             if let Some(d) = app.detail.as_mut() {
                 d.scroll = f(d.scroll).min(last_row);
@@ -495,8 +545,34 @@ impl App {
             Cmd::Up => scroll(self, &|s| s.saturating_sub(1)),
             Cmd::PageDown => scroll(self, &|s| s + 20),
             Cmd::PageUp => scroll(self, &|s| s.saturating_sub(20)),
+            Cmd::GoTop if is_chart => {
+                if let Some(d) = self.detail.as_mut() {
+                    d.chart.jump_start(n_candles);
+                }
+            }
+            Cmd::GoEnd if is_chart => {
+                if let Some(d) = self.detail.as_mut() {
+                    d.chart.jump_end();
+                }
+            }
             Cmd::GoTop => scroll(self, &|_| 0),
             Cmd::GoEnd => scroll(self, &|_| usize::MAX),
+            Cmd::CursorLeft | Cmd::CursorRight if is_chart => {
+                let delta = if cmd == Cmd::CursorLeft { -1 } else { 1 };
+                if let Some(d) = self.detail.as_mut() {
+                    d.chart.move_cursor(n_candles, delta);
+                }
+            }
+            Cmd::PanLeft | Cmd::PanRight if is_chart => {
+                if let Some(d) = self.detail.as_mut() {
+                    let page = (d.chart.visible.get() / 2).max(1) as isize;
+                    let delta = if cmd == Cmd::PanLeft { -page } else { page };
+                    d.chart.pan(n_candles, delta);
+                }
+            }
+            Cmd::ZoomIn | Cmd::ZoomOut | Cmd::ZoomReset | Cmd::ToggleExtended => {
+                self.reshape_chart(cmd);
+            }
             Cmd::WatchAdd => {
                 if self.in_watchlist(&sym) {
                     self.flash = Some(format!("{sym} is already on the watchlist"));
@@ -705,10 +781,10 @@ mod tests {
         assert!(a.on_key(ch('4')).is_empty());
         // Back to 1D is cached → no fetch.
         assert!(a.on_key(ch('1')).is_empty());
-        // h at the first range stays put; l steps right.
-        assert!(a.on_key(ch('h')).is_empty());
+        // [ at the first range stays put; ] steps right.
+        assert!(a.on_key(ch('[')).is_empty());
         assert_eq!(
-            a.on_key(ch('l')),
+            a.on_key(ch(']')),
             vec![Action::FetchHistory("SPY".into(), HistoryRange::Day5)]
         );
         // r reloads the current range even if cached.
@@ -748,6 +824,90 @@ mod tests {
         typ(&mut a, "gw");
         assert_eq!(a.mode, Mode::Watchlist);
         assert!(a.detail.is_none());
+    }
+
+    fn session_bars(n: usize) -> Vec<Bar> {
+        // Regular-hours 5-minute bars from 14:30Z (09:30 EST) on 2026-11-06.
+        (0..n)
+            .map(|i| {
+                let m = 14 * 60 + 30 + i * 5;
+                let f = i as f64;
+                Bar {
+                    time: format!("2026-11-06T{:02}:{:02}:00Z", m / 60, m % 60)
+                        .parse()
+                        .unwrap(),
+                    open: 100.0 + f,
+                    high: 101.0 + f,
+                    low: 99.0 + f,
+                    close: 100.5 + f,
+                    volume: 10.0,
+                    vwap: None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chart_cursor_pan_zoom_and_session_keys() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Enter)); // SPY
+        a.set_history("SPY", HistoryRange::Day1, Ok(session_bars(60)));
+        a.detail.as_ref().unwrap().chart.visible.set(20);
+        // h steps the cursor back from the latest candle.
+        typ(&mut a, "hh");
+        assert_eq!(a.detail.as_ref().unwrap().chart.cursor, Some(57));
+        // g e re-pins to latest; g g jumps to the oldest.
+        typ(&mut a, "ge");
+        assert_eq!(a.detail.as_ref().unwrap().chart.cursor, None);
+        typ(&mut a, "gg");
+        assert_eq!(a.detail.as_ref().unwrap().chart.cursor, Some(0));
+        // L pans forward half a window.
+        typ(&mut a, "L");
+        assert_eq!(a.detail.as_ref().unwrap().chart.cursor, Some(10));
+        // Zoom out from fit merges bars; the cursor stays on the same time.
+        let t = a.detail.as_ref().unwrap().candles().unwrap().0[10].time;
+        typ(&mut a, "-");
+        let d = a.detail.as_ref().unwrap();
+        assert_eq!(
+            (d.chart.fit, d.chart.zoom_level()),
+            (false, chart::Zoom::Merge(2))
+        );
+        let (c, _) = d.candles().unwrap();
+        assert_eq!(c.len(), 30);
+        assert!(c[d.chart.cursor.unwrap()].time <= t);
+        // 0 returns to fit; + from fit (60 bars in 120 columns) → 4-column slots.
+        typ(&mut a, "0");
+        assert!(a.detail.as_ref().unwrap().chart.fit);
+        typ(&mut a, "+");
+        assert_eq!(
+            a.detail.as_ref().unwrap().chart.zoom_level(),
+            chart::Zoom::Slot(4)
+        );
+        // [ ] change range (and reset the cursor).
+        assert_eq!(
+            typ(&mut a, "]"),
+            vec![Action::FetchHistory("SPY".into(), HistoryRange::Day5)]
+        );
+        assert_eq!(a.detail.as_ref().unwrap().chart.cursor, None);
+        typ(&mut a, "[");
+        assert_eq!(a.detail.as_ref().unwrap().range, HistoryRange::Day1);
+        // v e toggles extended hours on intraday ranges only.
+        typ(&mut a, "ve");
+        assert!(a.detail.as_ref().unwrap().chart.extended);
+        typ(&mut a, "5ve");
+        assert!(a.flash.as_deref().unwrap_or("").contains("extended hours"));
+    }
+
+    #[test]
+    fn table_view_ignores_chart_cursor_keys() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Enter));
+        a.set_history("SPY", HistoryRange::Day1, Ok(session_bars(30)));
+        typ(&mut a, "vt");
+        typ(&mut a, "hh");
+        assert_eq!(a.detail.as_ref().unwrap().chart.cursor, None);
+        typ(&mut a, "ge");
+        assert_eq!(a.detail.as_ref().unwrap().scroll, 29);
     }
 
     #[test]
