@@ -1,8 +1,9 @@
 //! News reader window for `wickd tui`.
 //!
-//! The in-play headlines pane can open an article in a chromeless ui-leaf
-//! window beside the terminal. The TUI stays the controller: moving the
-//! headline cursor makes the window load the next article.
+//! The in-play headlines pane opens an article in a chromeless ui-leaf window.
+//! Once it's open, focus is in the window, so the window has its own keys:
+//! **ctrl+shift+→ / ←** load the next / previous headline (a small badge in
+//! the corner shows where you are). The TUI's own j/k still work too.
 //!
 //! ## How
 //!
@@ -11,33 +12,43 @@
 //!    `profile` field → ui-leaf uses a temp dir and deletes it on unmount),
 //!    and `debugPort` on a free loopback port.
 //! 2. When ui-leaf reports `ready`, attach to that Chrome over the DevTools
-//!    protocol: `GET /json/list` → the page target's WebSocket URL.
-//! 3. Each article is a `Page.navigate` on that target. The window shows the
-//!    real article page (embedding it in a frame doesn't work: Benzinga, the
-//!    main source, sends `X-Frame-Options: SAMEORIGIN`).
+//!    protocol (`GET /json/list` → the page's WebSocket), enable the Page and
+//!    Runtime domains and add a `__wickdNav` binding.
+//! 3. Each article: register a script for the next document (keyboard
+//!    handler + badge, calling `__wickdNav("next"|"prev")`), then
+//!    `Page.navigate`. Binding calls arrive as `Runtime.bindingCalled` events
+//!    and become [`ReaderEvent::Nav`]. The window shows the real article page
+//!    (framing it doesn't work: Benzinga sends `X-Frame-Options: SAMEORIGIN`).
 //!
 //! ## Security
 //!
 //! The DevTools port has no authentication; any local process can control
 //! the window while it's open. That's why the profile is throwaway (no
-//! cookies or logins to steal) and the port is loopback-only and random.
+//! cookies or logins to steal) and the port is loopback-only and random. A
+//! page can call the binding itself, so only `"next"`/`"prev"` are accepted.
 //!
 //! ## Lifecycle
 //!
-//! The window closing (or Chrome exiting) ends the ui-leaf mount; the reader
-//! notices `closed` and the next "open" starts a fresh window. Quitting the
-//! TUI sends `close`; ui-leaf also exits on its own if its parent dies.
+//! A user closing the window may or may not produce a timely `closed` from
+//! ui-leaf, so a navigation that finds the window gone drops it, opens a
+//! fresh one and retries. Each window has an id so a late `closed` from an
+//! old window can't tear down a new one. Quitting the TUI closes the window.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -47,17 +58,32 @@ pub const WINDOW: (u32, u32) = (1000, 1000);
 const READY_TIMEOUT: Duration = Duration::from_secs(25);
 /// How long to wait for Chrome's DevTools endpoint to list the page.
 const CDP_TIMEOUT: Duration = Duration::from_secs(8);
+/// Re-attaching to a window that was already attached: if the endpoint
+/// doesn't answer quickly, the window is gone (closed by the user).
+const REATTACH_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Per-command reply timeout.
+const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// ui-leaf heartbeat silence before `disconnected` (informational only — it
 /// never terminates the mount). Once the window navigates to an article the
 /// ui-leaf page is gone, so heartbeats stop by design; keep this long.
 const HEARTBEAT_TIMEOUT_MS: u64 = 3_600_000;
 const CLOSE_MSG: &[u8] = b"{\"version\":\"1\",\"type\":\"close\"}\n";
+/// The page→wickd binding name.
+const BINDING: &str = "__wickdNav";
+
+/// Which way the window's keys asked to move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavDir {
+    Next,
+    Prev,
+}
 
 /// Commands from the TUI.
 #[derive(Debug)]
 pub enum ReaderCmd {
-    /// Show this article, opening the window first if needed.
-    Show(String),
+    /// Show this article (opening the window first if needed); `label` is the
+    /// badge text shown on the page.
+    Show { url: String, label: String },
     /// Close the window; the sender (if any) is signalled once it's closed,
     /// so the TUI can wait for a clean shutdown instead of guessing a delay.
     Close(Option<std::sync::mpsc::Sender<()>>),
@@ -69,6 +95,17 @@ pub enum ReaderEvent {
     Opened,
     Error(String),
     Closed,
+    /// ctrl+shift+→/← pressed in the window.
+    Nav(NavDir),
+}
+
+/// Why a navigation failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NavError {
+    /// The window/Chrome is gone (e.g. the user closed it): reopen and retry.
+    Gone(String),
+    /// Anything else (slow page, Chrome refused the URL): report it.
+    Other(String),
 }
 
 /// The line-1 config for `ui-leaf mount`.
@@ -90,8 +127,8 @@ pub fn mount_config(views_root: &Path, debug_port: u16) -> String {
     .to_string()
 }
 
-/// From a DevTools `/json/list` response, the WebSocket URL of the ui-leaf
-/// page (the window's first `page` target).
+/// From a DevTools `/json/list` response, the WebSocket URL of the window's
+/// page: ui-leaf's own page if present, else any page.
 pub fn page_ws_url(list: &Value) -> Option<String> {
     let pages: Vec<&Value> = list
         .as_array()?
@@ -103,8 +140,6 @@ pub fn page_ws_url(list: &Value) -> Option<String> {
             .and_then(Value::as_str)
             .is_some_and(|u| u.starts_with("http://127.0.0.1") || u.starts_with("http://localhost"))
     };
-    // Prefer ui-leaf's own page (the one we just opened), else any page
-    // (after a navigation the URL is the article's).
     let page = pages.iter().find(is_local).or_else(|| pages.first())?;
     page.get("webSocketDebuggerUrl")
         .and_then(Value::as_str)
@@ -117,6 +152,54 @@ pub fn is_navigable(url: &str) -> bool {
     u.starts_with("https://") || u.starts_with("http://")
 }
 
+/// A `Runtime.bindingCalled` event for our binding → a direction. Anything
+/// else (other events, other bindings, odd payloads) → `None`.
+pub fn parse_nav(event: &Value) -> Option<NavDir> {
+    if event.get("method").and_then(Value::as_str) != Some("Runtime.bindingCalled") {
+        return None;
+    }
+    let params = event.get("params")?;
+    if params.get("name").and_then(Value::as_str) != Some(BINDING) {
+        return None;
+    }
+    match params.get("payload").and_then(Value::as_str) {
+        Some("next") => Some(NavDir::Next),
+        Some("prev") => Some(NavDir::Prev),
+        _ => None,
+    }
+}
+
+/// The script injected into each article page: ctrl+shift+→/← call the
+/// binding; a small badge shows `label` in the corner.
+pub fn page_script(label: &str) -> String {
+    let label = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        r#"(() => {{
+  const label = {label};
+  const send = (d) => {{ try {{ window.{BINDING} && window.{BINDING}(d); }} catch (e) {{}} }};
+  window.addEventListener("keydown", (e) => {{
+    if (e.ctrlKey && e.shiftKey && (e.key === "ArrowRight" || e.key === "ArrowLeft")) {{
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      send(e.key === "ArrowRight" ? "next" : "prev");
+    }}
+  }}, true);
+  const badge = () => {{
+    if (document.getElementById("__wickd_badge")) return;
+    const b = document.createElement("div");
+    b.id = "__wickd_badge";
+    b.textContent = label;
+    b.style.cssText = "position:fixed;bottom:12px;right:12px;z-index:2147483647;" +
+      "background:rgba(21,26,34,.92);color:#d1d5db;font:12px -apple-system,BlinkMacSystemFont,sans-serif;" +
+      "padding:6px 10px;border-radius:6px;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,.4)";
+    (document.body || document.documentElement).appendChild(b);
+  }};
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", badge);
+  else badge();
+}})();"#
+    )
+}
+
 /// A free loopback port for Chrome's DevTools endpoint. Bind-then-release
 /// can race another process grabbing the port in between; acceptable for a
 /// loopback port picked at random (Chrome would just fail to bind, and the
@@ -127,6 +210,83 @@ fn free_port() -> std::io::Result<u16> {
 }
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
+
+/// A live DevTools connection: commands go out on `sink`; a background task
+/// routes replies to `pending` and binding calls to the nav channel.
+struct Cdp {
+    sink: SplitSink<Ws, Message>,
+    pending: Pending,
+    alive: Arc<AtomicBool>,
+    next_id: u64,
+}
+
+impl Cdp {
+    async fn connect(ws_url: &str, nav: UnboundedSender<NavDir>) -> Result<Self, String> {
+        let (ws, _) = tokio_tungstenite::connect_async(ws_url)
+            .await
+            .map_err(|e| format!("connecting to the reader window: {e}"))?;
+        let (sink, mut stream) = ws.split();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let alive = Arc::new(AtomicBool::new(true));
+        let (p, a) = (pending.clone(), alive.clone());
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = stream.next().await {
+                let Message::Text(t) = msg else { continue };
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                if let Some(id) = v.get("id").and_then(Value::as_u64) {
+                    if let Some(tx) = p.lock().ok().and_then(|mut m| m.remove(&id)) {
+                        let _ = tx.send(v);
+                    }
+                } else if let Some(dir) = parse_nav(&v) {
+                    let _ = nav.send(dir);
+                }
+            }
+            a.store(false, Ordering::SeqCst);
+            // Fail any callers still waiting.
+            if let Ok(mut m) = p.lock() {
+                m.clear();
+            }
+        });
+        Ok(Self {
+            sink,
+            pending,
+            alive,
+            next_id: 1,
+        })
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    /// Send a command and wait for its reply. `Err(None)` = connection gone.
+    async fn call(&mut self, method: &str, params: Value) -> Result<Value, Option<String>> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut m) = self.pending.lock() {
+            m.insert(id, tx);
+        }
+        let msg = json!({ "id": id, "method": method, "params": params });
+        if self
+            .sink
+            .send(Message::Text(msg.to_string().into()))
+            .await
+            .is_err()
+        {
+            return Err(None);
+        }
+        match tokio::time::timeout(CALL_TIMEOUT, rx).await {
+            Ok(Ok(v)) => match v.get("error") {
+                Some(e) => Err(Some(e.to_string())),
+                None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
+            },
+            Ok(Err(_)) => Err(None), // reader task ended: socket closed
+            Err(_) => Err(Some(format!("{method} timed out"))),
+        }
+    }
+}
 
 struct Session {
     /// Distinguishes this window's `closed` notice from an older one's.
@@ -134,8 +294,11 @@ struct Session {
     child: Child,
     stdin: ChildStdin,
     port: u16,
-    ws: Option<Ws>,
-    next_id: u64,
+    cdp: Option<Cdp>,
+    /// Attached successfully at least once (re-attaches use a short timeout).
+    attached: bool,
+    /// The current per-document script, replaced before each article.
+    script_id: Option<String>,
 }
 
 impl Session {
@@ -207,15 +370,21 @@ impl Session {
             child,
             stdin,
             port,
-            ws: None,
-            next_id: 1,
+            cdp: None,
+            attached: false,
+            script_id: None,
         })
     }
 
-    /// (Re)attach to the window's page over CDP.
-    async fn attach(&mut self) -> Result<(), String> {
+    /// (Re)attach to the window's page over CDP and set up the binding.
+    async fn attach(&mut self, nav: &UnboundedSender<NavDir>) -> Result<(), String> {
         let url = format!("http://127.0.0.1:{}/json/list", self.port);
-        let deadline = tokio::time::Instant::now() + CDP_TIMEOUT;
+        let wait = if self.attached {
+            REATTACH_TIMEOUT
+        } else {
+            CDP_TIMEOUT
+        };
+        let deadline = tokio::time::Instant::now() + wait;
         let ws_url = loop {
             let found = match reqwest::get(&url).await {
                 Ok(r) => r.json::<Value>().await.ok().and_then(|v| page_ws_url(&v)),
@@ -229,58 +398,68 @@ impl Session {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         };
-        let (ws, _) = tokio_tungstenite::connect_async(ws_url.as_str())
-            .await
-            .map_err(|e| format!("connecting to the reader window: {e}"))?;
-        self.ws = Some(ws);
+        let mut cdp = Cdp::connect(&ws_url, nav.clone()).await?;
+        for (method, params) in [
+            ("Page.enable", json!({})),
+            ("Runtime.enable", json!({})),
+            ("Runtime.addBinding", json!({ "name": BINDING })),
+        ] {
+            cdp.call(method, params)
+                .await
+                .map_err(|e| e.unwrap_or_else(|| "lost the reader window".into()))?;
+        }
+        self.cdp = Some(cdp);
+        self.script_id = None;
+        self.attached = true;
         Ok(())
     }
 
-    async fn navigate(&mut self, url: &str) -> Result<(), String> {
-        for attempt in 0..2 {
-            if self.ws.is_none() {
-                self.attach().await?;
-            }
-            let id = self.next_id;
-            self.next_id += 1;
-            let msg = json!({ "id": id, "method": "Page.navigate", "params": { "url": url } });
-            let Some(ws) = self.ws.as_mut() else {
-                return Err("lost the reader window".into());
-            };
-            let sent = ws.send(Message::Text(msg.to_string().into())).await;
-            if sent.is_err() {
-                self.ws = None; // stale socket: reattach once
-                if attempt == 0 {
-                    continue;
-                }
-                return Err("lost the reader window".into());
-            }
-            // Wait for the matching response (ignore any events).
-            let reply = tokio::time::timeout(Duration::from_secs(10), async {
-                while let Some(Ok(m)) = ws.next().await {
-                    if let Message::Text(t) = m {
-                        let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
-                        if v.get("id").and_then(Value::as_u64) == Some(id) {
-                            return Some(v);
-                        }
-                    }
-                }
-                None
-            })
-            .await;
-            return match reply {
-                Ok(Some(v)) => match v.get("error") {
-                    Some(e) => Err(format!("couldn't open the article: {e}")),
-                    None => Ok(()),
-                },
-                Ok(None) => {
-                    self.ws = None;
-                    Err("lost the reader window".into())
-                }
-                Err(_) => Err("the article is taking a while to load".into()),
-            };
+    async fn navigate(
+        &mut self,
+        url: &str,
+        label: &str,
+        nav: &UnboundedSender<NavDir>,
+    ) -> Result<(), NavError> {
+        let gone = |m: &str| NavError::Gone(m.to_string());
+        if !self.cdp.as_ref().is_some_and(Cdp::is_alive) {
+            self.cdp = None;
+            self.attach(nav).await.map_err(NavError::Gone)?;
         }
-        Err("lost the reader window".into())
+        let Some(cdp) = self.cdp.as_mut() else {
+            return Err(gone("lost the reader window"));
+        };
+        let lost = |e: Option<String>| match e {
+            None => NavError::Gone("lost the reader window".into()),
+            Some(m) => NavError::Other(m),
+        };
+        // Swap the per-document script for this article's badge.
+        if let Some(old) = self.script_id.take() {
+            let _ = cdp
+                .call(
+                    "Page.removeScriptToEvaluateOnNewDocument",
+                    json!({ "identifier": old }),
+                )
+                .await;
+        }
+        let added = cdp
+            .call(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": page_script(label) }),
+            )
+            .await
+            .map_err(lost)?;
+        self.script_id = added
+            .get("identifier")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let r = cdp
+            .call("Page.navigate", json!({ "url": url }))
+            .await
+            .map_err(lost)?;
+        if let Some(e) = r.get("errorText").and_then(Value::as_str) {
+            return Err(NavError::Other(format!("couldn't open the article: {e}")));
+        }
+        Ok(())
     }
 
     async fn close(mut self) {
@@ -290,33 +469,82 @@ impl Session {
     }
 }
 
-/// Bring the terminal back to the front after the window opens (macOS), so
-/// keystrokes keep going to the TUI. Best effort.
-fn refocus_terminal() {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
-    let app = if std::env::var_os("KITTY_WINDOW_ID").is_some() {
-        Some("kitty")
-    } else {
-        match std::env::var("TERM_PROGRAM").as_deref() {
-            Ok("iTerm.app") => Some("iTerm"),
-            Ok("Apple_Terminal") => Some("Terminal"),
-            Ok("WezTerm") => Some("WezTerm"),
-            Ok("ghostty") => Some("Ghostty"),
-            _ => None,
+/// Owns at most one reader window.
+struct Reader {
+    bin: String,
+    views_root: Option<std::path::PathBuf>,
+    closed_tx: UnboundedSender<u64>,
+    nav_tx: UnboundedSender<NavDir>,
+    session: Option<Session>,
+    next_id: u64,
+}
+
+impl Reader {
+    async fn open(&mut self, events: &impl Fn(ReaderEvent)) -> bool {
+        let Some(root) = self.views_root.as_deref() else {
+            events(ReaderEvent::Error(
+                "reader view assets not found (WICKD_VIEWS_ROOT)".into(),
+            ));
+            return false;
+        };
+        self.next_id += 1;
+        match Session::open(self.next_id, &self.bin, root, self.closed_tx.clone()).await {
+            Ok(s) => {
+                self.session = Some(s);
+                events(ReaderEvent::Opened);
+                true
+            }
+            Err(e) => {
+                events(ReaderEvent::Error(e));
+                false
+            }
         }
-    };
-    if let Some(app) = app {
-        let _ = std::process::Command::new("open")
-            .args(["-a", app])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+    }
+
+    /// Show `url`, opening a window if there isn't one. If the window turns
+    /// out to be gone (the user closed it and the close notice hasn't landed,
+    /// or never will), drop it, open a fresh one and retry once.
+    async fn show(&mut self, url: &str, label: &str, events: &impl Fn(ReaderEvent)) {
+        if !is_navigable(url) {
+            events(ReaderEvent::Error("this headline has no web link".into()));
+            return;
+        }
+        for attempt in 0..2 {
+            if self.session.is_none() && !self.open(events).await {
+                return;
+            }
+            let nav = self.nav_tx.clone();
+            let Some(s) = self.session.as_mut() else {
+                return;
+            };
+            match s.navigate(url, label, &nav).await {
+                Ok(()) => return,
+                Err(NavError::Gone(e)) => {
+                    if let Some(dead) = self.session.take() {
+                        dead.close().await;
+                    }
+                    if attempt == 1 {
+                        events(ReaderEvent::Error(e));
+                    }
+                }
+                Err(NavError::Other(e)) => {
+                    events(ReaderEvent::Error(e));
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn close(&mut self, events: &impl Fn(ReaderEvent)) {
+        if let Some(s) = self.session.take() {
+            s.close().await;
+            events(ReaderEvent::Closed);
+        }
     }
 }
 
-/// The reader task: owns at most one window, serialises commands.
+/// The reader task: owns at most one window, serialises commands, and
+/// forwards the window's ctrl+shift+arrow presses to the TUI.
 pub async fn run(
     mut rx: UnboundedReceiver<ReaderCmd>,
     events: impl Fn(ReaderEvent) + Send + 'static,
@@ -324,61 +552,42 @@ pub async fn run(
     views_root: Option<std::path::PathBuf>,
 ) {
     let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
-    let mut session: Option<Session> = None;
-    let mut next_id: u64 = 0;
+    let (nav_tx, mut nav_rx) = tokio::sync::mpsc::unbounded_channel::<NavDir>();
+    let mut r = Reader {
+        bin,
+        views_root,
+        closed_tx,
+        nav_tx,
+        session: None,
+        next_id: 0,
+    };
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
                 None => {
-                    if let Some(s) = session.take() {
+                    if let Some(s) = r.session.take() {
                         s.close().await;
                     }
                     return;
                 }
                 Some(ReaderCmd::Close(ack)) => {
-                    if let Some(s) = session.take() {
-                        s.close().await;
-                        events(ReaderEvent::Closed);
-                    }
+                    r.close(&events).await;
                     if let Some(ack) = ack {
                         let _ = ack.send(());
                     }
                 }
-                Some(ReaderCmd::Show(url)) => {
-                    if !is_navigable(&url) {
-                        events(ReaderEvent::Error("this headline has no web link".into()));
-                        continue;
-                    }
-                    if session.is_none() {
-                        let Some(root) = views_root.as_deref() else {
-                            events(ReaderEvent::Error("reader view assets not found (WICKD_VIEWS_ROOT)".into()));
-                            continue;
-                        };
-                        next_id += 1;
-                        match Session::open(next_id, &bin, root, closed_tx.clone()).await {
-                            Ok(s) => {
-                                session = Some(s);
-                                events(ReaderEvent::Opened);
-                                refocus_terminal();
-                            }
-                            Err(e) => {
-                                events(ReaderEvent::Error(e));
-                                continue;
-                            }
-                        }
-                    }
-                    if let Some(s) = session.as_mut() {
-                        if let Err(e) = s.navigate(&url).await {
-                            events(ReaderEvent::Error(e));
-                        }
-                    }
-                }
+                Some(ReaderCmd::Show { url, label }) => r.show(&url, &label, &events).await,
             },
+            Some(dir) = nav_rx.recv() => {
+                if r.session.is_some() {
+                    events(ReaderEvent::Nav(dir));
+                }
+            }
             // Only the *current* window's close notice counts: a window closed
             // on purpose (x) reports late, and must not tear down a new one.
             Some(id) = closed_rx.recv() => {
-                if session.as_ref().is_some_and(|s| s.id == id) {
-                    session = None;
+                if r.session.as_ref().is_some_and(|s| s.id == id) {
+                    r.session = None;
                     events(ReaderEvent::Closed);
                 }
             }
@@ -397,7 +606,6 @@ mod tests {
         assert_eq!(c["shell"], "app");
         assert_eq!(c["debugPort"], 9333);
         assert_eq!(c["windowSize"]["width"], WINDOW.0);
-        // No persistent profile: ui-leaf uses a throwaway one.
         assert!(c.get("profile").is_none());
     }
 
@@ -409,7 +617,6 @@ mod tests {
             {"type":"page","url":"http://127.0.0.1:51234/#token=abc","webSocketDebuggerUrl":"ws://leaf"}
         ]);
         assert_eq!(page_ws_url(&list).as_deref(), Some("ws://leaf"));
-        // After navigating away, any page will do.
         let list = json!([{"type":"page","url":"https://www.benzinga.com/a","webSocketDebuggerUrl":"ws://p"}]);
         assert_eq!(page_ws_url(&list).as_deref(), Some("ws://p"));
         assert_eq!(page_ws_url(&json!([])), None);
@@ -426,43 +633,150 @@ mod tests {
     }
 
     #[test]
+    fn binding_events_parse_only_our_two_directions() {
+        let ev = |name: &str, payload: &str| json!({"method":"Runtime.bindingCalled","params":{"name":name,"payload":payload,"executionContextId":1}});
+        assert_eq!(parse_nav(&ev(BINDING, "next")), Some(NavDir::Next));
+        assert_eq!(parse_nav(&ev(BINDING, "prev")), Some(NavDir::Prev));
+        assert_eq!(parse_nav(&ev(BINDING, "rm -rf")), None);
+        assert_eq!(parse_nav(&ev("other", "next")), None);
+        assert_eq!(
+            parse_nav(&json!({"method":"Page.loadEventFired","params":{}})),
+            None
+        );
+    }
+
+    #[test]
+    fn page_script_escapes_the_label_and_wires_the_keys() {
+        let s = page_script(r#"NVDA "3 of 12" </script>"#);
+        assert!(
+            s.contains(r#"const label = "NVDA \"3 of 12\" </script>";"#),
+            "{s}"
+        );
+        assert!(s.contains("ArrowRight") && s.contains(BINDING));
+    }
+
+    #[test]
     fn free_port_is_loopback_bindable() {
         assert!(free_port().unwrap() > 0);
     }
 
-    /// Live smoke test (opens a real Chrome window for a few seconds):
-    /// `cargo test -p wickd reader_live_smoke -- --ignored --nocapture`
-    #[tokio::test]
-    #[ignore]
-    async fn reader_live_smoke() {
+    fn reader() -> (Reader, UnboundedReceiver<NavDir>) {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("views");
         let (closed_tx, _closed_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut s = Session::open(1, "ui-leaf", &root, closed_tx)
-            .await
-            .expect("open");
-        s.navigate("https://example.com/")
-            .await
-            .expect("navigate 1");
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        s.navigate("https://www.iana.org/help/example-domains")
-            .await
-            .expect("navigate 2");
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let list: Value = reqwest::get(format!("http://127.0.0.1:{}/json/list", s.port))
+        let (nav_tx, nav_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Reader {
+                bin: "ui-leaf".into(),
+                views_root: Some(root),
+                closed_tx,
+                nav_tx,
+                session: None,
+                next_id: 0,
+            },
+            nav_rx,
+        )
+    }
+
+    async fn page_urls(port: u16) -> Vec<String> {
+        let list: Value = reqwest::get(format!("http://127.0.0.1:{port}/json/list"))
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
-        let urls: Vec<String> = list
-            .as_array()
+        list.as_array()
             .unwrap()
             .iter()
             .filter(|t| t["type"] == "page")
             .filter_map(|t| t["url"].as_str().map(str::to_string))
-            .collect();
+            .collect()
+    }
+
+    /// Live (opens a real Chrome window for a few seconds):
+    /// `cargo test -p wickd reader_live -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn reader_live_navigates_and_window_keys_reach_wickd() {
+        let (mut r, mut nav_rx) = reader();
+        let events = |_e: ReaderEvent| {};
+        r.show("https://example.com/", "TEST · 1 of 2", &events)
+            .await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        r.show(
+            "https://www.iana.org/help/example-domains",
+            "TEST · 2 of 2",
+            &events,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let port = r.session.as_ref().expect("window open").port;
+        let urls = page_urls(port).await;
         println!("page urls: {urls:?}");
         assert!(urls.iter().any(|u| u.contains("iana.org")), "{urls:?}");
-        s.close().await;
+        // Press ctrl+shift+→ inside the page; wickd must hear "next".
+        let s = r.session.as_mut().unwrap();
+        let cdp = s.cdp.as_mut().unwrap();
+        for kind in ["keyDown", "keyUp"] {
+            cdp.call(
+                "Input.dispatchKeyEvent",
+                json!({ "type": kind, "modifiers": 2 | 8, "key": "ArrowRight",
+                        "code": "ArrowRight", "windowsVirtualKeyCode": 39 }),
+            )
+            .await
+            .unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), nav_rx.recv())
+            .await
+            .expect("binding call arrived");
+        println!("nav: {got:?}");
+        assert_eq!(got, Some(NavDir::Next));
+        // The badge rendered on the article page.
+        let badge = cdp
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": "document.getElementById('__wickd_badge')?.textContent" }),
+            )
+            .await
+            .unwrap();
+        println!("badge: {badge}");
+        assert_eq!(badge["result"]["value"], "TEST · 2 of 2");
+        r.close(&events).await;
+    }
+
+    /// The reported bug: the user closes the window, then opens another
+    /// article. The reader must notice and open a fresh window.
+    #[tokio::test]
+    #[ignore]
+    async fn reader_live_reopen_after_user_closes_window() {
+        let (mut r, _nav_rx) = reader();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let events = move |e: ReaderEvent| sink.lock().unwrap().push(e);
+        r.show("https://example.com/", "1", &events).await;
+        let port = r.session.as_ref().expect("window open").port;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let list: Value = reqwest::get(format!("http://127.0.0.1:{port}/json/list"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        for t in list.as_array().unwrap() {
+            if t["type"] == "page" {
+                let id = t["id"].as_str().unwrap();
+                let _ = reqwest::get(format!("http://127.0.0.1:{port}/json/close/{id}")).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        r.show("https://www.iana.org/help/example-domains", "2", &events)
+            .await;
+        let ev = seen.lock().unwrap().clone();
+        println!("events: {ev:?}");
+        assert!(
+            !ev.iter().any(|e| matches!(e, ReaderEvent::Error(_))),
+            "{ev:?}"
+        );
+        assert_eq!(ev.iter().filter(|e| **e == ReaderEvent::Opened).count(), 2);
+        r.close(&events).await;
     }
 }

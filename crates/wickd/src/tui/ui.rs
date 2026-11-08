@@ -560,7 +560,7 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
         title.push_str("· tab to pick ");
     }
     if ip.reader_open {
-        title.push_str("· reader open ");
+        title.push_str("· reader open: ctrl+shift+←/→ in the window ");
     }
     let nblock = Block::default()
         .borders(Borders::ALL)

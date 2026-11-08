@@ -367,7 +367,7 @@ fn run_loop(
                 }
                 Reply::InPlay(r) => actions.extend(app.set_inplay(r)),
                 Reply::News(sym, r) => app.set_news(sym, r),
-                Reply::Reader(ev) => app.set_reader(ev),
+                Reply::Reader(ev) => actions.extend(app.set_reader(ev)),
             }
         }
 
@@ -446,8 +446,8 @@ fn run_loop(
                     }
                     return Ok(());
                 }
-                Action::ReaderShow(url) => {
-                    let _ = reader_tx.send(reader::ReaderCmd::Show(url));
+                Action::ReaderShow { url, label } => {
+                    let _ = reader_tx.send(reader::ReaderCmd::Show { url, label });
                 }
                 Action::ReaderClose => {
                     let _ = reader_tx.send(reader::ReaderCmd::Close(None));
