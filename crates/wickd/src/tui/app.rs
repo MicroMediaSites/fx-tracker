@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use wickd_core::equities::alpaca::NewsItem;
@@ -61,10 +61,21 @@ pub struct InPlayState {
     pub notes: Vec<String>,
     pub error: Option<String>,
     pub updated: Option<DateTime<Local>>,
-    /// Headlines per symbol, for the side pane.
+    /// Headlines per symbol: the side pane *and* the NEWS column read this.
     pub news: HashMap<String, Result<Vec<NewsItem>, String>>,
+    /// When each symbol's headlines were fetched (for the cache TTL).
+    pub news_at: HashMap<String, DateTime<Utc>>,
+    /// After a failed fetch, don't retry a symbol before this time.
+    pub news_retry_after: HashMap<String, DateTime<Utc>>,
     pub news_pending: Vec<String>,
 }
+
+/// Rows (from the top of the visible list) that get a NEWS age.
+pub const NEWS_ROWS: usize = 60;
+/// How long fetched headlines are trusted before a refetch.
+pub const NEWS_TTL_MINUTES: i64 = 10;
+/// Backoff before retrying a symbol whose headline fetch failed.
+pub const NEWS_RETRY_SECONDS: i64 = 60;
 
 impl Default for InPlayState {
     fn default() -> Self {
@@ -78,6 +89,8 @@ impl Default for InPlayState {
             error: None,
             updated: None,
             news: HashMap::new(),
+            news_at: HashMap::new(),
+            news_retry_after: HashMap::new(),
             news_pending: Vec::new(),
         }
     }
@@ -388,18 +401,46 @@ impl App {
             self.inplay.loading = true;
             out.push(Action::FetchInPlay);
         }
-        out.extend(self.request_selected_news());
+        out.extend(self.request_news(Utc::now()));
         out
     }
 
-    /// Ask for the selected row's headlines unless cached or in flight.
-    fn request_selected_news(&mut self) -> Option<Action> {
-        let sym = self.inplay.selected_symbol()?;
-        if self.inplay.news.contains_key(&sym) || self.inplay.news_pending.contains(&sym) {
-            return None;
+    /// Ask for headlines the list is missing: the selected row first, then
+    /// the top [`NEWS_ROWS`] visible rows, skipping anything in flight or
+    /// fetched within [`NEWS_TTL_MINUTES`].
+    pub fn request_news(&mut self, now: DateTime<Utc>) -> Vec<Action> {
+        let ip = &mut self.inplay;
+        let vis: Vec<String> = ip.visible().iter().map(|r| r.symbol.clone()).collect();
+        let mut wanted: Vec<String> = ip.selected_symbol().into_iter().collect();
+        for s in vis.into_iter().take(NEWS_ROWS) {
+            if !wanted.contains(&s) {
+                wanted.push(s);
+            }
         }
-        self.inplay.news_pending.push(sym.clone());
-        Some(Action::FetchNews(sym))
+        let ttl = chrono::Duration::minutes(NEWS_TTL_MINUTES);
+        let mut out = Vec::new();
+        for sym in wanted {
+            let fresh = ip.news_at.get(&sym).is_some_and(|t| now - *t < ttl);
+            let backing_off = ip.news_retry_after.get(&sym).is_some_and(|t| now < *t);
+            if fresh || backing_off || ip.news_pending.contains(&sym) {
+                continue;
+            }
+            ip.news_pending.push(sym.clone());
+            out.push(Action::FetchNews(sym));
+        }
+        out
+    }
+
+    /// Copy cached headlines onto the rows' NEWS columns (rows are rebuilt
+    /// from scratch on every refresh, so this has to be re-applied).
+    fn apply_news_cache(&mut self) {
+        let ip = &mut self.inplay;
+        for row in ip.rows.iter_mut() {
+            if let Some(Ok(items)) = ip.news.get(&row.symbol) {
+                row.latest_news = items.iter().map(|n| n.created_at).max();
+                row.news_count = items.len();
+            }
+        }
     }
 
     /// A rebuilt in-play list arrived.
@@ -423,21 +464,28 @@ impl App {
             }
             Err(e) => ip.error = Some(e),
         }
-        self.request_selected_news().into_iter().collect()
+        self.apply_news_cache();
+        self.request_news(Utc::now())
     }
 
     pub fn set_news(&mut self, symbol: String, result: Result<Vec<NewsItem>, String>) {
         self.inplay.news_pending.retain(|s| *s != symbol);
-        // The pane's per-symbol fetch is authoritative: fold it into the
-        // row's NEWS column so the list and the pane never disagree.
-        if let Ok(items) = &result {
-            if let Some(row) = self.inplay.rows.iter_mut().find(|r| r.symbol == symbol) {
-                let latest = items.iter().map(|n| n.created_at).max();
-                row.latest_news = row.latest_news.max(latest);
-                row.news_count = row.news_count.max(items.len());
-            }
+        // Successes are fresh for the TTL. A failure (e.g. a rate-limit hit)
+        // is shown in the pane and retried after a short backoff — never on
+        // every keypress, which would keep a 429 burst going.
+        let now = Utc::now();
+        if result.is_ok() {
+            self.inplay.news_at.insert(symbol.clone(), now);
+            self.inplay.news_retry_after.remove(&symbol);
+        } else {
+            self.inplay.news_at.remove(&symbol);
+            self.inplay.news_retry_after.insert(
+                symbol.clone(),
+                now + chrono::Duration::seconds(NEWS_RETRY_SECONDS),
+            );
         }
         self.inplay.news.insert(symbol, result);
+        self.apply_news_cache();
     }
 
     fn exec_inplay(&mut self, cmd: Cmd) -> Vec<Action> {
@@ -458,6 +506,9 @@ impl App {
             Cmd::GoEnd if len > 0 => self.inplay.selected = len - 1,
             Cmd::Refresh => {
                 self.inplay.news.clear();
+                self.inplay.news_at.clear();
+                self.inplay.news_retry_after.clear();
+                self.inplay.news_pending.clear();
                 if !self.inplay.loading {
                     self.inplay.loading = true;
                     return vec![Action::FetchInPlay];
@@ -497,7 +548,7 @@ impl App {
             }
             _ => {}
         }
-        self.request_selected_news().into_iter().collect()
+        self.request_news(Utc::now())
     }
 
     fn open_search(&mut self) {
@@ -1118,7 +1169,8 @@ mod tests {
         // A second g i while loading doesn't double-fetch.
         a.mode = Mode::Watchlist;
         assert!(typ(&mut a, "gi").is_empty());
-        // Rows arrive: sorted by biggest move, news requested for the top row.
+        // Rows arrive: sorted by biggest move; headlines requested for every
+        // visible row (selected first). PENNY is under $5, so it's hidden.
         let acts = a.set_inplay(Ok((
             vec![
                 ip_row("SMALL", 1.0, 50.0, 0.5),
@@ -1127,15 +1179,18 @@ mod tests {
             ],
             vec!["movers unavailable".into()],
         )));
-        // PENNY (40%) is filtered out under $5, so BIG leads.
-        assert_eq!(acts, vec![Action::FetchNews("BIG".into())]);
+        assert_eq!(
+            acts,
+            vec![
+                Action::FetchNews("BIG".into()),
+                Action::FetchNews("SMALL".into())
+            ]
+        );
         assert_eq!(a.inplay.visible().len(), 2);
-        // Moving down asks for the next symbol's headlines.
-        assert_eq!(typ(&mut a, "j"), vec![Action::FetchNews("SMALL".into())]);
-        a.set_news("SMALL".into(), Ok(vec![]));
-        assert!(typ(&mut a, "kj").is_empty() || a.inplay.news_pending.contains(&"BIG".to_string()));
-        // v f drops the price filter; v r sorts by relative volume.
-        typ(&mut a, "vf");
+        // In flight → moving around doesn't re-request.
+        assert!(typ(&mut a, "jk").is_empty());
+        // v f drops the price filter (PENNY now visible → its news requested).
+        assert_eq!(typ(&mut a, "vf"), vec![Action::FetchNews("PENNY".into())]);
         assert_eq!(a.inplay.visible().len(), 3);
         typ(&mut a, "vr");
         assert_eq!(a.inplay.selected_symbol().as_deref(), Some("PENNY"));
@@ -1156,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_headlines_fill_the_rows_news_column() {
+    fn news_cache_fills_rows_and_survives_list_rebuilds() {
         let mut a = app();
         typ(&mut a, "gi");
         a.set_inplay(Ok((vec![ip_row("A", 9.0, 10.0, 1.0)], vec![])));
@@ -1174,11 +1229,30 @@ mod tests {
             "A".into(),
             Ok(vec![item(1, t), item(2, t - chrono::Duration::hours(5))]),
         );
+        assert_eq!(
+            (a.inplay.rows[0].latest_news, a.inplay.rows[0].news_count),
+            (Some(t), 2)
+        );
+        // The list rebuilds from scratch (as every minute / on return) —
+        // the cached headlines are re-applied and nothing is re-requested.
+        let acts = a.set_inplay(Ok((vec![ip_row("A", 9.5, 10.0, 1.0)], vec![])));
+        assert!(acts.is_empty(), "{acts:?}");
         assert_eq!(a.inplay.rows[0].latest_news, Some(t));
-        assert_eq!(a.inplay.rows[0].news_count, 2);
-        // An error leaves the column alone.
-        a.set_news("A".into(), Err("x".into()));
-        assert_eq!(a.inplay.rows[0].latest_news, Some(t));
+        // After the TTL, a rebuild asks again.
+        let later = chrono::Utc::now() + chrono::Duration::minutes(NEWS_TTL_MINUTES + 1);
+        assert_eq!(a.request_news(later), vec![Action::FetchNews("A".into())]);
+        // A failed fetch backs off: moving the cursor doesn't re-request it,
+        // but once the backoff passes it's retried.
+        a.inplay.news_pending.clear();
+        a.set_news("A".into(), Err("rate limited".into()));
+        assert!(typ(&mut a, "jk").is_empty());
+        assert!(a.request_news(chrono::Utc::now()).is_empty());
+        let after = chrono::Utc::now() + chrono::Duration::seconds(NEWS_RETRY_SECONDS + 1);
+        assert_eq!(a.request_news(after), vec![Action::FetchNews("A".into())]);
+        // r clears the cache and refetches.
+        a.inplay.news_pending.clear();
+        assert_eq!(typ(&mut a, "r"), vec![Action::FetchInPlay]);
+        assert!(a.inplay.news.is_empty());
     }
 
     #[test]
