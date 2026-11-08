@@ -84,6 +84,11 @@ pub struct InPlayState {
     pub reader_open: bool,
 }
 
+/// Rows a J/K (shift) step moves in a list.
+pub const LIST_PAGE: usize = 10;
+/// Headlines a J/K step moves in the headlines pane.
+pub const NEWS_PAGE: usize = 3;
+
 /// Rows (from the top of the visible list) that get a NEWS age.
 pub const NEWS_ROWS: usize = 60;
 /// How long fetched headlines are trusted before a refetch.
@@ -420,6 +425,8 @@ impl App {
             Cmd::Help => self.show_help = true,
             Cmd::Down if len > 0 => self.selected = (self.selected + 1).min(len - 1),
             Cmd::Up => self.selected = self.selected.saturating_sub(1),
+            Cmd::PageDown if len > 0 => self.selected = (self.selected + LIST_PAGE).min(len - 1),
+            Cmd::PageUp => self.selected = self.selected.saturating_sub(LIST_PAGE),
             Cmd::GoTop => self.selected = 0,
             Cmd::GoEnd if len > 0 => self.selected = len - 1,
             Cmd::GoRow => {
@@ -577,12 +584,17 @@ impl App {
         let n = self.inplay.selected_headlines().len();
         let before = self.inplay.news_cursor;
         match cmd {
-            Cmd::FocusNews | Cmd::Back => {
+            Cmd::FocusNews | Cmd::Back | Cmd::FocusLeft => {
                 self.inplay.focus_news = false;
                 return Some(vec![]);
             }
+            Cmd::FocusRight => return Some(vec![]),
             Cmd::Down => self.inplay.news_cursor = (before + 1).min(n.saturating_sub(1)),
             Cmd::Up => self.inplay.news_cursor = before.saturating_sub(1),
+            Cmd::PageDown => {
+                self.inplay.news_cursor = (before + NEWS_PAGE).min(n.saturating_sub(1))
+            }
+            Cmd::PageUp => self.inplay.news_cursor = before.saturating_sub(NEWS_PAGE),
             Cmd::GoTop => self.inplay.news_cursor = 0,
             Cmd::GoEnd => self.inplay.news_cursor = n.saturating_sub(1),
             Cmd::Open => {
@@ -638,7 +650,10 @@ impl App {
                 vec![]
             };
         }
-        if cmd == Cmd::FocusNews {
+        if cmd == Cmd::FocusLeft {
+            return vec![];
+        }
+        if cmd == Cmd::FocusNews || cmd == Cmd::FocusRight {
             if self.inplay.selected_headlines().is_empty() {
                 self.flash = Some("no headlines for this symbol yet".into());
             } else {
@@ -669,6 +684,8 @@ impl App {
             Cmd::Search => self.open_search(),
             Cmd::Down if len > 0 => self.inplay.selected = (ip_sel + 1).min(len - 1),
             Cmd::Up => self.inplay.selected = ip_sel.saturating_sub(1),
+            Cmd::PageDown if len > 0 => self.inplay.selected = (ip_sel + LIST_PAGE).min(len - 1),
+            Cmd::PageUp => self.inplay.selected = ip_sel.saturating_sub(LIST_PAGE),
             Cmd::GoTop => self.inplay.selected = 0,
             Cmd::GoEnd if len > 0 => self.inplay.selected = len - 1,
             Cmd::Refresh => {
@@ -1497,6 +1514,53 @@ mod tests {
         // Reader closing is tracked.
         a.set_reader(ReaderEvent::Closed);
         assert!(!a.inplay.reader_open);
+    }
+
+    #[test]
+    fn vim_navigation_everywhere() {
+        // Watchlist: J/K page (clamped), j/k step.
+        let mut a = App::new((0..25).map(|i| format!("S{i}")).collect(), "IEX");
+        typ(&mut a, "J");
+        assert_eq!(a.selected, LIST_PAGE);
+        typ(&mut a, "JJ");
+        assert_eq!(a.selected, 24);
+        typ(&mut a, "K");
+        assert_eq!(a.selected, 24 - LIST_PAGE);
+        // In play: J pages the list; l moves right into headlines, h back.
+        typ(&mut a, "gi");
+        let rows: Vec<Row> = (0..15)
+            .map(|i| ip_row(&format!("R{i:02}"), 30.0 - i as f64, 10.0, 1.0))
+            .collect();
+        a.set_inplay(Ok((rows, vec![])));
+        typ(&mut a, "J");
+        assert_eq!(a.inplay.selected, LIST_PAGE);
+        let sym = a.inplay.selected_symbol().unwrap();
+        let t: chrono::DateTime<chrono::Utc> = "2026-11-06T12:00:00Z".parse().unwrap();
+        let items: Vec<NewsItem> = (0..8)
+            .map(|id| NewsItem {
+                id,
+                headline: format!("h{id}"),
+                summary: String::new(),
+                created_at: t,
+                symbols: vec![sym.clone()],
+                source: "benzinga".into(),
+                url: Some(format!("https://x/{id}")),
+            })
+            .collect();
+        a.set_news(sym.clone(), Ok(items));
+        typ(&mut a, "h"); // left edge: nothing
+        assert!(!a.inplay.focus_news);
+        typ(&mut a, "l");
+        assert!(a.inplay.focus_news);
+        typ(&mut a, "J");
+        assert_eq!(a.inplay.news_cursor, NEWS_PAGE);
+        typ(&mut a, "K");
+        assert_eq!(a.inplay.news_cursor, 0);
+        typ(&mut a, "h");
+        assert!(!a.inplay.focus_news);
+        // enter (not l) opens the chart from the list.
+        let acts = a.on_key(key(KeyCode::Enter));
+        assert!(acts.contains(&Action::FetchHistory(sym, HistoryRange::Day1)));
     }
 
     #[test]
