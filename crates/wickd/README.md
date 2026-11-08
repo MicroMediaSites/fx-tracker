@@ -40,6 +40,10 @@ wickd tui              # IEX real-time quotes (free plan)
 wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 ```
 
+- **Navigation** works the same way everywhere: `j`/`k` move up and down a
+  list, `h`/`l` move left and right (the chart cursor, or between the in-play
+  list and its headlines), and shifted letters take bigger steps (`J`/`K` a
+  page, `H`/`L` half a chart screen).
 - **Keys** are Helix-style. Bare keys move (`j`/`k`, arrows), open (`enter`),
   back out (`esc`), search (`/`), refresh (`r`) and quit (`q`). A prefix letter
   opens a category, and a panel lists the next keys:

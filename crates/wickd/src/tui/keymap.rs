@@ -1,5 +1,9 @@
 //! `wickd tui` keys, Helix-style (the same pattern as prview and pablo).
 //!
+//! Navigation is vim-shaped everywhere: **j/k** move up/down a list, **h/l**
+//! move left/right (chart cursor; list ↔ headlines pane), and the shifted
+//! letters take bigger steps (**J/K** a page, **H/L** half a chart screen).
+//!
 //! Bare keys do the everyday things: move, open, back, search, quit. A
 //! letter *prefix* opens a category, and the next key picks the action:
 //!
@@ -61,6 +65,8 @@ pub enum Cmd {
     GoWatchlist,
     GoInPlay,
     FocusNews,
+    FocusRight,
+    FocusLeft,
     CloseReader,
     SortChange,
     SortRelVolume,
@@ -192,14 +198,22 @@ pub static BINDINGS: &[Binding] = &[
     // ── bare ──
     bare(&[K::Down, K::Char('j')], Cmd::Down, "down", WDI),
     bare(&[K::Up, K::Char('k')], Cmd::Up, "up", WDI),
-    bare(&[K::PageDown], Cmd::PageDown, "page down", D),
-    bare(&[K::PageUp], Cmd::PageUp, "page up", D),
+    bare(
+        &[K::Char('J'), K::PageDown],
+        Cmd::PageDown,
+        "down a page",
+        WDI,
+    ),
+    bare(&[K::Char('K'), K::PageUp], Cmd::PageUp, "up a page", WDI),
     bare(
         &[K::Enter, K::Right, K::Char('l')],
         Cmd::Open,
         "open symbol",
-        WI,
+        W,
     ),
+    bare(&[K::Enter], Cmd::Open, "open (chart / article)", I),
+    bare(&[K::Right, K::Char('l')], Cmd::FocusRight, "→ headlines", I),
+    bare(&[K::Left, K::Char('h')], Cmd::FocusLeft, "← list", I),
     bare(&[K::Left, K::Char('h')], Cmd::CursorLeft, "cursor ←", D),
     bare(&[K::Right, K::Char('l')], Cmd::CursorRight, "cursor →", D),
     bare(&[K::Char('H')], Cmd::PanLeft, "pan back", D),
