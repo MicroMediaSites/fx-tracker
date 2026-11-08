@@ -583,8 +583,12 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, d: &DetailState) {
             );
         }
         Some(bars) => match d.view {
-            DetailView::Candles => render_chart_view(frame, body, d, snap, Style2::Candles),
-            DetailView::Line => render_chart_view(frame, body, d, snap, Style2::Line),
+            DetailView::Candles => {
+                render_chart_view(frame, body, d, snap, Style2::Candles, app.history_delayed)
+            }
+            DetailView::Line => {
+                render_chart_view(frame, body, d, snap, Style2::Line, app.history_delayed)
+            }
             DetailView::Table => render_bar_table(frame, body, d.range, bars, d.scroll),
         },
     }
@@ -743,6 +747,7 @@ fn render_chart_view(
     d: &DetailState,
     snap: Option<&Snapshot>,
     style: Style2,
+    delayed: bool,
 ) {
     let range = d.range;
     let reference = (range == HistoryRange::Day1)
@@ -780,6 +785,9 @@ fn render_chart_view(
     if let Some(p) = reference {
         title.push_str(&format!(" · prev close {}", fmt_price(p)));
     }
+    if delayed {
+        title.push_str(" · 15m delayed");
+    }
     title.push_str(" · −/+ zoom  h/l cursor  H/L pan ");
     let block = Block::default()
         .borders(Borders::ALL)
@@ -796,6 +804,7 @@ fn render_chart_view(
             style,
             reference,
             last_price: snap.and_then(Snapshot::last),
+            delayed,
             fmt_price,
             fmt_volume,
             time_label: &time_label,

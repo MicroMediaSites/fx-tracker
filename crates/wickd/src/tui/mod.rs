@@ -205,9 +205,11 @@ impl Every {
 /// runtime (the worker is spawned onto it).
 pub async fn run(client: AlpacaClient, watchlist: Vec<String>, opts: Options) -> Result<()> {
     let feed_label = client.feed().display_label();
+    let history_delayed = client.feed() != wickd_core::equities::alpaca::QuoteFeed::Sip;
     let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
     let requests = spawn_worker(client, reply_tx);
-    let app = App::new(watchlist, feed_label);
+    let mut app = App::new(watchlist, feed_label);
+    app.history_delayed = history_delayed;
     tokio::task::spawn_blocking(move || run_loop(app, requests, reply_rx, opts))
         .await
         .context("tui task panicked")?

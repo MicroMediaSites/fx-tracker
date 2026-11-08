@@ -85,8 +85,10 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 - **Data**. Quotes poll every 15s (`--refresh`). On the free plan, live quotes
   are IEX-only (about 3% of volume). `--feed delayed-sip` trades that for
   all-exchange quotes 15 minutes behind. History is always consolidated and
-  split-adjusted, and runs 15 minutes behind on the free plan. Times are shown
-  in the local zone.
+  split-adjusted, and runs 15 minutes behind on the free plan. On the free
+  plan the chart title says `15m delayed`, and a dotted marker joins the
+  newest candle to the live price tag, so the gap reads as "moved since".
+  Times are shown in the local zone.
 - **Keys**. Agents can export `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY`
   instead of using the keychain item (service `wickd`, account `alpaca`).
 
