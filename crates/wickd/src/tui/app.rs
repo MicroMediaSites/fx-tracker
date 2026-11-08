@@ -517,10 +517,10 @@ impl App {
                 self.inplay.focus_news = false;
                 return Some(vec![]);
             }
-            Cmd::Down if n > 0 => self.inplay.news_cursor = (before + 1).min(n - 1),
+            Cmd::Down => self.inplay.news_cursor = (before + 1).min(n.saturating_sub(1)),
             Cmd::Up => self.inplay.news_cursor = before.saturating_sub(1),
             Cmd::GoTop => self.inplay.news_cursor = 0,
-            Cmd::GoEnd if n > 0 => self.inplay.news_cursor = n - 1,
+            Cmd::GoEnd => self.inplay.news_cursor = n.saturating_sub(1),
             Cmd::Open => {
                 return Some(match self.inplay.cursor_url() {
                     Some(u) => vec![Action::ReaderShow(u)],
@@ -530,7 +530,6 @@ impl App {
                     }
                 });
             }
-            Cmd::Down | Cmd::GoEnd => {}
             _ => return None,
         }
         // Moving the cursor while the reader is open loads that article.

@@ -54,12 +54,13 @@ const HEARTBEAT_TIMEOUT_MS: u64 = 3_600_000;
 const CLOSE_MSG: &[u8] = b"{\"version\":\"1\",\"type\":\"close\"}\n";
 
 /// Commands from the TUI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ReaderCmd {
     /// Show this article, opening the window first if needed.
     Show(String),
-    /// Close the window.
-    Close,
+    /// Close the window; the sender (if any) is signalled once it's closed,
+    /// so the TUI can wait for a clean shutdown instead of guessing a delay.
+    Close(Option<std::sync::mpsc::Sender<()>>),
 }
 
 /// Events back to the TUI.
@@ -92,22 +93,19 @@ pub fn mount_config(views_root: &Path, debug_port: u16) -> String {
 /// From a DevTools `/json/list` response, the WebSocket URL of the ui-leaf
 /// page (the window's first `page` target).
 pub fn page_ws_url(list: &Value) -> Option<String> {
-    let targets = list.as_array()?;
-    let page = targets
+    let pages: Vec<&Value> = list
+        .as_array()?
         .iter()
         .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
-        // Prefer ui-leaf's own page (the one we just opened)…
-        .find(|t| {
-            t.get("url").and_then(Value::as_str).is_some_and(|u| {
-                u.starts_with("http://127.0.0.1") || u.starts_with("http://localhost")
-            })
-        })
-        // …else any page (after a navigation the URL is the article's).
-        .or_else(|| {
-            targets
-                .iter()
-                .find(|t| t.get("type").and_then(Value::as_str) == Some("page"))
-        })?;
+        .collect();
+    let is_local = |t: &&&Value| {
+        t.get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|u| u.starts_with("http://127.0.0.1") || u.starts_with("http://localhost"))
+    };
+    // Prefer ui-leaf's own page (the one we just opened), else any page
+    // (after a navigation the URL is the article's).
+    let page = pages.iter().find(is_local).or_else(|| pages.first())?;
     page.get("webSocketDebuggerUrl")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -119,7 +117,10 @@ pub fn is_navigable(url: &str) -> bool {
     u.starts_with("https://") || u.starts_with("http://")
 }
 
-/// A free loopback port for Chrome's DevTools endpoint.
+/// A free loopback port for Chrome's DevTools endpoint. Bind-then-release
+/// can race another process grabbing the port in between; acceptable for a
+/// loopback port picked at random (Chrome would just fail to bind, and the
+/// attach step reports that).
 fn free_port() -> std::io::Result<u16> {
     let l = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(l.local_addr()?.port())
@@ -128,6 +129,8 @@ fn free_port() -> std::io::Result<u16> {
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 struct Session {
+    /// Distinguishes this window's `closed` notice from an older one's.
+    id: u64,
     child: Child,
     stdin: ChildStdin,
     port: u16,
@@ -137,9 +140,10 @@ struct Session {
 
 impl Session {
     async fn open(
+        id: u64,
         bin: &str,
         views_root: &Path,
-        closed: UnboundedSender<()>,
+        closed: UnboundedSender<u64>,
     ) -> Result<Self, String> {
         let port = free_port().map_err(|e| format!("no free port for the reader: {e}"))?;
         let mut child = Command::new(bin)
@@ -195,10 +199,11 @@ impl Session {
                     break;
                 }
             }
-            let _ = closed.send(());
+            let _ = closed.send(id);
         });
 
         Ok(Self {
+            id,
             child,
             stdin,
             port,
@@ -239,7 +244,9 @@ impl Session {
             let id = self.next_id;
             self.next_id += 1;
             let msg = json!({ "id": id, "method": "Page.navigate", "params": { "url": url } });
-            let ws = self.ws.as_mut().expect("attached above");
+            let Some(ws) = self.ws.as_mut() else {
+                return Err("lost the reader window".into());
+            };
             let sent = ws.send(Message::Text(msg.to_string().into())).await;
             if sent.is_err() {
                 self.ws = None; // stale socket: reattach once
@@ -316,18 +323,25 @@ pub async fn run(
     bin: String,
     views_root: Option<std::path::PathBuf>,
 ) {
-    let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
     let mut session: Option<Session> = None;
+    let mut next_id: u64 = 0;
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
-                None | Some(ReaderCmd::Close) => {
+                None => {
+                    if let Some(s) = session.take() {
+                        s.close().await;
+                    }
+                    return;
+                }
+                Some(ReaderCmd::Close(ack)) => {
                     if let Some(s) = session.take() {
                         s.close().await;
                         events(ReaderEvent::Closed);
                     }
-                    if cmd.is_none() {
-                        return;
+                    if let Some(ack) = ack {
+                        let _ = ack.send(());
                     }
                 }
                 Some(ReaderCmd::Show(url)) => {
@@ -340,7 +354,8 @@ pub async fn run(
                             events(ReaderEvent::Error("reader view assets not found (WICKD_VIEWS_ROOT)".into()));
                             continue;
                         };
-                        match Session::open(&bin, root, closed_tx.clone()).await {
+                        next_id += 1;
+                        match Session::open(next_id, &bin, root, closed_tx.clone()).await {
                             Ok(s) => {
                                 session = Some(s);
                                 events(ReaderEvent::Opened);
@@ -359,9 +374,13 @@ pub async fn run(
                     }
                 }
             },
-            Some(()) = closed_rx.recv() => {
-                session = None;
-                events(ReaderEvent::Closed);
+            // Only the *current* window's close notice counts: a window closed
+            // on purpose (x) reports late, and must not tear down a new one.
+            Some(id) = closed_rx.recv() => {
+                if session.as_ref().is_some_and(|s| s.id == id) {
+                    session = None;
+                    events(ReaderEvent::Closed);
+                }
             }
         }
     }
@@ -418,10 +437,12 @@ mod tests {
     async fn reader_live_smoke() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("views");
         let (closed_tx, _closed_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut s = Session::open("ui-leaf", &root, closed_tx)
+        let mut s = Session::open(1, "ui-leaf", &root, closed_tx)
             .await
             .expect("open");
-        s.navigate("https://example.com/").await.expect("navigate 1");
+        s.navigate("https://example.com/")
+            .await
+            .expect("navigate 1");
         tokio::time::sleep(Duration::from_secs(2)).await;
         s.navigate("https://www.iana.org/help/example-domains")
             .await

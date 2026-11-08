@@ -434,9 +434,15 @@ fn run_loop(
             match action {
                 Action::Quit => {
                     if app.inplay.reader_open {
-                        // Close the reader window before leaving.
-                        let _ = reader_tx.send(reader::ReaderCmd::Close);
-                        std::thread::sleep(Duration::from_millis(400));
+                        // Close the reader window and wait (bounded) for the
+                        // reader task to confirm, instead of guessing a delay.
+                        let (ack_tx, ack_rx) = mpsc::channel();
+                        if reader_tx
+                            .send(reader::ReaderCmd::Close(Some(ack_tx)))
+                            .is_ok()
+                        {
+                            let _ = ack_rx.recv_timeout(Duration::from_secs(4));
+                        }
                     }
                     return Ok(());
                 }
@@ -444,7 +450,7 @@ fn run_loop(
                     let _ = reader_tx.send(reader::ReaderCmd::Show(url));
                 }
                 Action::ReaderClose => {
-                    let _ = reader_tx.send(reader::ReaderCmd::Close);
+                    let _ = reader_tx.send(reader::ReaderCmd::Close(None));
                 }
                 Action::RefreshQuotes => {
                     quotes.reset();
