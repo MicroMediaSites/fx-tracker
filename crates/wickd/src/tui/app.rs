@@ -129,6 +129,8 @@ pub struct App {
     /// Last removed watchlist entry, for `u`ndo.
     undo: Option<(usize, String)>,
     pub feed_label: &'static str,
+    /// History runs ~15 min behind (any plan without real-time SIP).
+    pub history_delayed: bool,
 }
 
 impl App {
@@ -152,6 +154,7 @@ impl App {
             flash: None,
             undo: None,
             feed_label,
+            history_delayed: true,
         }
     }
 

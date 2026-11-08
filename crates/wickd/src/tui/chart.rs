@@ -585,6 +585,9 @@ pub struct ChartWidget<'a> {
     pub reference: Option<f64>,
     /// Price for the right-axis tag (live last), else the newest close.
     pub last_price: Option<f64>,
+    /// Candles lag the live price (free plan): draw a faint marker from the
+    /// newest candle to the live price so the gap reads as "moved since".
+    pub delayed: bool,
     pub fmt_price: fn(f64) -> String,
     pub fmt_volume: fn(f64) -> String,
     /// Full timestamp label for the readout.
@@ -678,6 +681,11 @@ impl Widget for ChartWidget<'_> {
         if let Some(r) = self.reference {
             lo = lo.min(r);
             hi = hi.max(r);
+        }
+        // Keep the live price on scale while the newest candle is visible.
+        if let Some(p) = self.last_price.filter(|_| end == n) {
+            lo = lo.min(p);
+            hi = hi.max(p);
         }
         let pad = ((hi - lo) * 0.04).max(hi.abs() * 0.0005);
         let (lo, hi) = (lo - pad, hi + pad);
@@ -835,6 +843,21 @@ impl Widget for ChartWidget<'_> {
         // Last-price tag on the axis.
         let newest = &self.candles[n - 1];
         let last = self.last_price.unwrap_or(newest.close);
+        // Delay marker: from just right of the newest candle, a dotted
+        // vertical from its close to the live price, then across to the tag.
+        if self.delayed && self.last_price.is_some() && end == n && last >= lo && last <= hi {
+            let xg = x_of(end - 1 - start) + bw as u16;
+            let (rc, rl) = (row_of(newest.close), row_of(last));
+            let st = Style::default().fg(pal.dim);
+            if xg < x_axis {
+                for r in rc.min(rl)..=rc.max(rl) {
+                    buf.set_string(xg, y0 + r, "┆", st);
+                }
+                for x in xg + 1..x_axis {
+                    buf.set_string(x, y0 + rl, "·", st);
+                }
+            }
+        }
         if last >= lo && last <= hi {
             let up = newest
                 .prev_close
@@ -1089,6 +1112,7 @@ mod tests {
             style,
             reference: Some(candles[0].open),
             last_price: None,
+            delayed: false,
             fmt_price: |p| format!("{p:.2}"),
             fmt_volume: |v| format!("{v:.0}"),
             time_label: &label,
@@ -1168,6 +1192,45 @@ mod tests {
         assert_eq!(v.visible.get(), (100 - 8) / 6);
         // Tiny areas are a no-op.
         render(&candles, &ChartView::default(), 10, 4, Style2::Candles);
+    }
+
+    #[test]
+    fn delay_marker_joins_the_newest_candle_to_the_live_price() {
+        let candles = build(&walk(30), 1);
+        let v = ChartView {
+            fit: false,
+            zoom: 4, // 2-column slots leave a gap column after each candle
+            ..ChartView::default()
+        };
+        let area = Rect::new(0, 0, 100, 24);
+        let label = |t: DateTime<Utc>| t.format("%H:%M").to_string();
+        let boundary = |_p: Option<DateTime<Utc>>, _t: DateTime<Utc>| None;
+        let draw = |delayed: bool| {
+            let mut buf = Buffer::empty(area);
+            ChartWidget {
+                candles: &candles,
+                view: &v,
+                style: Style2::Candles,
+                reference: None,
+                last_price: Some(candles[29].close + 2.0),
+                delayed,
+                fmt_price: |p| format!("{p:.2}"),
+                fmt_volume: |v| format!("{v:.0}"),
+                time_label: &label,
+                boundary: &boundary,
+                palette: Palette {
+                    up: Color::Green,
+                    down: Color::Red,
+                    dim: Color::DarkGray,
+                    grid: Color::Gray,
+                    text: Color::White,
+                },
+            }
+            .render(area, &mut buf);
+            text(&buf)
+        };
+        assert!(draw(true).contains('┆'), "{}", draw(true));
+        assert!(!draw(false).contains('┆'));
     }
 
     #[test]
