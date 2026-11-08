@@ -193,6 +193,17 @@ impl InPlayState {
     }
 }
 
+/// `g f`: filter the current list by ticker or company name; `enter` jumps
+/// the real cursor to the picked line, `esc` restores it.
+#[derive(Debug, Clone, Default)]
+pub struct FindState {
+    pub query: String,
+    /// Index into the current matches.
+    pub selected: usize,
+    /// The list cursor before `g f`, restored on `esc`.
+    pub saved: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct SearchState {
     pub query: String,
@@ -275,6 +286,8 @@ pub struct App {
     pub pending: Option<Pending>,
     pub search: SearchState,
     pub detail: Option<DetailState>,
+    /// Active `g f` filter on the watchlist / in-play list.
+    pub find: Option<FindState>,
     pub inplay: InPlayState,
     pub quotes_error: Option<String>,
     pub last_quotes: Option<DateTime<Local>>,
@@ -303,6 +316,7 @@ impl App {
             pending: None,
             search: SearchState::default(),
             detail: None,
+            find: None,
             inplay: InPlayState::default(),
             quotes_error: None,
             last_quotes: None,
@@ -400,6 +414,9 @@ impl App {
             return vec![];
         }
         self.flash = None;
+        if self.find.is_some() {
+            return self.on_find_key(key);
+        }
         let Some(ctx) = self.ctx() else {
             return self.on_search_key(key);
         };
@@ -437,6 +454,7 @@ impl App {
                 }
             }
             Cmd::Search => self.open_search(),
+            Cmd::Find => self.open_find(),
             Cmd::GoInPlay => return self.open_inplay(),
             Cmd::WatchAdd => {
                 self.open_search();
@@ -679,6 +697,7 @@ impl App {
             app.inplay.selected = 0;
         };
         match cmd {
+            Cmd::Find => self.open_find(),
             Cmd::Back | Cmd::GoWatchlist => self.mode = Mode::Watchlist,
             Cmd::Help => self.show_help = true,
             Cmd::Search => self.open_search(),
@@ -733,6 +752,113 @@ impl App {
             _ => {}
         }
         self.request_news(Utc::now())
+    }
+
+    /// Symbols of the list `g f` filters on this screen, in display order.
+    fn find_items(&self) -> Vec<String> {
+        match self.mode {
+            Mode::InPlay => self
+                .inplay
+                .visible()
+                .iter()
+                .map(|r| r.symbol.clone())
+                .collect(),
+            _ => self.watchlist.clone(),
+        }
+    }
+
+    /// Indices (into the current list) matching the find query by ticker or
+    /// company name, case-insensitive; everything when the query is empty.
+    pub fn find_matches(&self) -> Vec<usize> {
+        let q = self
+            .find
+            .as_ref()
+            .map(|f| f.query.trim().to_lowercase())
+            .unwrap_or_default();
+        self.find_items()
+            .iter()
+            .enumerate()
+            .filter(|(_, sym)| {
+                q.is_empty()
+                    || sym.to_lowercase().contains(&q)
+                    || self
+                        .asset(sym)
+                        .is_some_and(|a| a.name.to_lowercase().contains(&q))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn open_find(&mut self) {
+        let current = match self.mode {
+            Mode::InPlay => self.inplay.selected,
+            _ => self.selected,
+        };
+        self.inplay.focus_news = false;
+        self.find = Some(FindState {
+            query: String::new(),
+            selected: current,
+            saved: current,
+        });
+    }
+
+    fn on_find_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let matches = self.find_matches();
+        let n = matches.len();
+        let Some(f) = self.find.as_mut() else {
+            return vec![];
+        };
+        match key.code {
+            KeyCode::Esc => {
+                let saved = f.saved;
+                self.find = None;
+                match self.mode {
+                    Mode::InPlay => self.inplay.selected = saved,
+                    _ => self.selected = saved,
+                }
+                return vec![];
+            }
+            KeyCode::Enter => {
+                let picked = matches.get(f.selected).copied();
+                self.find = None;
+                let Some(i) = picked else {
+                    self.flash = Some("no matches".into());
+                    return vec![];
+                };
+                return match self.mode {
+                    Mode::InPlay => {
+                        self.inplay.selected = i;
+                        self.inplay.news_cursor = 0;
+                        self.request_news(Utc::now())
+                    }
+                    _ => {
+                        self.selected = i;
+                        vec![]
+                    }
+                };
+            }
+            KeyCode::Down | KeyCode::Char('n') if key.code == KeyCode::Down || ctrl => {
+                f.selected = (f.selected + 1).min(n.saturating_sub(1));
+            }
+            KeyCode::Up | KeyCode::Char('p') if key.code == KeyCode::Up || ctrl => {
+                f.selected = f.selected.saturating_sub(1);
+            }
+            KeyCode::Backspace => {
+                f.query.pop();
+                f.selected = 0;
+            }
+            KeyCode::Char('u') if ctrl => {
+                f.query.clear();
+                f.selected = 0;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                f.query.push(c);
+                f.selected = 0;
+            }
+            _ => {}
+        }
+        vec![]
     }
 
     fn open_search(&mut self) {
@@ -1561,6 +1687,68 @@ mod tests {
         // enter (not l) opens the chart from the list.
         let acts = a.on_key(key(KeyCode::Enter));
         assert!(acts.contains(&Action::FetchHistory(sym, HistoryRange::Day1)));
+    }
+
+    #[test]
+    fn find_filters_the_list_and_enter_jumps_to_the_line() {
+        // In play: "g f spac" narrows to SPCX (by company name), enter jumps.
+        let mut a = app();
+        a.set_assets(vec![
+            Asset {
+                symbol: "SPCX".into(),
+                name: "Space Exploration Technologies Corp.".into(),
+                exchange: "NASDAQ".into(),
+                tradable: true,
+            },
+            Asset {
+                symbol: "NVDA".into(),
+                name: "NVIDIA Corporation".into(),
+                exchange: "NASDAQ".into(),
+                tradable: true,
+            },
+        ]);
+        typ(&mut a, "gi");
+        a.set_inplay(Ok((
+            vec![
+                ip_row("NVDA", 9.0, 10.0, 1.0),
+                ip_row("AAPL", 7.0, 10.0, 1.0),
+                ip_row("SPCX", 5.0, 10.0, 1.0),
+            ],
+            vec![],
+        )));
+        assert_eq!(a.inplay.selected, 0);
+        typ(&mut a, "gf");
+        assert!(a.find.is_some());
+        typ(&mut a, "spac");
+        assert_eq!(a.find_matches(), vec![2]);
+        // While filtering, letters (even q/j) type rather than act.
+        assert_eq!(a.mode, Mode::InPlay);
+        let acts = a.on_key(key(KeyCode::Enter));
+        assert!(a.find.is_none());
+        assert_eq!(a.inplay.selected_symbol().as_deref(), Some("SPCX"));
+        assert!(acts.contains(&Action::FetchNews("SPCX".into())) || acts.is_empty());
+        // Ticker match, arrows pick among several, esc restores the cursor.
+        typ(&mut a, "gf");
+        typ(&mut a, "a"); // NVDA (name "NVIDIA Corporation") , AAPL, SPCX ("Space ...") all contain "a"
+        assert_eq!(a.find_matches().len(), 3);
+        a.on_key(key(KeyCode::Down));
+        assert_eq!(a.find.as_ref().unwrap().selected, 1);
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.inplay.selected_symbol().as_deref(), Some("SPCX"));
+        // No matches + enter: cancels with a note.
+        typ(&mut a, "gf");
+        typ(&mut a, "zzzz");
+        assert!(a.find_matches().is_empty());
+        a.on_key(key(KeyCode::Enter));
+        assert!(a.find.is_none());
+        assert!(a.flash.as_deref().unwrap_or("").contains("no matches"));
+        // Watchlist works the same.
+        a.on_key(key(KeyCode::Esc)); // back to watchlist
+        assert_eq!(a.mode, Mode::Watchlist);
+        typ(&mut a, "gf");
+        typ(&mut a, "aap");
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.selected_symbol(), Some("AAPL"));
     }
 
     #[test]

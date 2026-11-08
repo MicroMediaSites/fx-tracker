@@ -64,6 +64,7 @@ pub enum Cmd {
     GoRow,
     GoWatchlist,
     GoInPlay,
+    Find,
     FocusNews,
     FocusRight,
     FocusLeft,
@@ -165,6 +166,7 @@ const WD: &[Ctx] = &[Ctx::Watchlist, Ctx::Detail];
 const I: &[Ctx] = &[Ctx::InPlay];
 const DI: &[Ctx] = &[Ctx::Detail, Ctx::InPlay];
 const WDI: &[Ctx] = &[Ctx::Watchlist, Ctx::Detail, Ctx::InPlay];
+const WI: &[Ctx] = &[Ctx::Watchlist, Ctx::InPlay];
 
 const fn bare(keys: &'static [K], cmd: Cmd, label: &'static str, ctx: &'static [Ctx]) -> Binding {
     Binding {
@@ -243,6 +245,13 @@ pub static BINDINGS: &[Binding] = &[
     pre('g', &[K::Number], Cmd::GoRow, "row n (then g)", W),
     pre('g', &[K::Char('w')], Cmd::GoWatchlist, "watchlist", DI),
     pre('g', &[K::Char('i')], Cmd::GoInPlay, "in play today", WD),
+    pre(
+        'g',
+        &[K::Char('f')],
+        Cmd::Find,
+        "find in list (filter, enter jumps)",
+        WI,
+    ),
     // ── w: watchlist ──
     pre('w', &[K::Char('a')], Cmd::WatchAdd, "add this symbol", D),
     pre('w', &[K::Char('a')], Cmd::WatchAdd, "add (search)", W),

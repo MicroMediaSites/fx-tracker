@@ -206,6 +206,26 @@ fn footer_hints(ctx: Ctx) -> String {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    if let Some(f) = &app.find {
+        let n = app.find_matches().len();
+        let line = Line::from(vec![
+            Span::styled(
+                "find ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(f.query.clone()),
+            Span::styled("▏", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!(
+                    "  {n} match{} · ↑↓ pick · enter jump · esc cancel",
+                    if n == 1 { "" } else { "es" }
+                ),
+                Style::default().fg(DIM),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     // A chord in progress wins over everything else.
     if let Some(p) = &app.pending {
         let hint = match &p.digits {
@@ -335,7 +355,16 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
         &["LAST", "CHG", "CHG%", "DAY RANGE", "VOLUME"],
         &["TODAY"],
     );
-    let rows = app.watchlist.iter().map(|sym| {
+    // While `g f` is active only matching rows show.
+    let shown: Vec<&String> = match &app.find {
+        Some(_) => app
+            .find_matches()
+            .into_iter()
+            .map(|i| &app.watchlist[i])
+            .collect(),
+        None => app.watchlist.iter().collect(),
+    };
+    let rows = shown.into_iter().map(|sym| {
         let snap = app.snapshots.get(sym);
         let (last, chg, pct, color) = quote_cells(snap);
         let name = app
@@ -383,7 +412,8 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
         .block(block)
         .column_spacing(2)
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    let mut state = TableState::default().with_selected(Some(app.selected));
+    let sel = app.find.as_ref().map_or(app.selected, |f| f.selected);
+    let mut state = TableState::default().with_selected(Some(sel));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -465,7 +495,13 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
         .split(inner);
     frame.render_widget(Paragraph::new(header), parts[0]);
 
-    let rows_vis = ip.visible();
+    let rows_vis: Vec<&inplay::Row> = match &app.find {
+        Some(_) => {
+            let all = ip.visible();
+            app.find_matches().into_iter().map(|i| all[i]).collect()
+        }
+        None => ip.visible(),
+    };
     if rows_vis.is_empty() {
         let msg = if ip.loading {
             "scanning movers, most active and your watchlist…"
@@ -544,7 +580,8 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
                     .bg(Color::Rgb(44, 52, 66))
                     .add_modifier(Modifier::BOLD),
             );
-        let mut state = TableState::default().with_selected(Some(ip.selected));
+        let sel = app.find.as_ref().map_or(ip.selected, |f| f.selected);
+        let mut state = TableState::default().with_selected(Some(sel));
         frame.render_stateful_widget(table, parts[1], &mut state);
     }
 
@@ -1757,6 +1794,18 @@ mod tests {
                 url: Some("https://www.benzinga.com/news/1".into()),
             }]),
         );
+    }
+
+    #[test]
+    fn find_shows_only_matches_and_a_prompt() {
+        let mut app = sample_app();
+        sample_inplay(&mut app);
+        for c in ['g', 'f', 'w', 'd'] {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let t = draw(&app, 150, 20);
+        assert!(t.contains("find wd") && t.contains("1 match"), "{t}");
+        assert!(t.contains("WDAY") && !t.contains("NVDA "), "{t}");
     }
 
     #[test]

@@ -44,6 +44,9 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   list, `h`/`l` move left and right (the chart cursor, or between the in-play
   list and its headlines), and shifted letters take bigger steps (`J`/`K` a
   page, `H`/`L` half a chart screen).
+- **Find** (`g f`): on any list, type to filter by ticker or company name
+  (case-insensitive). `↑`/`↓` pick among the matches, `enter` jumps the
+  cursor to that line in the full list, and `esc` cancels.
 - **Keys** are Helix-style. Bare keys move (`j`/`k`, arrows), open (`enter`),
   back out (`esc`), search (`/`), refresh (`r`) and quit (`q`). A prefix letter
   opens a category, and a panel lists the next keys:
