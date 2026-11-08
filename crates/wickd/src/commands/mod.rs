@@ -1,6 +1,7 @@
 //! CLI subcommands. One module per verb, plus a shared client resolver.
 
 pub mod alert;
+pub mod alpaca;
 pub mod approve;
 pub mod audit;
 pub mod backtest;
@@ -18,6 +19,7 @@ pub mod scripted;
 pub mod strategy;
 pub mod stream;
 pub mod trade;
+pub mod tui;
 pub mod view;
 pub mod walk_forward;
 pub mod watch;

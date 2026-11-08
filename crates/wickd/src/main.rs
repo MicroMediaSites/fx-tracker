@@ -18,6 +18,7 @@
 //!   stream       live prices → JSON-lines (coming next)
 
 mod alert;
+mod alpaca_creds;
 /// Shim: the durable alert queue moved to wickd-core (AGT-652) so the desktop
 /// app reads the same store. Same paths, same wire format.
 mod alert_queue {
@@ -53,12 +54,14 @@ mod spread_stats;
 mod stream_hub {
     pub use wickd_core::stream_hub::*;
 }
+mod tui;
 mod vault_store;
 mod watchlist;
 
 use clap::{Parser, Subcommand};
 
 use commands::alert::AlertArgs;
+use commands::alpaca::AlpacaArgs;
 use commands::approve::ApproveArgs;
 use commands::audit::AuditArgs;
 use commands::backtest::BacktestArgs;
@@ -74,6 +77,7 @@ use commands::queue::QueueArgs;
 use commands::strategy::StrategyArgs;
 use commands::stream::StreamArgs;
 use commands::trade::TradeArgs;
+use commands::tui::TuiArgs;
 use commands::view::ViewArgs;
 use commands::watch::WatchArgs;
 use output::Out;
@@ -109,6 +113,10 @@ enum Command {
     Stream(StreamArgs),
     /// Live terminal watchlist (bid/ask/spread) over a running `wickd stream`.
     Dashboard(DashboardArgs),
+    /// Stock ticker TUI: watchlist, symbol search, price-history drill-down (Alpaca data).
+    Tui(TuiArgs),
+    /// Alpaca market-data keys for `wickd tui`: login | status | logout.
+    Alpaca(AlpacaArgs),
     /// List built-in strategies, or run one over candles → JSON signals.
     Strategy(StrategyArgs),
     /// Backtest a strategy over historical candles → JSON metrics + trades.
@@ -161,6 +169,8 @@ async fn main() {
         Command::Trade(args) => commands::trade::run(args, out).await,
         Command::Stream(args) => commands::stream::run(args, out).await,
         Command::Dashboard(args) => commands::dashboard::run(args, out).await,
+        Command::Tui(args) => commands::tui::run(args, out).await,
+        Command::Alpaca(args) => commands::alpaca::run(args, out).await,
         Command::Strategy(args) => commands::strategy::run(args, out).await,
         Command::Backtest(args) => commands::backtest::run(args, out).await,
         Command::Books(args) => commands::books::run(args, out).await,

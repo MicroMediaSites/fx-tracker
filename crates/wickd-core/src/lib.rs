@@ -12,6 +12,7 @@ pub mod backtest;
 pub mod calendar_store;
 pub mod config;
 pub mod crypto;
+pub mod equities;
 pub mod error;
 pub mod event_sink;
 pub mod events;

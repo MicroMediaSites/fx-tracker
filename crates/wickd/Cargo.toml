@@ -56,3 +56,7 @@ flate2 = "1"
 # ratatui 0.29 re-exports crossterm 0.28, so the versions stay in lockstep.
 ratatui = "0.29"
 crossterm = "0.28"
+
+[dev-dependencies]
+# Temp data homes for the `wickd tui` store tests.
+tempfile = "3"
