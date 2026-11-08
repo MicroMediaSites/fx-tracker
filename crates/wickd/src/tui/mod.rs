@@ -76,6 +76,14 @@ enum Reply {
     News(String, Result<Vec<NewsItem>, String>),
 }
 
+/// Headline lookback, shared by the list's NEWS column and the side pane so
+/// the two agree.
+pub const NEWS_DAYS: i64 = 4;
+/// How many of the biggest movers get a NEWS age on each rebuild.
+const NEWS_SYMBOLS: usize = 60;
+/// Symbols per news request (each request caps at 50 articles total).
+const NEWS_GROUP: usize = 10;
+
 /// Build the in-play list: movers + most-actives + watchlist, enriched with
 /// snapshots, 20-day volume averages (same feed as the snapshots) and recent
 /// headlines. Screener/news failures degrade to notes; a snapshot failure
@@ -118,17 +126,32 @@ async fn build_inplay(
     // Headlines for the biggest movers (one request).
     let mut rows = inplay::build_rows(&universe, &snapshots, &daily, &[], now);
     inplay::sort_rows(&mut rows, inplay::SortBy::Change);
-    let top: Vec<String> = rows.iter().take(40).map(|r| r.symbol.clone()).collect();
-    let news = match client
-        .news(&top, now - chrono::Duration::hours(36), 50)
-        .await
-    {
-        Ok(n) => n,
-        Err(e) => {
-            notes.push(format!("news unavailable: {}", err_string(e)));
-            Vec::new()
+    // One request returns at most 50 articles *in total*, newest first, so a
+    // few heavily covered names would starve the rest. Ask in groups of
+    // NEWS_GROUP symbols, concurrently, so every name gets its share.
+    let top: Vec<String> = rows
+        .iter()
+        .take(NEWS_SYMBOLS)
+        .map(|r| r.symbol.clone())
+        .collect();
+    let since = now - chrono::Duration::days(NEWS_DAYS);
+    let mut set = tokio::task::JoinSet::new();
+    for group in top.chunks(NEWS_GROUP) {
+        let (client, group) = (client.clone(), group.to_vec());
+        set.spawn(async move { client.news(&group, since, 50).await });
+    }
+    let mut news = Vec::new();
+    let mut news_err = None;
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(Ok(mut n)) => news.append(&mut n),
+            Ok(Err(e)) => news_err = Some(err_string(e)),
+            Err(e) => news_err = Some(e.to_string()),
         }
-    };
+    }
+    if let Some(e) = news_err {
+        notes.push(format!("news partly unavailable: {e}"));
+    }
     Ok((
         inplay::build_rows(&universe, &snapshots, &daily, &news, now),
         notes,
@@ -209,7 +232,7 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                         Reply::InPlay(build_inplay(&client, &watchlist).await)
                     }
                     Request::News(sym) => {
-                        let since = Utc::now() - chrono::Duration::days(4);
+                        let since = Utc::now() - chrono::Duration::days(NEWS_DAYS);
                         let r = client
                             .news(std::slice::from_ref(&sym), since, 15)
                             .await

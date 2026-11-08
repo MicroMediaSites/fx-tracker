@@ -428,6 +428,15 @@ impl App {
 
     pub fn set_news(&mut self, symbol: String, result: Result<Vec<NewsItem>, String>) {
         self.inplay.news_pending.retain(|s| *s != symbol);
+        // The pane's per-symbol fetch is authoritative: fold it into the
+        // row's NEWS column so the list and the pane never disagree.
+        if let Ok(items) = &result {
+            if let Some(row) = self.inplay.rows.iter_mut().find(|r| r.symbol == symbol) {
+                let latest = items.iter().map(|n| n.created_at).max();
+                row.latest_news = row.latest_news.max(latest);
+                row.news_count = row.news_count.max(items.len());
+            }
+        }
         self.inplay.news.insert(symbol, result);
     }
 
@@ -1144,6 +1153,32 @@ mod tests {
         // esc from in play returns to the watchlist.
         a.on_key(key(KeyCode::Esc));
         assert_eq!(a.mode, Mode::Watchlist);
+    }
+
+    #[test]
+    fn pane_headlines_fill_the_rows_news_column() {
+        let mut a = app();
+        typ(&mut a, "gi");
+        a.set_inplay(Ok((vec![ip_row("A", 9.0, 10.0, 1.0)], vec![])));
+        assert_eq!(a.inplay.rows[0].latest_news, None);
+        let t: chrono::DateTime<chrono::Utc> = "2026-11-06T12:00:00Z".parse().unwrap();
+        let item = |id, t| NewsItem {
+            id,
+            headline: "h".into(),
+            summary: String::new(),
+            created_at: t,
+            symbols: vec!["A".into()],
+            source: "benzinga".into(),
+        };
+        a.set_news(
+            "A".into(),
+            Ok(vec![item(1, t), item(2, t - chrono::Duration::hours(5))]),
+        );
+        assert_eq!(a.inplay.rows[0].latest_news, Some(t));
+        assert_eq!(a.inplay.rows[0].news_count, 2);
+        // An error leaves the column alone.
+        a.set_news("A".into(), Err("x".into()));
+        assert_eq!(a.inplay.rows[0].latest_news, Some(t));
     }
 
     #[test]

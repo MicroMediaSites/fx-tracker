@@ -539,7 +539,11 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
         let table = Table::new(rows, widths)
             .header(head)
             .column_spacing(1)
-            .row_highlight_style(Style::default().bg(Color::Rgb(44, 52, 66)).add_modifier(Modifier::BOLD));
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(44, 52, 66))
+                    .add_modifier(Modifier::BOLD),
+            );
         let mut state = TableState::default().with_selected(Some(ip.selected));
         frame.render_stateful_widget(table, parts[1], &mut state);
     }
