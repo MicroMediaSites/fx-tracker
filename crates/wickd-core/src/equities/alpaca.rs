@@ -62,6 +62,15 @@ pub enum QuoteFeed {
 }
 
 impl QuoteFeed {
+    /// Short label for UIs.
+    pub fn display_label(self) -> &'static str {
+        match self {
+            QuoteFeed::Iex => "IEX",
+            QuoteFeed::Sip => "SIP",
+            QuoteFeed::DelayedSip => "SIP 15m delayed",
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             QuoteFeed::Iex => "iex",
@@ -247,7 +256,10 @@ impl AlpacaClient {
                 None => return Ok(out),
             }
         }
-        Ok(out)
+        // Never hand back silently truncated history.
+        Err(AlpacaError::Decode(format!(
+            "bars pagination exceeded {MAX_PAGES} pages; narrow the range"
+        )))
     }
 
     /// History for one symbol over a [`HistoryRange`], trimmed to the range's

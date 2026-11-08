@@ -379,6 +379,19 @@ impl App {
         self.request_history(range)
     }
 
+    /// Background refresh of the current range: keeps the cached bars on
+    /// screen while the request is in flight (the reply replaces them), so a
+    /// live 1D chart doesn't flash "loading" every minute.
+    pub fn refresh_history(&mut self) -> Option<Action> {
+        let d = self.detail.as_mut()?;
+        let range = d.range;
+        if d.loading.contains(&range) {
+            return None;
+        }
+        d.loading.push(range);
+        Some(Action::FetchHistory(d.symbol.clone(), range))
+    }
+
     fn set_range(&mut self, range: HistoryRange) -> Vec<Action> {
         if let Some(d) = self.detail.as_mut() {
             d.range = range;
@@ -624,6 +637,33 @@ mod tests {
                 Action::RefreshQuotes
             ]
         );
+    }
+
+    #[test]
+    fn background_refresh_keeps_bars_on_screen() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Enter)); // SPY, 1D requested
+        let one = Bar {
+            time: "2026-11-06T15:00:00Z".parse().unwrap(),
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 1.0,
+            vwap: None,
+        };
+        a.set_history("SPY", HistoryRange::Day1, Ok(vec![one.clone()]));
+        assert_eq!(
+            a.refresh_history(),
+            Some(Action::FetchHistory("SPY".into(), HistoryRange::Day1))
+        );
+        let d = a.detail.as_ref().unwrap();
+        assert!(d.is_loading());
+        assert_eq!(d.bars().unwrap().len(), 1, "cached bars stay visible");
+        // A second tick while in flight doesn't stack requests.
+        assert!(a.refresh_history().is_none());
+        a.set_history("SPY", HistoryRange::Day1, Ok(vec![one.clone(), one]));
+        assert_eq!(a.detail.as_ref().unwrap().bars().unwrap().len(), 2);
     }
 
     #[test]

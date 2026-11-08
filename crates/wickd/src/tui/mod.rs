@@ -202,11 +202,7 @@ impl Every {
 /// Run the TUI until the user quits. Must be called from within a tokio
 /// runtime (the worker is spawned onto it).
 pub async fn run(client: AlpacaClient, watchlist: Vec<String>, opts: Options) -> Result<()> {
-    let feed_label = match client.feed() {
-        wickd_core::equities::alpaca::QuoteFeed::Iex => "IEX",
-        wickd_core::equities::alpaca::QuoteFeed::Sip => "SIP",
-        wickd_core::equities::alpaca::QuoteFeed::DelayedSip => "SIP 15m delayed",
-    };
+    let feed_label = client.feed().display_label();
     let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
     let requests = spawn_worker(client, reply_tx);
     let app = App::new(watchlist, feed_label);
@@ -296,7 +292,7 @@ fn run_loop(
             if intraday.due() && open {
                 if let Some(d) = &app.detail {
                     if d.range == HistoryRange::Day1 && d.bars().is_some() {
-                        if let Some(Action::FetchHistory(s, r)) = app.reload_history() {
+                        if let Some(Action::FetchHistory(s, r)) = app.refresh_history() {
                             send(Request::History(s, r));
                         }
                     }

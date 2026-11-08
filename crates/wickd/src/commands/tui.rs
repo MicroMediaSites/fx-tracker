@@ -6,9 +6,9 @@
 //!   wickd tui --feed sip        # consolidated real-time quotes (paid plan)
 //!   wickd tui --refresh 5       # poll quotes every 5s
 //!
-//! The watchlist lives in `~/.wickd/tui.json`. This is the one interactive
-//! (non-JSON) verb; startup errors still come back as the usual JSON error
-//! envelope so agents can branch on them.
+//! The watchlist lives in `~/.wickd/tui.json`. Like `dashboard`, this is an
+//! interactive (non-JSON) verb; startup errors still come back as the usual
+//! JSON error envelope so agents can branch on them.
 
 use std::time::Duration;
 

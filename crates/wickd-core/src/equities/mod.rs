@@ -5,6 +5,11 @@
 //! `f64` on purpose — nothing here feeds the order path or a P&L ledger (those
 //! stay on `rust_decimal`), and charting wants floats anyway.
 //!
+//! **Do not reuse these types for strategy evaluation, backtests or
+//! execution.** If equities ever feed a money path, convert to `Decimal` at
+//! that boundary (or add separate domain types) — and any equities *trading*
+//! is its own explicit operator decision, not an extension of this client.
+//!
 //! The only provider today is Alpaca's market-data API ([`alpaca`]). The types
 //! below are provider-neutral so a second source can slot in behind the same
 //! shapes later.

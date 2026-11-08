@@ -31,8 +31,8 @@ feature — meant to be followed together by you and an agent.
 ## `wickd tui` — stock ticker
 
 An interactive terminal ticker for US stocks and ETFs, backed by Alpaca's
-market-data API. It is the one non-JSON verb. It is read-only: it never places
-orders.
+market-data API. Like `dashboard`, it is interactive rather than JSON. It is
+read-only: it never places orders.
 
 ```
 wickd alpaca login     # once: key id + secret from a free Alpaca paper account
