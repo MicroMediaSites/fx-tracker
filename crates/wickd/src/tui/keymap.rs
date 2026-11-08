@@ -3,7 +3,7 @@
 //! Bare keys do the everyday things: move, open, back, search, quit. A
 //! letter *prefix* opens a category, and the next key picks the action:
 //!
-//!   g  go to       g g top · g e end · g w watchlist · g <n> g row n
+//!   g  go to       g g top · g e end · g w watchlist · g i in play · g <n> g row n
 //!   w  watchlist   w a add · w d remove · w u undo · w j / w k move
 //!   t  time range  t d 1D · t w 5D · t m 1M · t 6 6M · t y 1Y · t 5 5Y · t a MAX
 //!   v  view        v c candles · v l line · v t table · v e extended hours
@@ -26,6 +26,7 @@ use wickd_core::equities::HistoryRange;
 pub enum Ctx {
     Watchlist,
     Detail,
+    InPlay,
 }
 
 /// What a key does.
@@ -58,6 +59,11 @@ pub enum Cmd {
     /// `g <n> g`: 1-based row (the number arrives with the step).
     GoRow,
     GoWatchlist,
+    GoInPlay,
+    SortChange,
+    SortRelVolume,
+    SortVolume,
+    TogglePriceFilter,
     WatchAdd,
     WatchRemove,
     WatchUndo,
@@ -148,6 +154,10 @@ pub const PREFIXES: [(char, &str); 4] = [
 const W: &[Ctx] = &[Ctx::Watchlist];
 const D: &[Ctx] = &[Ctx::Detail];
 const WD: &[Ctx] = &[Ctx::Watchlist, Ctx::Detail];
+const I: &[Ctx] = &[Ctx::InPlay];
+const WI: &[Ctx] = &[Ctx::Watchlist, Ctx::InPlay];
+const DI: &[Ctx] = &[Ctx::Detail, Ctx::InPlay];
+const WDI: &[Ctx] = &[Ctx::Watchlist, Ctx::Detail, Ctx::InPlay];
 
 const fn bare(keys: &'static [K], cmd: Cmd, label: &'static str, ctx: &'static [Ctx]) -> Binding {
     Binding {
@@ -178,15 +188,15 @@ const fn pre(
 /// Every binding. Order is display order within a group.
 pub static BINDINGS: &[Binding] = &[
     // ── bare ──
-    bare(&[K::Down, K::Char('j')], Cmd::Down, "down", WD),
-    bare(&[K::Up, K::Char('k')], Cmd::Up, "up", WD),
+    bare(&[K::Down, K::Char('j')], Cmd::Down, "down", WDI),
+    bare(&[K::Up, K::Char('k')], Cmd::Up, "up", WDI),
     bare(&[K::PageDown], Cmd::PageDown, "page down", D),
     bare(&[K::PageUp], Cmd::PageUp, "page up", D),
     bare(
         &[K::Enter, K::Right, K::Char('l')],
         Cmd::Open,
         "open symbol",
-        W,
+        WI,
     ),
     bare(&[K::Left, K::Char('h')], Cmd::CursorLeft, "cursor ←", D),
     bare(&[K::Right, K::Char('l')], Cmd::CursorRight, "cursor →", D),
@@ -205,20 +215,22 @@ pub static BINDINGS: &[Binding] = &[
     bare(&[K::Char('6')], Cmd::Range(HistoryRange::Year5), "5Y", D),
     bare(&[K::Char('7')], Cmd::Range(HistoryRange::Max), "MAX", D),
     bare(&[K::Tab], Cmd::ToggleView, "chart ↔ table", D),
-    bare(&[K::Char('/')], Cmd::Search, "search", WD),
-    bare(&[K::Char('r')], Cmd::Refresh, "refresh", WD),
-    bare(&[K::Esc, K::Char('q'), K::Backspace], Cmd::Back, "back", D),
-    bare(&[K::Char('?')], Cmd::Help, "help", WD),
+    bare(&[K::Char('/')], Cmd::Search, "search", WDI),
+    bare(&[K::Char('r')], Cmd::Refresh, "refresh", WDI),
+    bare(&[K::Esc, K::Char('q'), K::Backspace], Cmd::Back, "back", DI),
+    bare(&[K::Char('?')], Cmd::Help, "help", WDI),
     bare(&[K::Char('q')], Cmd::Quit, "quit", W),
     // ── g: go to ──
-    pre('g', &[K::Char('g')], Cmd::GoTop, "top", WD),
-    pre('g', &[K::Char('e')], Cmd::GoEnd, "end", WD),
+    pre('g', &[K::Char('g')], Cmd::GoTop, "top", WDI),
+    pre('g', &[K::Char('e')], Cmd::GoEnd, "end", WDI),
     pre('g', &[K::Number], Cmd::GoRow, "row n (then g)", W),
-    pre('g', &[K::Char('w')], Cmd::GoWatchlist, "watchlist", D),
+    pre('g', &[K::Char('w')], Cmd::GoWatchlist, "watchlist", DI),
+    pre('g', &[K::Char('i')], Cmd::GoInPlay, "in play today", WD),
     // ── w: watchlist ──
     pre('w', &[K::Char('a')], Cmd::WatchAdd, "add this symbol", D),
     pre('w', &[K::Char('a')], Cmd::WatchAdd, "add (search)", W),
-    pre('w', &[K::Char('d')], Cmd::WatchRemove, "remove", WD),
+    pre('w', &[K::Char('a')], Cmd::WatchAdd, "add to watchlist", I),
+    pre('w', &[K::Char('d')], Cmd::WatchRemove, "remove", WDI),
     pre('w', &[K::Char('u')], Cmd::WatchUndo, "undo remove", W),
     pre('w', &[K::Char('j')], Cmd::WatchMoveDown, "move down", W),
     pre('w', &[K::Char('k')], Cmd::WatchMoveUp, "move up", W),
@@ -281,6 +293,34 @@ pub static BINDINGS: &[Binding] = &[
         Cmd::ToggleExtended,
         "extended hours",
         D,
+    ),
+    pre(
+        'v',
+        &[K::Char('c')],
+        Cmd::SortChange,
+        "sort: biggest move",
+        I,
+    ),
+    pre(
+        'v',
+        &[K::Char('r')],
+        Cmd::SortRelVolume,
+        "sort: relative volume",
+        I,
+    ),
+    pre(
+        'v',
+        &[K::Char('a')],
+        Cmd::SortVolume,
+        "sort: most active",
+        I,
+    ),
+    pre(
+        'v',
+        &[K::Char('f')],
+        Cmd::TogglePriceFilter,
+        "price ≥ $5 filter",
+        I,
     ),
     pre('v', &[K::Char('t')], Cmd::ViewTable, "price table", D),
 ];
@@ -602,11 +642,18 @@ mod tests {
                 .collect::<String>(),
             "gwtv"
         );
+        assert_eq!(
+            prefixes_in(Ctx::InPlay)
+                .iter()
+                .map(|p| p.0)
+                .collect::<String>(),
+            "gwv"
+        );
     }
 
     #[test]
     fn no_key_is_bound_twice_in_one_place() {
-        for ctx in [Ctx::Watchlist, Ctx::Detail] {
+        for ctx in [Ctx::Watchlist, Ctx::Detail, Ctx::InPlay] {
             let mut seen: Vec<(Option<char>, K)> = Vec::new();
             for b in BINDINGS.iter().filter(|b| in_ctx(b, ctx)) {
                 for k in b.keys {
