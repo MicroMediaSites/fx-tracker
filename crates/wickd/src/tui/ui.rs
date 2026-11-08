@@ -15,6 +15,7 @@ use ratatui::Frame;
 use wickd_core::equities::{Bar, HistoryRange, Snapshot};
 
 use super::app::{App, DetailState, DetailView, Mode};
+use super::candles::{self, CandleChart};
 use super::keymap::{self, Ctx, Entry};
 
 const UP: Color = Color::Green;
@@ -584,7 +585,8 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, d: &DetailState) {
             );
         }
         Some(bars) => match d.view {
-            DetailView::Chart => render_chart(frame, body, d.range, bars, snap),
+            DetailView::Candles => render_candles(frame, body, d.range, bars, snap),
+            DetailView::Line => render_chart(frame, body, d.range, bars, snap),
             DetailView::Table => render_bar_table(frame, body, d.range, bars, d.scroll),
         },
     }
@@ -671,6 +673,50 @@ fn bar_time_label(range: HistoryRange, t: DateTime<Utc>) -> String {
     }
 }
 
+fn render_candles(
+    frame: &mut Frame,
+    area: Rect,
+    range: HistoryRange,
+    bars: &[Bar],
+    snap: Option<&Snapshot>,
+) {
+    let reference = (range == HistoryRange::Day1)
+        .then(|| snap.and_then(Snapshot::prev_close))
+        .flatten();
+    let block = Block::default().borders(Borders::ALL);
+    let inner = block.inner(area);
+    let k = candles::bars_per_candle(bars, reference, inner.width, fmt_price);
+    let mut title = format!(" candles · {}", range.timeframe());
+    if k > 1 {
+        title.push_str(&format!(" × {k}"));
+    }
+    if let Some(p) = reference {
+        title.push_str(&format!(" · prev close {}", fmt_price(p)));
+    }
+    title.push(' ');
+    frame.render_widget(
+        block.title(Span::styled(title, Style::default().fg(DIM))),
+        area,
+    );
+    let label = |i: usize| {
+        bars.get(i)
+            .map(|b| bar_time_label(range, b.time))
+            .unwrap_or_default()
+    };
+    frame.render_widget(
+        CandleChart {
+            bars,
+            reference,
+            fmt_price,
+            time_label: &label,
+            up: UP,
+            down: DOWN,
+            dim: DIM,
+        },
+        inner,
+    );
+}
+
 fn render_chart(
     frame: &mut Frame,
     area: Rect,
@@ -745,8 +791,8 @@ fn render_chart(
         .collect();
 
     let title = match prev_close {
-        Some(p) => format!(" close · prev close {} ", fmt_price(p)),
-        None => " close ".to_string(),
+        Some(p) => format!(" line · prev close {} ", fmt_price(p)),
+        None => " line · close ".to_string(),
     };
     let chart = Chart::new(datasets)
         .block(
@@ -1029,7 +1075,9 @@ mod tests {
         app.set_history("NVDA", HistoryRange::Day1, Ok(bars));
         let chart = draw(&app, 120, 24);
         assert!(
-            chart.contains("prev close 182.00") && chart.contains("1 1D"),
+            chart.contains("candles · 5Min · prev close 182.00")
+                && chart.contains("1 1D")
+                && chart.contains("vol"),
             "{chart}"
         );
         if std::env::var("WICKD_TUI_DUMP").is_ok() {
@@ -1089,6 +1137,52 @@ mod tests {
         press(&mut app, KeyCode::Char('1'));
         let g = draw(&app, 100, 12);
         assert!(g.contains("g 1") && g.contains("then g or enter"), "{g}");
+    }
+
+    /// A wiggly random-walk session: mixed up/down candles of varying size
+    /// and volume, so the candle view is exercised like real data.
+    fn walk(n: usize, start: f64) -> Vec<Bar> {
+        let mut price = start;
+        (0..n)
+            .map(|i| {
+                let f = i as f64;
+                let open = price;
+                let close = open + (f * 0.7).sin() * 0.6 + (f * 0.13).cos() * 0.25;
+                price = close;
+                Bar {
+                    time: chrono::Utc::now() - chrono::Duration::minutes(5 * (n - i) as i64),
+                    open,
+                    high: open.max(close) + 0.15 + (f * 1.3).sin().abs() * 0.3,
+                    low: open.min(close) - 0.15 - (f * 0.9).cos().abs() * 0.3,
+                    close,
+                    volume: 1e5 * (1.0 + (f * 0.37).sin().abs() * 4.0),
+                    vwap: None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn candles_are_default_and_line_and_table_switch() {
+        let mut app = sample_app();
+        press(&mut app, KeyCode::Enter); // SPY
+        app.set_history("SPY", HistoryRange::Day1, Ok(walk(78, 684.0)));
+        let c = draw(&app, 120, 26);
+        assert!(c.contains("candles · 5Min") && c.contains("vol"), "{c}");
+        if std::env::var("WICKD_TUI_DUMP").is_ok() {
+            println!("{c}\n");
+        }
+        // Many bars on a narrow screen are merged, and the title says so.
+        press(&mut app, KeyCode::Char('6'));
+        app.set_history("SPY", HistoryRange::Year5, Ok(walk(260, 400.0)));
+        let y5 = draw(&app, 90, 20);
+        assert!(y5.contains("candles · 1Week × 4"), "{y5}");
+        if std::env::var("WICKD_TUI_DUMP").is_ok() {
+            println!("{y5}\n");
+        }
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('l'));
+        assert!(draw(&app, 90, 20).contains("line · close"));
     }
 
     #[test]
