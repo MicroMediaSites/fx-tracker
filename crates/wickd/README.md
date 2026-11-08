@@ -40,14 +40,26 @@ wickd tui              # IEX real-time quotes (free plan)
 wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 ```
 
+- **Keys** are Helix-style. Bare keys move (`j`/`k`, arrows), open (`enter`),
+  back out (`esc`), search (`/`), refresh (`r`) and quit (`q`). A prefix letter
+  opens a category, and a panel lists the next keys:
+  - `g` go to: `g g` top, `g e` end, `g <n> g` row n, `g w` watchlist.
+  - `w` watchlist: `w a` add, `w d` remove, `w u` undo, `w j`/`w k` move.
+  - `t` time range: `t d`/`t w`/`t m`/`t 6`/`t y`/`t 5`/`t a` for
+    1D/5D/1M/6M/1Y/5Y/MAX.
+  - `v` view: `v c` chart, `v t` price table.
+
+  `esc` cancels a pending prefix, and `?` lists every key. The help screen,
+  the footer and the panel are all generated from the one keymap table
+  (`src/tui/keymap.rs`).
 - **Watchlist** (`~/.wickd/tui.json`). Shows last, change vs the prior session
-  close, day range, volume and a sparkline of today. `/` searches, `d` removes
-  (`u` undoes), `J`/`K` reorders, and `enter` opens a symbol.
+  close, day range, volume and a sparkline of today.
 - **Search**. Matches ticker or company name over Alpaca's active-equity list,
   cached daily in `~/.wickd/cache/alpaca-assets.json`. `tab` adds or removes a
   symbol, `enter` opens it.
-- **Symbol view**. `1`–`7` pick 1D/5D/1M/6M/1Y/5Y/MAX, and `t` flips between
-  the chart and a newest-first OHLCV table. The 1D chart marks the prior close.
+- **Symbol view**. A chart or a newest-first OHLCV table (`tab` flips between
+  them), over 1D to MAX (`1`–`7` are shortcuts for the ranges). The 1D chart
+  marks the prior close.
 - **Data**. Quotes poll every 15s (`--refresh`). On the free plan, live quotes
   are IEX-only (about 3% of volume). `--feed delayed-sip` trades that for
   all-exchange quotes 15 minutes behind. History is always consolidated and

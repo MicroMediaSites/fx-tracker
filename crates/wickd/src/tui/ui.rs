@@ -15,6 +15,7 @@ use ratatui::Frame;
 use wickd_core::equities::{Bar, HistoryRange, Snapshot};
 
 use super::app::{App, DetailState, DetailView, Mode};
+use super::keymap::{self, Ctx, Entry};
 
 const UP: Color = Color::Green;
 const DOWN: Color = Color::Red;
@@ -137,6 +138,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         },
     }
     render_footer(frame, chunks[2], app);
+    if let (Some(p), Some(ctx)) = (&app.pending, app.ctx()) {
+        render_key_panel(frame, chunks[1], ctx, p);
+    }
     if app.show_help {
         render_help(frame, frame.area());
     }
@@ -182,15 +186,44 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// The footer's hint line for a screen, generated from the keymap: the
+/// prefix categories first (they hold most commands), then the bare keys
+/// that aren't plain movement.
+fn footer_hints(ctx: Ctx) -> String {
+    let mut parts: Vec<String> = keymap::prefixes_in(ctx)
+        .into_iter()
+        .map(|(p, name)| format!("{p} {name}…"))
+        .collect();
+    for e in keymap::bare_entries(ctx) {
+        let first = e.keys.split(' ').next().unwrap_or("");
+        if matches!(first, "↓" | "↑" | "←" | "→" | "pgdn" | "pgup") {
+            continue;
+        }
+        parts.push(format!("{first} {}", e.label));
+    }
+    parts.join(" · ")
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let hints = match app.mode {
-        Mode::Watchlist => {
-            "enter open · / search · d remove · J/K move · r refresh · ? help · q quit"
-        }
-        Mode::Search => "type to search · ↑↓ select · enter open · tab add/remove · esc back",
-        Mode::Detail => {
-            "1-7 range · h/l prev/next · t chart/table · a watchlist · r reload · esc back"
-        }
+    // A chord in progress wins over everything else.
+    if let Some(p) = &app.pending {
+        let hint = match &p.digits {
+            Some(_) => "  type a row number, then g or enter · esc cancels".to_string(),
+            None => format!("  {}… · esc cancels", keymap::prefix_name(p.prefix)),
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                keymap::pending_text(p),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(hint, Style::default().fg(DIM)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    let hints = match app.ctx() {
+        Some(ctx) => footer_hints(ctx),
+        None => "type to search · ↑↓ select · enter open · tab add/remove · esc back".to_string(),
     };
     let msg = app
         .flash
@@ -202,6 +235,56 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         None => Line::from(Span::styled(hints, Style::default().fg(DIM))),
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// While a prefix is pending: its second keys, bottom-right of the body.
+fn render_key_panel(frame: &mut Frame, area: Rect, ctx: Ctx, p: &keymap::Pending) {
+    let entries = keymap::prefix_entries(ctx, p.prefix);
+    if entries.is_empty() {
+        return;
+    }
+    let key_w = entries
+        .iter()
+        .map(|e| e.keys.chars().count())
+        .max()
+        .unwrap_or(1);
+    let lines: Vec<Line> = entries
+        .iter()
+        .map(|e| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {:<key_w$}  ", e.keys),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(e.label),
+            ])
+        })
+        .collect();
+    let title = format!(" {} · {} ", p.prefix, keymap::prefix_name(p.prefix));
+    let inner_w = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        .max(title.chars().count());
+    let w = (inner_w as u16 + 3).min(area.width);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w + 2),
+        y: area.y + area.height.saturating_sub(h + 1),
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .title(title),
+        ),
+        rect,
+    );
 }
 
 /// Header row: left-aligned labels, then right-aligned (numeric) labels,
@@ -734,42 +817,63 @@ fn render_bar_table(
 
 // ── help ────────────────────────────────────────────────────────────────────
 
-fn render_help(frame: &mut Frame, area: Rect) {
-    let text = vec![
-        Line::from(Span::styled(
-            "watchlist",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from("  j/k ↑↓   move          enter/l  open symbol"),
-        Line::from("  / or a   search        d        remove (u undo)"),
-        Line::from("  J/K      reorder       r        refresh quotes"),
-        Line::from("  q/esc    quit"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "search",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from("  type     filter by ticker or name"),
-        Line::from("  ↑↓       select        enter    open symbol"),
-        Line::from("  tab      add/remove    esc      back"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "symbol",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from("  1-7      1D 5D 1M 6M 1Y 5Y MAX   h/l  prev/next range"),
-        Line::from("  t/tab    chart ↔ price table     j/k  scroll table"),
-        Line::from("  a        add/remove watchlist    r    reload"),
-        Line::from("  esc/q    back"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "history: consolidated (all exchanges); 15 min behind on the free plan",
+fn help_section(title: &str, ctx: Ctx) -> Vec<Line<'static>> {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let key = Style::default().fg(ACCENT);
+    let row = |k: String, label: &'static str| {
+        Line::from(vec![
+            Span::styled(format!("  {k:<14}"), key),
+            Span::raw(label),
+        ])
+    };
+    let mut out = vec![Line::from(Span::styled(title.to_string(), bold))];
+    for Entry { keys, label } in keymap::bare_entries(ctx) {
+        out.push(row(keys, label));
+    }
+    for (p, name) in keymap::prefixes_in(ctx) {
+        out.push(Line::from(Span::styled(
+            format!("  {p} · {name}"),
             Style::default().fg(DIM),
-        )),
-        Line::from(Span::styled("any key closes", Style::default().fg(DIM))),
-    ];
-    let w = 64.min(area.width.saturating_sub(2));
-    let h = (text.len() as u16 + 2).min(area.height.saturating_sub(2));
+        )));
+        for Entry { keys, label } in keymap::prefix_entries(ctx, p) {
+            out.push(row(format!("{p} {keys}"), label));
+        }
+    }
+    out
+}
+
+fn render_help(frame: &mut Frame, area: Rect) {
+    let mut left = help_section("watchlist", Ctx::Watchlist);
+    left.push(Line::from(""));
+    left.push(Line::from(Span::styled(
+        "search",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    for (k, l) in [
+        ("type", "filter by ticker or name"),
+        ("↑ ↓", "select"),
+        ("enter", "open symbol"),
+        ("tab", "add / remove from watchlist"),
+        ("esc", "back"),
+    ] {
+        left.push(Line::from(vec![
+            Span::styled(format!("  {k:<14}"), Style::default().fg(ACCENT)),
+            Span::raw(l),
+        ]));
+    }
+    let mut right = help_section("symbol", Ctx::Detail);
+    right.push(Line::from(""));
+    right.push(Line::from(Span::styled(
+        "history is all-exchange data, 15 min behind on the free plan",
+        Style::default().fg(DIM),
+    )));
+    right.push(Line::from(Span::styled(
+        "any key closes",
+        Style::default().fg(DIM),
+    )));
+
+    let w = 96.min(area.width.saturating_sub(2));
+    let h = (left.len().max(right.len()) as u16 + 2).min(area.height.saturating_sub(2));
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -777,10 +881,15 @@ fn render_help(frame: &mut Frame, area: Rect) {
         height: h,
     };
     frame.render_widget(Clear, rect);
-    frame.render_widget(
-        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" keys ")),
-        rect,
-    );
+    let block = Block::default().borders(Borders::ALL).title(" keys ");
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(inner);
+    frame.render_widget(Paragraph::new(left), cols[0]);
+    frame.render_widget(Paragraph::new(right), cols[1]);
 }
 
 #[cfg(test)]
@@ -927,7 +1036,7 @@ mod tests {
             println!("{chart}\n");
         }
 
-        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Tab);
         let table = draw(&app, 120, 14);
         assert!(
             table.contains("newest first") && table.contains("188.16"),
@@ -939,7 +1048,47 @@ mod tests {
 
         press(&mut app, KeyCode::Char('?'));
         let help = draw(&app, 120, 30);
-        assert!(help.contains("chart ↔ price table"), "{help}");
+        assert!(
+            help.contains("chart ↔ table") && help.contains("t · time range"),
+            "{help}"
+        );
+        if std::env::var("WICKD_TUI_DUMP").is_ok() {
+            println!("{help}\n");
+        }
+    }
+
+    #[test]
+    fn key_panel_lists_second_keys_while_pending() {
+        let mut app = sample_app();
+        press(&mut app, KeyCode::Char('w'));
+        let wl = draw(&app, 100, 16);
+        assert!(
+            wl.contains("w · watchlist") && wl.contains("move down"),
+            "{wl}"
+        );
+        assert!(wl.contains("watchlist… · esc cancels"), "{wl}");
+        if std::env::var("WICKD_TUI_DUMP").is_ok() {
+            println!("{wl}\n");
+        }
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Enter); // open SPY
+        press(&mut app, KeyCode::Char('t'));
+        let d = draw(&app, 100, 20);
+        assert!(
+            d.contains("t · time range") && d.contains("6 months"),
+            "{d}"
+        );
+        if std::env::var("WICKD_TUI_DUMP").is_ok() {
+            println!("{d}\n");
+        }
+        // g + digits shows the number being typed.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('w')); // back to watchlist
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('1'));
+        let g = draw(&app, 100, 12);
+        assert!(g.contains("g 1") && g.contains("then g or enter"), "{g}");
     }
 
     #[test]

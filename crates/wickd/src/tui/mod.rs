@@ -24,6 +24,7 @@
 //! call per minute, history on demand — well under 10/min at rest.
 
 pub mod app;
+pub mod keymap;
 pub mod search;
 pub mod store;
 pub mod ui;
