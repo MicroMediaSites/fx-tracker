@@ -5,6 +5,7 @@
 //! - [`app`]    — pure state machine (keys → state + [`app::Action`]s)
 //! - [`ui`]     — rendering
 //! - [`search`] — local symbol ranking over the cached asset list
+//! - [`inplay`] — the "in play today" list (movers, actives, rvol, news)
 //! - [`store`]  — watchlist + asset cache under `~/.wickd`
 //! - this file  — terminal lifecycle, the polling schedule, and the async
 //!   fetch worker
@@ -25,6 +26,7 @@
 
 pub mod app;
 pub mod chart;
+pub mod inplay;
 pub mod keymap;
 pub mod search;
 pub mod store;
@@ -46,7 +48,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
-use wickd_core::equities::alpaca::{AlpacaClient, AlpacaError};
+use wickd_core::equities::alpaca::{AlpacaClient, AlpacaError, NewsItem};
 use wickd_core::equities::{Asset, Bar, HistoryRange, MarketClock, Snapshot};
 
 use app::{Action, App, Mode};
@@ -59,6 +61,8 @@ enum Request {
     History(String, HistoryRange),
     Assets,
     Clock,
+    InPlay(Vec<String>),
+    News(String),
 }
 
 /// Results coming back to the run loop.
@@ -68,6 +72,67 @@ enum Reply {
     History(String, HistoryRange, Result<Vec<Bar>, String>),
     Assets(Result<Vec<Asset>, String>),
     Clock(Result<MarketClock, String>),
+    InPlay(Result<(Vec<inplay::Row>, Vec<String>), String>),
+    News(String, Result<Vec<NewsItem>, String>),
+}
+
+/// Build the in-play list: movers + most-actives + watchlist, enriched with
+/// snapshots, 20-day volume averages (same feed as the snapshots) and recent
+/// headlines. Screener/news failures degrade to notes; a snapshot failure
+/// fails the whole refresh.
+async fn build_inplay(
+    client: &AlpacaClient,
+    watchlist: &[String],
+) -> Result<(Vec<inplay::Row>, Vec<String>), String> {
+    let now = Utc::now();
+    let mut notes = Vec::new();
+    let (movers, actives) = tokio::join!(client.movers(50), client.most_actives(50));
+    let movers = movers
+        .map_err(|e| notes.push(format!("top movers unavailable: {}", err_string(e))))
+        .ok();
+    let actives = actives
+        .map_err(|e| notes.push(format!("most active unavailable: {}", err_string(e))))
+        .unwrap_or_default();
+    let universe = inplay::universe(movers.as_ref(), &actives, watchlist);
+    let symbols: Vec<String> = universe.iter().map(|(s, _)| s.clone()).collect();
+
+    let mut snapshots = HashMap::new();
+    let mut daily = HashMap::new();
+    for chunk in symbols.chunks(100) {
+        let (snaps, bars) = tokio::join!(
+            client.snapshots(chunk),
+            client.bars_on(
+                chunk,
+                "1Day",
+                now - chrono::Duration::days(40),
+                client.volume_feed()
+            )
+        );
+        snapshots.extend(snaps.map_err(err_string)?);
+        match bars {
+            Ok(b) => daily.extend(b),
+            Err(e) => notes.push(format!("volume history unavailable: {}", err_string(e))),
+        }
+    }
+
+    // Headlines for the biggest movers (one request).
+    let mut rows = inplay::build_rows(&universe, &snapshots, &daily, &[], now);
+    inplay::sort_rows(&mut rows, inplay::SortBy::Change);
+    let top: Vec<String> = rows.iter().take(40).map(|r| r.symbol.clone()).collect();
+    let news = match client
+        .news(&top, now - chrono::Duration::hours(36), 50)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            notes.push(format!("news unavailable: {}", err_string(e)));
+            Vec::new()
+        }
+    };
+    Ok((
+        inplay::build_rows(&universe, &snapshots, &daily, &news, now),
+        notes,
+    ))
 }
 
 pub struct Options {
@@ -140,6 +205,17 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                         Reply::Assets(r)
                     }
                     Request::Clock => Reply::Clock(client.clock().await.map_err(err_string)),
+                    Request::InPlay(watchlist) => {
+                        Reply::InPlay(build_inplay(&client, &watchlist).await)
+                    }
+                    Request::News(sym) => {
+                        let since = Utc::now() - chrono::Duration::days(4);
+                        let r = client
+                            .news(std::slice::from_ref(&sym), since, 15)
+                            .await
+                            .map_err(err_string);
+                        Reply::News(sym, r)
+                    }
                 };
                 let _ = replies.send(reply);
             });
@@ -237,8 +313,11 @@ fn run_loop(
     // Live 1D chart refresh while a detail view is open.
     let mut intraday = Every::new(Duration::from_secs(60));
     let mut quotes_in_flight = false;
+    // Rebuild the in-play list every minute while it's on screen.
+    let mut inplay_timer = Every::new(Duration::from_secs(60));
 
     loop {
+        let mut actions: Vec<Action> = Vec::new();
         // 1. Apply replies.
         while let Ok(reply) = replies.try_recv() {
             match reply {
@@ -268,6 +347,8 @@ fn run_loop(
                         app.clock = Some(c);
                     }
                 }
+                Reply::InPlay(r) => actions.extend(app.set_inplay(r)),
+                Reply::News(sym, r) => app.set_news(sym, r),
             }
         }
 
@@ -305,6 +386,15 @@ fn run_loop(
         } else {
             intraday.reset();
         }
+        if app.mode == Mode::InPlay {
+            // The first tick after opening is skipped: opening already fetched.
+            if inplay_timer.due() && app.inplay.updated.is_some() && !app.inplay.loading {
+                app.inplay.loading = true;
+                actions.push(Action::FetchInPlay);
+            }
+        } else {
+            inplay_timer.reset();
+        }
 
         // 3. Draw.
         terminal
@@ -314,22 +404,26 @@ fn run_loop(
         // 4. Input.
         if event::poll(Duration::from_millis(150)).context("polling for input")? {
             if let Event::Key(key) = event::read().context("reading input")? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+                if key.kind == KeyEventKind::Press {
+                    actions.extend(app.on_key(key));
                 }
-                for action in app.on_key(key) {
-                    match action {
-                        Action::Quit => return Ok(()),
-                        Action::RefreshQuotes => {
-                            quotes.reset();
-                            sparks.reset();
-                        }
-                        Action::FetchHistory(s, r) => send(Request::History(s, r)),
-                        Action::SaveWatchlist => {
-                            if let Err(e) = store::save_watchlist(&app.watchlist) {
-                                app.flash = Some(format!("could not save watchlist: {e:#}"));
-                            }
-                        }
+            }
+        }
+
+        // 5. Side effects from replies and keys.
+        for action in actions {
+            match action {
+                Action::Quit => return Ok(()),
+                Action::RefreshQuotes => {
+                    quotes.reset();
+                    sparks.reset();
+                }
+                Action::FetchHistory(s, r) => send(Request::History(s, r)),
+                Action::FetchInPlay => send(Request::InPlay(app.watchlist.clone())),
+                Action::FetchNews(s) => send(Request::News(s)),
+                Action::SaveWatchlist => {
+                    if let Err(e) = store::save_watchlist(&app.watchlist) {
+                        app.flash = Some(format!("could not save watchlist: {e:#}"));
                     }
                 }
             }

@@ -229,6 +229,27 @@ impl AlpacaClient {
         timeframe: &str,
         start: DateTime<Utc>,
     ) -> Result<HashMap<String, Vec<Bar>>, AlpacaError> {
+        self.bars_on(symbols, timeframe, start, "sip").await
+    }
+
+    /// The bars feed whose volumes are comparable with this client's quote
+    /// feed: IEX for IEX quotes, consolidated otherwise. Use it when a ratio
+    /// mixes snapshot volume with historical volume (relative volume).
+    pub fn volume_feed(&self) -> &'static str {
+        match self.feed {
+            QuoteFeed::Iex => "iex",
+            QuoteFeed::Sip | QuoteFeed::DelayedSip => "sip",
+        }
+    }
+
+    /// [`Self::bars`] on an explicit feed (`sip` or `iex`).
+    pub async fn bars_on(
+        &self,
+        symbols: &[String],
+        timeframe: &str,
+        start: DateTime<Utc>,
+        feed: &str,
+    ) -> Result<HashMap<String, Vec<Bar>>, AlpacaError> {
         let mut out: HashMap<String, Vec<Bar>> = HashMap::new();
         if symbols.is_empty() {
             return Ok(out);
@@ -242,7 +263,7 @@ impl AlpacaClient {
                 ("start", start.to_rfc3339_opts(SecondsFormat::Secs, true)),
                 ("limit", PAGE_LIMIT.to_string()),
                 ("adjustment", "split".to_string()),
-                ("feed", "sip".to_string()),
+                ("feed", feed.to_string()),
             ];
             if let Some(tok) = &page_token {
                 query.push(("page_token", tok.clone()));
@@ -299,6 +320,103 @@ impl AlpacaClient {
         let url = format!("{}/v2/clock", self.trading_base);
         self.get(&url, &[]).await
     }
+
+    /// Top gainers and losers (`top` ≤ 50 each). Resets at the open; before
+    /// that it reports the previous session.
+    pub async fn movers(&self, top: u32) -> Result<Movers, AlpacaError> {
+        let url = format!("{}/v1beta1/screener/stocks/movers", self.data_base);
+        self.get(&url, &[("top", top.clamp(1, 50).to_string())])
+            .await
+    }
+
+    /// Most active stocks by volume today (`top` ≤ 100).
+    pub async fn most_actives(&self, top: u32) -> Result<Vec<MostActive>, AlpacaError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            most_actives: Vec<MostActive>,
+        }
+        let url = format!("{}/v1beta1/screener/stocks/most-actives", self.data_base);
+        let r: Resp = self
+            .get(
+                &url,
+                &[
+                    ("by", "volume".to_string()),
+                    ("top", top.clamp(1, 100).to_string()),
+                ],
+            )
+            .await?;
+        Ok(r.most_actives)
+    }
+
+    /// Recent headlines (newest first) for `symbols` since `start`.
+    pub async fn news(
+        &self,
+        symbols: &[String],
+        start: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<NewsItem>, AlpacaError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            news: Vec<NewsItem>,
+        }
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = format!("{}/v1beta1/news", self.data_base);
+        let r: Resp = self
+            .get(
+                &url,
+                &[
+                    ("symbols", symbols.join(",")),
+                    ("start", start.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                    ("limit", limit.clamp(1, 50).to_string()),
+                    ("sort", "desc".to_string()),
+                ],
+            )
+            .await?;
+        Ok(r.news)
+    }
+}
+
+/// Top movers for the session.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Movers {
+    #[serde(default)]
+    pub gainers: Vec<Mover>,
+    #[serde(default)]
+    pub losers: Vec<Mover>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Mover {
+    pub symbol: String,
+    #[serde(default)]
+    pub price: f64,
+    #[serde(default)]
+    pub percent_change: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MostActive {
+    pub symbol: String,
+    #[serde(default)]
+    pub volume: f64,
+}
+
+/// One headline from Alpaca's news feed (Benzinga).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct NewsItem {
+    pub id: i64,
+    pub headline: String,
+    #[serde(default)]
+    pub summary: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    #[serde(default)]
+    pub source: String,
 }
 
 #[cfg(test)]
@@ -443,6 +561,78 @@ mod tests {
         let assets = c.assets().await.unwrap();
         assert_eq!(assets[0].symbol, "NVDA");
         assert!(assets[0].tradable);
+    }
+
+    #[tokio::test]
+    async fn screeners_news_and_feed_specific_bars_parse() {
+        let server = MockServer::start().await;
+        Mock::given(path("/v1beta1/screener/stocks/movers"))
+            .and(query_param("top", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "gainers": [{"symbol":"ABCD","price":12.5,"change":2.5,"percent_change":25.0}],
+                "losers": [{"symbol":"WXYZ","price":40.0,"change":-10.0,"percent_change":-20.0}],
+                "market_type": "stocks",
+                "last_updated": "2026-11-06T21:00:00.123456789Z"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1beta1/screener/stocks/most-actives"))
+            .and(query_param("by", "volume"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "most_actives": [{"symbol":"NVDA","volume":250000000,"trade_count":1200000}],
+                "last_updated": "2026-11-06T21:00:00Z"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1beta1/news"))
+            .and(query_param("symbols", "ABCD"))
+            .and(query_param("sort", "desc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "news": [{
+                    "id": 1, "headline": "ABCD beats estimates", "summary": "", "content": "",
+                    "author": "", "created_at": "2026-11-06T12:05:00Z", "updated_at": "2026-11-06T12:05:00Z",
+                    "symbols": ["ABCD"], "source": "benzinga", "url": null, "images": []
+                }],
+                "next_page_token": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/v2/stocks/bars"))
+            .and(query_param("feed", "iex"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "bars": {"ABCD": [{"t":"2026-11-05T05:00:00Z","o":1,"h":2,"l":0.5,"c":1.5,"v":10,"n":1,"vw":1.2}]},
+                "next_page_token": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = client(&server, QuoteFeed::Iex).await;
+        let m = c.movers(80).await.unwrap(); // clamped to 50
+        assert_eq!(m.gainers[0].symbol, "ABCD");
+        assert_eq!(m.losers[0].percent_change, -20.0);
+        assert_eq!(c.most_actives(50).await.unwrap()[0].volume, 250_000_000.0);
+        let news = c
+            .news(
+                &["ABCD".into()],
+                "2026-11-05T00:00:00Z".parse().unwrap(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(news[0].headline, "ABCD beats estimates");
+        assert!(c.news(&[], Utc::now(), 10).await.unwrap().is_empty());
+        assert_eq!(c.volume_feed(), "iex");
+        let bars = c
+            .bars_on(
+                &["ABCD".into()],
+                "1Day",
+                "2026-10-01T00:00:00Z".parse().unwrap(),
+                c.volume_feed(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bars["ABCD"].len(), 1);
     }
 
     #[test]

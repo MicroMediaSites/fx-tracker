@@ -43,7 +43,8 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 - **Keys** are Helix-style. Bare keys move (`j`/`k`, arrows), open (`enter`),
   back out (`esc`), search (`/`), refresh (`r`) and quit (`q`). A prefix letter
   opens a category, and a panel lists the next keys:
-  - `g` go to: `g g` top, `g e` end, `g <n> g` row n, `g w` watchlist.
+  - `g` go to: `g g` top, `g e` end, `g <n> g` row n, `g w` watchlist, `g i`
+    in play today.
   - `w` watchlist: `w a` add, `w d` remove, `w u` undo, `w j`/`w k` move.
   - `t` time range: `t d`/`t w`/`t m`/`t 6`/`t y`/`t 5`/`t a` for
     1D/5D/1M/6M/1Y/5Y/MAX.
@@ -59,6 +60,20 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   (`src/tui/keymap.rs`).
 - **Watchlist** (`~/.wickd/tui.json`). Shows last, change vs the prior session
   close, day range, volume and a sparkline of today.
+- **In play** (`g i`). Lists what is worth watching today. It merges top
+  movers, the most active names and your watchlist, then shows for each name:
+  - change against yesterday's close (the gap, in pre-market);
+  - the move since the open;
+  - volume so far and relative volume: today against the 20-day average, from
+    the same feed, so it means something even on IEX;
+  - how recent its latest headline is.
+
+  `v c`, `v r` and `v a` sort by biggest move, relative volume or volume, and
+  `v f` toggles the price ≥ $5 filter. `w a` adds the selected name to the
+  watchlist, and `enter` opens its chart. A side pane shows Alpaca/Benzinga
+  headlines for the selected symbol. Sources your plan doesn't include show a
+  note instead of breaking the screen. Top movers only reset at the open, so
+  before then the gap column is the useful one.
 - **Search**. Matches ticker or company name over Alpaca's active-equity list,
   cached daily in `~/.wickd/cache/alpaca-assets.json`. `tab` adds or removes a
   symbol, `enter` opens it.

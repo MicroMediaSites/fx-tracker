@@ -7,9 +7,11 @@ use std::collections::HashMap;
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use wickd_core::equities::alpaca::NewsItem;
 use wickd_core::equities::{Asset, Bar, HistoryRange, MarketClock, Snapshot};
 
 use super::chart::{self, Candle, ChartView};
+use super::inplay::{self, Row, SortBy};
 use super::keymap::{self, Cmd, Ctx, Pending, Step};
 use super::search;
 use super::store::normalize_symbol;
@@ -19,6 +21,7 @@ pub enum Mode {
     Watchlist,
     Search,
     Detail,
+    InPlay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +40,57 @@ pub enum Action {
     FetchHistory(String, HistoryRange),
     /// Persist the watchlist.
     SaveWatchlist,
+    /// Rebuild the in-play list.
+    FetchInPlay,
+    /// Fetch recent headlines for one symbol.
+    FetchNews(String),
     Quit,
+}
+
+/// The "in play today" screen.
+#[derive(Debug)]
+pub struct InPlayState {
+    /// All rows, sorted by `sort` (filtering happens on read).
+    pub rows: Vec<Row>,
+    pub selected: usize,
+    pub sort: SortBy,
+    /// Minimum price filter (`None` = show everything).
+    pub min_price: Option<f64>,
+    pub loading: bool,
+    /// Sources that failed (e.g. a screener not on this plan).
+    pub notes: Vec<String>,
+    pub error: Option<String>,
+    pub updated: Option<DateTime<Local>>,
+    /// Headlines per symbol, for the side pane.
+    pub news: HashMap<String, Result<Vec<NewsItem>, String>>,
+    pub news_pending: Vec<String>,
+}
+
+impl Default for InPlayState {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            selected: 0,
+            sort: SortBy::Change,
+            min_price: Some(inplay::DEFAULT_MIN_PRICE),
+            loading: false,
+            notes: Vec::new(),
+            error: None,
+            updated: None,
+            news: HashMap::new(),
+            news_pending: Vec::new(),
+        }
+    }
+}
+
+impl InPlayState {
+    pub fn visible(&self) -> Vec<&Row> {
+        inplay::visible(&self.rows, self.min_price)
+    }
+
+    pub fn selected_symbol(&self) -> Option<String> {
+        self.visible().get(self.selected).map(|r| r.symbol.clone())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -122,6 +175,7 @@ pub struct App {
     pub pending: Option<Pending>,
     pub search: SearchState,
     pub detail: Option<DetailState>,
+    pub inplay: InPlayState,
     pub quotes_error: Option<String>,
     pub last_quotes: Option<DateTime<Local>>,
     /// Transient one-line message for the footer.
@@ -149,6 +203,7 @@ impl App {
             pending: None,
             search: SearchState::default(),
             detail: None,
+            inplay: InPlayState::default(),
             quotes_error: None,
             last_quotes: None,
             flash: None,
@@ -230,6 +285,7 @@ impl App {
         match self.mode {
             Mode::Watchlist => Some(Ctx::Watchlist),
             Mode::Detail => Some(Ctx::Detail),
+            Mode::InPlay => Some(Ctx::InPlay),
             Mode::Search => None,
         }
     }
@@ -256,6 +312,7 @@ impl App {
             Step::Act(cmd, n) => match ctx {
                 Ctx::Watchlist => self.exec_watchlist(cmd, n),
                 Ctx::Detail => self.exec_detail(cmd),
+                Ctx::InPlay => self.exec_inplay(cmd),
             },
             Step::Pending | Step::Cancel | Step::None => vec![],
         }
@@ -278,6 +335,7 @@ impl App {
                 }
             }
             Cmd::Search => self.open_search(),
+            Cmd::GoInPlay => return self.open_inplay(),
             Cmd::WatchAdd => {
                 self.open_search();
                 self.flash = Some("find a symbol, then tab to add it".into());
@@ -321,6 +379,116 @@ impl App {
             _ => {}
         }
         vec![]
+    }
+
+    fn open_inplay(&mut self) -> Vec<Action> {
+        self.mode = Mode::InPlay;
+        let mut out = Vec::new();
+        if !self.inplay.loading {
+            self.inplay.loading = true;
+            out.push(Action::FetchInPlay);
+        }
+        out.extend(self.request_selected_news());
+        out
+    }
+
+    /// Ask for the selected row's headlines unless cached or in flight.
+    fn request_selected_news(&mut self) -> Option<Action> {
+        let sym = self.inplay.selected_symbol()?;
+        if self.inplay.news.contains_key(&sym) || self.inplay.news_pending.contains(&sym) {
+            return None;
+        }
+        self.inplay.news_pending.push(sym.clone());
+        Some(Action::FetchNews(sym))
+    }
+
+    /// A rebuilt in-play list arrived.
+    pub fn set_inplay(&mut self, result: Result<(Vec<Row>, Vec<String>), String>) -> Vec<Action> {
+        let ip = &mut self.inplay;
+        ip.loading = false;
+        match result {
+            Ok((mut rows, notes)) => {
+                // Keep the cursor on the same symbol across refreshes.
+                let keep = ip.selected_symbol();
+                inplay::sort_rows(&mut rows, ip.sort);
+                ip.rows = rows;
+                ip.notes = notes;
+                ip.error = None;
+                ip.updated = Some(Local::now());
+                let vis = ip.visible();
+                ip.selected = keep
+                    .and_then(|k| vis.iter().position(|r| r.symbol == k))
+                    .unwrap_or(0)
+                    .min(vis.len().saturating_sub(1));
+            }
+            Err(e) => ip.error = Some(e),
+        }
+        self.request_selected_news().into_iter().collect()
+    }
+
+    pub fn set_news(&mut self, symbol: String, result: Result<Vec<NewsItem>, String>) {
+        self.inplay.news_pending.retain(|s| *s != symbol);
+        self.inplay.news.insert(symbol, result);
+    }
+
+    fn exec_inplay(&mut self, cmd: Cmd) -> Vec<Action> {
+        let len = self.inplay.visible().len();
+        let ip_sel = self.inplay.selected;
+        let resort = |app: &mut App, by: SortBy| {
+            app.inplay.sort = by;
+            inplay::sort_rows(&mut app.inplay.rows, by);
+            app.inplay.selected = 0;
+        };
+        match cmd {
+            Cmd::Back | Cmd::GoWatchlist => self.mode = Mode::Watchlist,
+            Cmd::Help => self.show_help = true,
+            Cmd::Search => self.open_search(),
+            Cmd::Down if len > 0 => self.inplay.selected = (ip_sel + 1).min(len - 1),
+            Cmd::Up => self.inplay.selected = ip_sel.saturating_sub(1),
+            Cmd::GoTop => self.inplay.selected = 0,
+            Cmd::GoEnd if len > 0 => self.inplay.selected = len - 1,
+            Cmd::Refresh => {
+                self.inplay.news.clear();
+                if !self.inplay.loading {
+                    self.inplay.loading = true;
+                    return vec![Action::FetchInPlay];
+                }
+            }
+            Cmd::Open => {
+                if let Some(sym) = self.inplay.selected_symbol() {
+                    return self.open_detail(sym, Mode::InPlay);
+                }
+            }
+            Cmd::WatchAdd => {
+                if let Some(sym) = self.inplay.selected_symbol() {
+                    if self.in_watchlist(&sym) {
+                        self.flash = Some(format!("{sym} is already on the watchlist"));
+                    } else {
+                        return self.toggle_watchlist(sym);
+                    }
+                }
+            }
+            Cmd::WatchRemove => {
+                if let Some(sym) = self.inplay.selected_symbol() {
+                    if self.in_watchlist(&sym) {
+                        return self.toggle_watchlist(sym);
+                    }
+                    self.flash = Some(format!("{sym} isn't on the watchlist"));
+                }
+            }
+            Cmd::SortChange => resort(self, SortBy::Change),
+            Cmd::SortRelVolume => resort(self, SortBy::RelVolume),
+            Cmd::SortVolume => resort(self, SortBy::Volume),
+            Cmd::TogglePriceFilter => {
+                self.inplay.min_price = match self.inplay.min_price {
+                    Some(_) => None,
+                    None => Some(inplay::DEFAULT_MIN_PRICE),
+                };
+                self.inplay.selected = 0;
+            }
+            _ => {}
+        }
+        self.request_selected_news().into_iter().collect()
     }
 
     fn open_search(&mut self) {
@@ -530,6 +698,10 @@ impl App {
             Cmd::GoWatchlist => {
                 self.detail = None;
                 self.mode = Mode::Watchlist;
+            }
+            Cmd::GoInPlay => {
+                self.detail = None;
+                return self.open_inplay();
             }
             Cmd::Help => self.show_help = true,
             Cmd::Range(r) => return self.set_range(r),
@@ -911,6 +1083,89 @@ mod tests {
         assert_eq!(a.detail.as_ref().unwrap().chart.cursor, None);
         typ(&mut a, "ge");
         assert_eq!(a.detail.as_ref().unwrap().scroll, 29);
+    }
+
+    fn ip_row(sym: &str, chg: f64, last: f64, rvol: f64) -> Row {
+        Row {
+            symbol: sym.into(),
+            last: Some(last),
+            chg_pct: Some(chg),
+            from_open_pct: None,
+            volume: Some(rvol * 1e6),
+            avg_volume: Some(1e6),
+            rvol: Some(rvol),
+            tags: vec![],
+            latest_news: None,
+            news_count: 0,
+        }
+    }
+
+    #[test]
+    fn in_play_screen_keys_sort_filter_news_and_back() {
+        let mut a = app();
+        // g i opens the screen, asks for the list.
+        assert_eq!(typ(&mut a, "gi"), vec![Action::FetchInPlay]);
+        assert_eq!(a.mode, Mode::InPlay);
+        // A second g i while loading doesn't double-fetch.
+        a.mode = Mode::Watchlist;
+        assert!(typ(&mut a, "gi").is_empty());
+        // Rows arrive: sorted by biggest move, news requested for the top row.
+        let acts = a.set_inplay(Ok((
+            vec![
+                ip_row("SMALL", 1.0, 50.0, 0.5),
+                ip_row("BIG", -12.0, 30.0, 3.0),
+                ip_row("PENNY", 40.0, 1.5, 9.0),
+            ],
+            vec!["movers unavailable".into()],
+        )));
+        // PENNY (40%) is filtered out under $5, so BIG leads.
+        assert_eq!(acts, vec![Action::FetchNews("BIG".into())]);
+        assert_eq!(a.inplay.visible().len(), 2);
+        // Moving down asks for the next symbol's headlines.
+        assert_eq!(typ(&mut a, "j"), vec![Action::FetchNews("SMALL".into())]);
+        a.set_news("SMALL".into(), Ok(vec![]));
+        assert!(typ(&mut a, "kj").is_empty() || a.inplay.news_pending.contains(&"BIG".to_string()));
+        // v f drops the price filter; v r sorts by relative volume.
+        typ(&mut a, "vf");
+        assert_eq!(a.inplay.visible().len(), 3);
+        typ(&mut a, "vr");
+        assert_eq!(a.inplay.selected_symbol().as_deref(), Some("PENNY"));
+        // w a adds the selected name to the watchlist.
+        assert_eq!(
+            typ(&mut a, "wa"),
+            vec![Action::SaveWatchlist, Action::RefreshQuotes]
+        );
+        assert!(a.in_watchlist("PENNY"));
+        // enter opens the chart; esc comes back to in play.
+        let acts = a.on_key(key(KeyCode::Enter));
+        assert!(acts.contains(&Action::FetchHistory("PENNY".into(), HistoryRange::Day1)));
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.mode, Mode::InPlay);
+        // esc from in play returns to the watchlist.
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.mode, Mode::Watchlist);
+    }
+
+    #[test]
+    fn in_play_refresh_keeps_the_selected_symbol() {
+        let mut a = app();
+        typ(&mut a, "gi");
+        a.set_inplay(Ok((
+            vec![ip_row("A", 9.0, 10.0, 1.0), ip_row("B", 5.0, 10.0, 1.0)],
+            vec![],
+        )));
+        typ(&mut a, "j"); // B
+        a.set_inplay(Ok((
+            vec![ip_row("B", 20.0, 10.0, 1.0), ip_row("A", 9.0, 10.0, 1.0)],
+            vec![],
+        )));
+        assert_eq!(a.inplay.selected_symbol().as_deref(), Some("B"));
+        // Errors keep the old rows.
+        a.set_inplay(Err("boom".into()));
+        assert_eq!(
+            (a.inplay.rows.len(), a.inplay.error.as_deref()),
+            (2, Some("boom"))
+        );
     }
 
     #[test]

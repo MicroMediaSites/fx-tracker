@@ -12,6 +12,7 @@ use wickd_core::equities::{Bar, HistoryRange, Snapshot};
 
 use super::app::{App, DetailState, DetailView, Mode};
 use super::chart::{ChartWidget, Palette, Style2, Zoom};
+use super::inplay::{self, Tag};
 use super::keymap::{self, Ctx, Entry};
 
 // Same teal/red as the wickd desktop app (TradingView/OANDA palette).
@@ -131,6 +132,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     match app.mode {
         Mode::Watchlist => render_watchlist(frame, chunks[1], app),
         Mode::Search => render_search(frame, chunks[1], app),
+        Mode::InPlay => render_inplay(frame, chunks[1], app),
         Mode::Detail => match &app.detail {
             Some(d) => render_detail(frame, chunks[1], app, d),
             None => render_watchlist(frame, chunks[1], app),
@@ -386,6 +388,246 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 // ── search ──────────────────────────────────────────────────────────────────
+
+// ── in play ─────────────────────────────────────────────────────────────────
+
+fn fmt_pct(p: Option<f64>) -> (String, Color) {
+    match p {
+        Some(v) => (format!("{v:+.1}%"), change_color(Some(v))),
+        None => ("—".into(), DIM),
+    }
+}
+
+fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
+    let ip = &app.inplay;
+    let now = Utc::now();
+    let wide = area.width >= 120;
+    let cols = Layout::default()
+        .direction(if wide {
+            Direction::Horizontal
+        } else {
+            Direction::Vertical
+        })
+        .constraints(if wide {
+            [Constraint::Percentage(62), Constraint::Percentage(38)]
+        } else {
+            [Constraint::Percentage(60), Constraint::Percentage(40)]
+        })
+        .split(area);
+
+    // Status line: session, sort, filter, freshness, degraded sources.
+    let phase = inplay::session_phase(app.clock.as_ref(), now);
+    let mut status = vec![
+        Span::styled(format!(" {phase}"), Style::default().fg(ACCENT)),
+        Span::styled(
+            format!(" · sorted by {}", ip.sort.label()),
+            Style::default().fg(DIM),
+        ),
+        Span::styled(
+            match ip.min_price {
+                Some(m) => format!(" · price ≥ ${m:.0}"),
+                None => " · all prices".into(),
+            },
+            Style::default().fg(DIM),
+        ),
+    ];
+    match (&ip.updated, ip.loading) {
+        (_, true) => status.push(Span::styled(" · refreshing…", Style::default().fg(DIM))),
+        (Some(t), false) => status.push(Span::styled(
+            format!(" · updated {}", t.format("%-I:%M %p")),
+            Style::default().fg(DIM),
+        )),
+        _ => {}
+    }
+    let mut header = vec![Line::from(status)];
+    if phase == "pre-market" {
+        header.push(Line::from(Span::styled(
+            " chg% is the gap vs yesterday's close; top movers still show yesterday until the open",
+            Style::default().fg(DIM),
+        )));
+    }
+    for n in ip.notes.iter().chain(ip.error.iter()) {
+        header.push(Line::from(Span::styled(
+            format!(" {n}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(GRID))
+        .title(" in play today ");
+    let inner = block.inner(cols[0]);
+    frame.render_widget(block, cols[0]);
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(header.len() as u16), Constraint::Min(1)])
+        .split(inner);
+    frame.render_widget(Paragraph::new(header), parts[0]);
+
+    let rows_vis = ip.visible();
+    if rows_vis.is_empty() {
+        let msg = if ip.loading {
+            "scanning movers, most active and your watchlist…"
+        } else {
+            "nothing to show yet — r to refresh"
+        };
+        frame.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(DIM)),
+            parts[1],
+        );
+    } else {
+        let head = header_row(
+            &["SYMBOL", "NAME"],
+            &["LAST", "CHG%", "FROM OPEN", "VOL", "RVOL", "NEWS"],
+            &["", ""],
+        );
+        let rows = rows_vis.iter().map(|r| {
+            let name = app
+                .asset(&r.symbol)
+                .map(|a| short_name(&a.name))
+                .unwrap_or_default();
+            let (chg, chg_c) = fmt_pct(r.chg_pct);
+            let (fo, fo_c) = fmt_pct(r.from_open_pct);
+            let rvol = r
+                .rvol
+                .map(|v| format!("{v:.1}×"))
+                .unwrap_or_else(|| "—".into());
+            let rvol_style = match r.rvol {
+                Some(v) if v >= 2.0 => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Some(_) => Style::default(),
+                None => Style::default().fg(DIM),
+            };
+            let news = r
+                .latest_news
+                .map(|t| inplay::age(t, now))
+                .unwrap_or_default();
+            let tags: String = r.tags.iter().map(|t| t.glyph()).collect();
+            let right = |s: String| Cell::from(Line::from(s).alignment(Alignment::Right));
+            let tag_color = if r.tags.contains(&Tag::Gainer) {
+                UP
+            } else if r.tags.contains(&Tag::Loser) {
+                DOWN
+            } else {
+                DIM
+            };
+            Row::new(vec![
+                Cell::from(r.symbol.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+                Cell::from(name),
+                right(r.last.map(fmt_price).unwrap_or_else(|| "—".into())),
+                right(chg).style(Style::default().fg(chg_c)),
+                right(fo).style(Style::default().fg(fo_c)),
+                right(r.volume.map(fmt_volume).unwrap_or_else(|| "—".into())),
+                right(rvol).style(rvol_style),
+                right(news).style(Style::default().fg(ACCENT)),
+                Cell::from(""),
+                Cell::from(tags).style(Style::default().fg(tag_color)),
+            ])
+        });
+        let widths = [
+            Constraint::Length(7),
+            Constraint::Min(10),
+            Constraint::Length(9),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Length(5),
+            Constraint::Length(0),
+            Constraint::Length(4),
+        ];
+        let table = Table::new(rows, widths)
+            .header(head)
+            .column_spacing(1)
+            .row_highlight_style(Style::default().bg(Color::Rgb(44, 52, 66)).add_modifier(Modifier::BOLD));
+        let mut state = TableState::default().with_selected(Some(ip.selected));
+        frame.render_stateful_widget(table, parts[1], &mut state);
+    }
+
+    // Headlines for the selected symbol.
+    let sel = ip.selected_symbol();
+    let title = match &sel {
+        Some(s) => format!(" {s} · headlines "),
+        None => " headlines ".into(),
+    };
+    let nblock = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(GRID))
+        .title(title);
+    let ninner = nblock.inner(cols[1]);
+    frame.render_widget(nblock, cols[1]);
+    let width = ninner.width.saturating_sub(1) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    match sel.as_ref().and_then(|s| ip.news.get(s)) {
+        None if sel.is_some() => lines.push(Line::from(Span::styled(
+            "loading…",
+            Style::default().fg(DIM),
+        ))),
+        None => {}
+        Some(Err(e)) => lines.push(Line::from(Span::styled(
+            format!("headlines unavailable: {e}"),
+            Style::default().fg(Color::Yellow),
+        ))),
+        Some(Ok(items)) if items.is_empty() => lines.push(Line::from(Span::styled(
+            "no headlines in the last few days — a move without news is often just the market",
+            Style::default().fg(DIM),
+        ))),
+        Some(Ok(items)) => {
+            for n in items {
+                let when = local(n.created_at);
+                let stamp = if wickd_core::equities::eastern_date(n.created_at)
+                    == wickd_core::equities::eastern_date(now)
+                {
+                    when.format("%-I:%M %p").to_string()
+                } else {
+                    when.format("%a %b %-d").to_string()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(stamp, Style::default().fg(ACCENT)),
+                    Span::styled(
+                        format!("  {}", inplay::age(n.created_at, now)),
+                        Style::default().fg(DIM),
+                    ),
+                ]));
+                for l in wrap(&n.headline, width) {
+                    lines.push(Line::from(Span::styled(
+                        l,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                }
+                if !n.summary.trim().is_empty() {
+                    for l in wrap(n.summary.trim(), width).into_iter().take(3) {
+                        lines.push(Line::from(Span::styled(l, Style::default().fg(DIM))));
+                    }
+                }
+                lines.push(Line::from(""));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), ninner);
+}
+
+/// Greedy word wrap to `width` columns.
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let w = word.chars().count();
+        let c = cur.chars().count();
+        if c > 0 && c + 1 + w > width {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
 
 fn render_search(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
@@ -907,6 +1149,8 @@ fn help_section(title: &str, ctx: Ctx) -> Vec<Line<'static>> {
 fn render_help(frame: &mut Frame, area: Rect) {
     let mut left = help_section("watchlist", Ctx::Watchlist);
     left.push(Line::from(""));
+    left.extend(help_section("in play", Ctx::InPlay));
+    left.push(Line::from(""));
     left.push(Line::from(Span::styled(
         "search",
         Style::default().add_modifier(Modifier::BOLD),
@@ -1395,6 +1639,112 @@ mod tests {
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('l'));
         shoot(&app, "5-1y-line");
+
+        press(&mut app, KeyCode::Esc);
+        sample_inplay(&mut app);
+        press(&mut app, KeyCode::Char('j'));
+        shoot(&app, "6-in-play");
+    }
+
+    #[test]
+    fn wrap_breaks_on_words() {
+        assert_eq!(
+            wrap("one two three four", 9),
+            vec!["one two", "three", "four"]
+        );
+        assert!(wrap("", 10).is_empty());
+    }
+
+    fn sample_inplay(app: &mut App) {
+        use crate::tui::inplay::Row as IpRow;
+        let now = Utc::now();
+        let row = |s: &str,
+                   chg: f64,
+                   fo: Option<f64>,
+                   rvol: Option<f64>,
+                   tags: Vec<Tag>,
+                   news: Option<i64>| IpRow {
+            symbol: s.into(),
+            last: Some(40.0 + chg),
+            chg_pct: Some(chg),
+            from_open_pct: fo,
+            volume: rvol.map(|r| r * 2e6),
+            avg_volume: Some(2e6),
+            rvol,
+            tags,
+            latest_news: news.map(|m| now - chrono::Duration::minutes(m)),
+            news_count: news.map_or(0, |_| 1),
+        };
+        press(app, KeyCode::Char('g'));
+        press(app, KeyCode::Char('i'));
+        app.set_inplay(Ok((
+            vec![
+                row(
+                    "NVDA",
+                    6.4,
+                    Some(2.1),
+                    Some(3.4),
+                    vec![Tag::Gainer, Tag::Active, Tag::Watch],
+                    Some(35),
+                ),
+                row(
+                    "SPY",
+                    -0.4,
+                    Some(-0.2),
+                    Some(1.1),
+                    vec![Tag::Active, Tag::Watch],
+                    None,
+                ),
+                row(
+                    "WDAY",
+                    -11.2,
+                    Some(-3.0),
+                    Some(5.8),
+                    vec![Tag::Loser],
+                    Some(600),
+                ),
+                row("ABCD", 22.0, None, None, vec![Tag::Gainer], Some(90)),
+            ],
+            vec!["most active unavailable: not allowed on this Alpaca plan (forbidden)".into()],
+        )));
+        app.set_news(
+            "WDAY".into(),
+            Ok(vec![wickd_core::equities::alpaca::NewsItem {
+                id: 1,
+                headline: "Workday shares slide after the company cuts its full-year subscription revenue outlook".into(),
+                summary: "The HR software maker lowered guidance citing slower deal closings in the quarter.".into(),
+                created_at: now - chrono::Duration::hours(10),
+                symbols: vec!["WDAY".into()],
+                source: "benzinga".into(),
+            }]),
+        );
+    }
+
+    #[test]
+    fn in_play_screen_renders_rows_notes_and_headlines() {
+        let mut app = sample_app();
+        sample_inplay(&mut app);
+        // Default sort: biggest move → ABCD (+22) then WDAY (−11.2).
+        press(&mut app, KeyCode::Char('j')); // WDAY
+        let t = draw(&app, 150, 24);
+        assert!(
+            t.contains("in play today") && t.contains("sorted by biggest move"),
+            "{t}"
+        );
+        assert!(
+            t.contains("WDAY") && t.contains("-11.2%") && t.contains("5.8×"),
+            "{t}"
+        );
+        assert!(t.contains("most active unavailable"), "{t}");
+        assert!(
+            t.contains("WDAY · headlines") && t.contains("Workday shares slide"),
+            "{t}"
+        );
+        if std::env::var("WICKD_TUI_DUMP").is_ok() {
+            println!("{t}\n");
+        }
+        // Narrow terminals stack the headlines below and don't panic.
+        draw(&app, 80, 30);
     }
 
     #[test]
