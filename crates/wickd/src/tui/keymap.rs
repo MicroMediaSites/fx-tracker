@@ -6,7 +6,7 @@
 //!   g  go to       g g top · g e end · g w watchlist · g <n> g row n
 //!   w  watchlist   w a add · w d remove · w u undo · w j / w k move
 //!   t  time range  t d 1D · t w 5D · t m 1M · t 6 6M · t y 1Y · t 5 5Y · t a MAX
-//!   v  view        v c chart · v t table
+//!   v  view        v c candles · v l line · v t table
 //!
 //! While a prefix is pending the key panel lists its second keys. `esc`
 //! cancels it, and so does any key that isn't one of its second keys (which
@@ -55,7 +55,8 @@ pub enum Cmd {
     WatchUndo,
     WatchMoveDown,
     WatchMoveUp,
-    ViewChart,
+    ViewCandles,
+    ViewLine,
     ViewTable,
 }
 
@@ -262,7 +263,8 @@ pub static BINDINGS: &[Binding] = &[
         D,
     ),
     // ── v: view ──
-    pre('v', &[K::Char('c')], Cmd::ViewChart, "chart", D),
+    pre('v', &[K::Char('c')], Cmd::ViewCandles, "candles", D),
+    pre('v', &[K::Char('l')], Cmd::ViewLine, "line", D),
     pre('v', &[K::Char('t')], Cmd::ViewTable, "price table", D),
 ];
 

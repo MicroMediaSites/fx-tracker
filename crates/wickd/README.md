@@ -47,7 +47,7 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   - `w` watchlist: `w a` add, `w d` remove, `w u` undo, `w j`/`w k` move.
   - `t` time range: `t d`/`t w`/`t m`/`t 6`/`t y`/`t 5`/`t a` for
     1D/5D/1M/6M/1Y/5Y/MAX.
-  - `v` view: `v c` chart, `v t` price table.
+  - `v` view: `v c` candles, `v l` line, `v t` price table.
 
   `esc` cancels a pending prefix, and `?` lists every key. The help screen,
   the footer and the panel are all generated from the one keymap table
@@ -57,9 +57,13 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 - **Search**. Matches ticker or company name over Alpaca's active-equity list,
   cached daily in `~/.wickd/cache/alpaca-assets.json`. `tab` adds or removes a
   symbol, `enter` opens it.
-- **Symbol view**. A chart or a newest-first OHLCV table (`tab` flips between
-  them), over 1D to MAX (`1`–`7` are shortcuts for the ranges). The 1D chart
-  marks the prior close.
+- **Symbol view**. Covers 1D to MAX (`1`–`7` are shortcuts for the ranges).
+  The default is a candlestick chart with a volume strip underneath. When a
+  range has more bars than the screen has columns, consecutive bars merge
+  into one candle with their real open, high, low and close; the title shows
+  how many (`× 4`). `v l` switches to a close-price line, and `tab` flips
+  between the last chart style and a newest-first OHLCV table. On 1D, a
+  dotted line marks the prior close.
 - **Data**. Quotes poll every 15s (`--refresh`). On the free plan, live quotes
   are IEX-only (about 3% of volume). `--feed delayed-sip` trades that for
   all-exchange quotes 15 minutes behind. History is always consolidated and

@@ -22,7 +22,8 @@ pub enum Mode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailView {
-    Chart,
+    Candles,
+    Line,
     Table,
 }
 
@@ -51,6 +52,8 @@ pub struct DetailState {
     pub symbol: String,
     pub range: HistoryRange,
     pub view: DetailView,
+    /// Chart style `tab` returns to from the table.
+    pub last_chart: DetailView,
     /// Loaded history per range (kept so flipping back is instant).
     pub history: HashMap<HistoryRange, Vec<Bar>>,
     /// Ranges with a request in flight.
@@ -67,7 +70,8 @@ impl DetailState {
         Self {
             symbol,
             range: HistoryRange::Day1,
-            view: DetailView::Chart,
+            view: DetailView::Candles,
+            last_chart: DetailView::Candles,
             history: HashMap::new(),
             loading: Vec::new(),
             error: None,
@@ -454,10 +458,15 @@ impl App {
         };
         let view = |app: &mut App, v: Option<DetailView>| {
             if let Some(d) = app.detail.as_mut() {
-                d.view = v.unwrap_or(match d.view {
-                    DetailView::Chart => DetailView::Table,
-                    DetailView::Table => DetailView::Chart,
+                // None = tab: table ↔ the last chart style.
+                let next = v.unwrap_or(match d.view {
+                    DetailView::Table => d.last_chart,
+                    _ => DetailView::Table,
                 });
+                if next != DetailView::Table {
+                    d.last_chart = next;
+                }
+                d.view = next;
             }
         };
         match cmd {
@@ -479,7 +488,8 @@ impl App {
                 return self.set_range(HistoryRange::ALL[range_idx.saturating_sub(1)]);
             }
             Cmd::ToggleView => view(self, None),
-            Cmd::ViewChart => view(self, Some(DetailView::Chart)),
+            Cmd::ViewCandles => view(self, Some(DetailView::Candles)),
+            Cmd::ViewLine => view(self, Some(DetailView::Line)),
             Cmd::ViewTable => view(self, Some(DetailView::Table)),
             Cmd::Down => scroll(self, &|s| s + 1),
             Cmd::Up => scroll(self, &|s| s.saturating_sub(1)),
@@ -726,9 +736,15 @@ mod tests {
         typ(&mut a, "vt"); // explicit, not a toggle
         assert_eq!(a.detail.as_ref().unwrap().view, DetailView::Table);
         typ(&mut a, "vc");
-        assert_eq!(a.detail.as_ref().unwrap().view, DetailView::Chart);
+        assert_eq!(a.detail.as_ref().unwrap().view, DetailView::Candles);
         a.on_key(key(KeyCode::Tab));
         assert_eq!(a.detail.as_ref().unwrap().view, DetailView::Table);
+        // Tab returns to the last chart style, line included.
+        typ(&mut a, "vl");
+        assert_eq!(a.detail.as_ref().unwrap().view, DetailView::Line);
+        a.on_key(key(KeyCode::Tab));
+        a.on_key(key(KeyCode::Tab));
+        assert_eq!(a.detail.as_ref().unwrap().view, DetailView::Line);
         typ(&mut a, "gw");
         assert_eq!(a.mode, Mode::Watchlist);
         assert!(a.detail.is_none());
