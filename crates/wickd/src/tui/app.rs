@@ -65,6 +65,8 @@ pub struct InPlayState {
     pub news: HashMap<String, Result<Vec<NewsItem>, String>>,
     /// When each symbol's headlines were fetched (for the cache TTL).
     pub news_at: HashMap<String, DateTime<Utc>>,
+    /// After a failed fetch, don't retry a symbol before this time.
+    pub news_retry_after: HashMap<String, DateTime<Utc>>,
     pub news_pending: Vec<String>,
 }
 
@@ -72,6 +74,8 @@ pub struct InPlayState {
 pub const NEWS_ROWS: usize = 60;
 /// How long fetched headlines are trusted before a refetch.
 pub const NEWS_TTL_MINUTES: i64 = 10;
+/// Backoff before retrying a symbol whose headline fetch failed.
+pub const NEWS_RETRY_SECONDS: i64 = 60;
 
 impl Default for InPlayState {
     fn default() -> Self {
@@ -86,6 +90,7 @@ impl Default for InPlayState {
             updated: None,
             news: HashMap::new(),
             news_at: HashMap::new(),
+            news_retry_after: HashMap::new(),
             news_pending: Vec::new(),
         }
     }
@@ -407,12 +412,17 @@ impl App {
         let ip = &mut self.inplay;
         let vis: Vec<String> = ip.visible().iter().map(|r| r.symbol.clone()).collect();
         let mut wanted: Vec<String> = ip.selected_symbol().into_iter().collect();
-        wanted.extend(vis.into_iter().take(NEWS_ROWS));
+        for s in vis.into_iter().take(NEWS_ROWS) {
+            if !wanted.contains(&s) {
+                wanted.push(s);
+            }
+        }
         let ttl = chrono::Duration::minutes(NEWS_TTL_MINUTES);
         let mut out = Vec::new();
         for sym in wanted {
             let fresh = ip.news_at.get(&sym).is_some_and(|t| now - *t < ttl);
-            if fresh || ip.news_pending.contains(&sym) {
+            let backing_off = ip.news_retry_after.get(&sym).is_some_and(|t| now < *t);
+            if fresh || backing_off || ip.news_pending.contains(&sym) {
                 continue;
             }
             ip.news_pending.push(sym.clone());
@@ -460,12 +470,19 @@ impl App {
 
     pub fn set_news(&mut self, symbol: String, result: Result<Vec<NewsItem>, String>) {
         self.inplay.news_pending.retain(|s| *s != symbol);
-        // Only successes count as fresh: an error (e.g. a rate-limit hit) is
-        // shown in the pane but retried on the next rebuild.
+        // Successes are fresh for the TTL. A failure (e.g. a rate-limit hit)
+        // is shown in the pane and retried after a short backoff — never on
+        // every keypress, which would keep a 429 burst going.
+        let now = Utc::now();
         if result.is_ok() {
-            self.inplay.news_at.insert(symbol.clone(), Utc::now());
+            self.inplay.news_at.insert(symbol.clone(), now);
+            self.inplay.news_retry_after.remove(&symbol);
         } else {
             self.inplay.news_at.remove(&symbol);
+            self.inplay.news_retry_after.insert(
+                symbol.clone(),
+                now + chrono::Duration::seconds(NEWS_RETRY_SECONDS),
+            );
         }
         self.inplay.news.insert(symbol, result);
         self.apply_news_cache();
@@ -490,6 +507,8 @@ impl App {
             Cmd::Refresh => {
                 self.inplay.news.clear();
                 self.inplay.news_at.clear();
+                self.inplay.news_retry_after.clear();
+                self.inplay.news_pending.clear();
                 if !self.inplay.loading {
                     self.inplay.loading = true;
                     return vec![Action::FetchInPlay];
@@ -1222,13 +1241,14 @@ mod tests {
         // After the TTL, a rebuild asks again.
         let later = chrono::Utc::now() + chrono::Duration::minutes(NEWS_TTL_MINUTES + 1);
         assert_eq!(a.request_news(later), vec![Action::FetchNews("A".into())]);
-        // A failed fetch isn't cached as fresh: the next rebuild retries it.
+        // A failed fetch backs off: moving the cursor doesn't re-request it,
+        // but once the backoff passes it's retried.
         a.inplay.news_pending.clear();
         a.set_news("A".into(), Err("rate limited".into()));
-        assert_eq!(
-            a.request_news(chrono::Utc::now()),
-            vec![Action::FetchNews("A".into())]
-        );
+        assert!(typ(&mut a, "jk").is_empty());
+        assert!(a.request_news(chrono::Utc::now()).is_empty());
+        let after = chrono::Utc::now() + chrono::Duration::seconds(NEWS_RETRY_SECONDS + 1);
+        assert_eq!(a.request_news(after), vec![Action::FetchNews("A".into())]);
         // r clears the cache and refetches.
         a.inplay.news_pending.clear();
         assert_eq!(typ(&mut a, "r"), vec![Action::FetchInPlay]);

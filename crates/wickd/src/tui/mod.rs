@@ -207,7 +207,8 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                         Reply::InPlay(build_inplay(&client, &watchlist).await)
                     }
                     Request::News(sym) => {
-                        let _slot = news_slots.acquire().await;
+                        // Held for the request; the semaphore is never closed.
+                        let _slot = news_slots.acquire().await.ok();
                         let since = Utc::now() - chrono::Duration::days(NEWS_DAYS);
                         let r = client
                             .news(std::slice::from_ref(&sym), since, 15)
