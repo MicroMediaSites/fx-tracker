@@ -47,7 +47,12 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   - `w` watchlist: `w a` add, `w d` remove, `w u` undo, `w j`/`w k` move.
   - `t` time range: `t d`/`t w`/`t m`/`t 6`/`t y`/`t 5`/`t a` for
     1D/5D/1M/6M/1Y/5Y/MAX.
-  - `v` view: `v c` candles, `v l` line, `v t` price table.
+  - `v` view: `v c` candles, `v l` line, `v t` price table, `v e` extended
+    hours.
+
+  On a chart, `h`/`l` (or arrows) move a cursor candle by candle, `H`/`L` pan
+  half a screen, `+`/`-` zoom, `0` returns to fit, `[`/`]` change range, and
+  `g g`/`g e` jump to the oldest or latest candle.
 
   `esc` cancels a pending prefix, and `?` lists every key. The help screen,
   the footer and the panel are all generated from the one keymap table
@@ -58,12 +63,25 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   cached daily in `~/.wickd/cache/alpaca-assets.json`. `tab` adds or removes a
   symbol, `enter` opens it.
 - **Symbol view**. Covers 1D to MAX (`1`–`7` are shortcuts for the ranges).
-  The default is a candlestick chart with a volume strip underneath. When a
-  range has more bars than the screen has columns, consecutive bars merge
-  into one candle with their real open, high, low and close; the title shows
-  how many (`× 4`). `v l` switches to a close-price line, and `tab` flips
-  between the last chart style and a newest-first OHLCV table. On 1D, a
-  dotted line marks the prior close.
+  The default is a candlestick chart using the desktop app's hollow-candle
+  scheme. Colour shows direction against the previous candle's close (teal
+  up, red down). The body is hollow when the close is at or above the open,
+  and solid when it's below.
+  - The chart opens in **fit**: the whole range spread across the width. When
+    there are more bars than columns, consecutive bars merge into one candle
+    with their real open, high, low and close, and the title shows how many
+    (`× 4`).
+  - Zooming in widens candles to 2, 4 and 6 columns. Wide hollow candles draw
+    as outlines. Zooming out merges 2, 4 or 8 bars per candle.
+  - A readout line shows the cursor candle's time, OHLC, change and volume.
+  - The price axis on the right has gridlines and a tag for the last price.
+  - Volume sits underneath, scaled to the 95th percentile so one
+    closing-auction bar doesn't flatten the rest.
+  - Intraday ranges show regular hours (09:30–16:00 ET) unless you toggle
+    `v e`. On 1D, a dashed line marks the prior close.
+
+  `v l` switches to a close-price line with the same zoom and cursor, and
+  `tab` flips between the last chart style and a newest-first OHLCV table.
 - **Data**. Quotes poll every 15s (`--refresh`). On the free plan, live quotes
   are IEX-only (about 3% of volume). `--feed delayed-sip` trades that for
   all-exchange quotes 15 minutes behind. History is always consolidated and
