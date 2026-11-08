@@ -9,6 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use wickd_core::equities::{Asset, Bar, HistoryRange, MarketClock, Snapshot};
 
+use super::keymap::{self, Cmd, Ctx, Pending, Step};
 use super::search;
 use super::store::normalize_symbol;
 
@@ -98,6 +99,8 @@ pub struct App {
     pub clock: Option<MarketClock>,
     pub mode: Mode,
     pub show_help: bool,
+    /// A Helix-style prefix waiting for its second key (`g`, `w`, `t`, `v`).
+    pub pending: Option<Pending>,
     pub search: SearchState,
     pub detail: Option<DetailState>,
     pub quotes_error: Option<String>,
@@ -122,6 +125,7 @@ impl App {
             clock: None,
             mode: Mode::Watchlist,
             show_help: false,
+            pending: None,
             search: SearchState::default(),
             detail: None,
             quotes_error: None,
@@ -198,6 +202,16 @@ impl App {
 
     // ── key handling ────────────────────────────────────────────────────────
 
+    /// Keymap context for the current screen. `None` in search, whose text
+    /// box takes raw keystrokes instead.
+    pub fn ctx(&self) -> Option<Ctx> {
+        match self.mode {
+            Mode::Watchlist => Some(Ctx::Watchlist),
+            Mode::Detail => Some(Ctx::Detail),
+            Mode::Search => None,
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return vec![Action::Quit];
@@ -208,51 +222,70 @@ impl App {
             return vec![];
         }
         self.flash = None;
-        match self.mode {
-            Mode::Watchlist => self.on_watchlist_key(key),
-            Mode::Search => self.on_search_key(key),
-            Mode::Detail => self.on_detail_key(key),
+        let Some(ctx) = self.ctx() else {
+            return self.on_search_key(key);
+        };
+        let Some(tok) = keymap::token(&key) else {
+            return vec![];
+        };
+        let (pending, step) = keymap::step(ctx, self.pending.as_ref(), tok);
+        self.pending = pending;
+        match step {
+            Step::Act(cmd, n) => match ctx {
+                Ctx::Watchlist => self.exec_watchlist(cmd, n),
+                Ctx::Detail => self.exec_detail(cmd),
+            },
+            Step::Pending | Step::Cancel | Step::None => vec![],
         }
     }
 
-    fn on_watchlist_key(&mut self, key: KeyEvent) -> Vec<Action> {
-        let n = self.watchlist.len();
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return vec![Action::Quit],
-            KeyCode::Char('?') => self.show_help = true,
-            KeyCode::Down | KeyCode::Char('j') if n > 0 => {
-                self.selected = (self.selected + 1).min(n - 1)
+    fn exec_watchlist(&mut self, cmd: Cmd, n: Option<usize>) -> Vec<Action> {
+        let len = self.watchlist.len();
+        match cmd {
+            Cmd::Quit => return vec![Action::Quit],
+            Cmd::Help => self.show_help = true,
+            Cmd::Down if len > 0 => self.selected = (self.selected + 1).min(len - 1),
+            Cmd::Up => self.selected = self.selected.saturating_sub(1),
+            Cmd::GoTop => self.selected = 0,
+            Cmd::GoEnd if len > 0 => self.selected = len - 1,
+            Cmd::GoRow => {
+                if let Some(row) = n.filter(|r| *r >= 1) {
+                    if len > 0 {
+                        self.selected = (row - 1).min(len - 1);
+                    }
+                }
             }
-            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Char('g') | KeyCode::Home => self.selected = 0,
-            KeyCode::Char('G') | KeyCode::End if n > 0 => self.selected = n - 1,
-            KeyCode::Char('J') if n > 1 && self.selected + 1 < n => {
-                self.watchlist.swap(self.selected, self.selected + 1);
-                self.selected += 1;
-                return vec![Action::SaveWatchlist];
+            Cmd::Search => self.open_search(),
+            Cmd::WatchAdd => {
+                self.open_search();
+                self.flash = Some("find a symbol, then tab to add it".into());
             }
-            KeyCode::Char('K') if self.selected > 0 && n > 1 => {
-                self.watchlist.swap(self.selected, self.selected - 1);
-                self.selected -= 1;
-                return vec![Action::SaveWatchlist];
-            }
-            KeyCode::Char('/') | KeyCode::Char('a') => self.open_search(),
-            KeyCode::Char('r') => return vec![Action::RefreshQuotes],
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            Cmd::Refresh => return vec![Action::RefreshQuotes],
+            Cmd::Open => {
                 if let Some(sym) = self.selected_symbol().map(str::to_string) {
                     return self.open_detail(sym, Mode::Watchlist);
                 }
             }
-            KeyCode::Char('d') | KeyCode::Delete if n > 0 => {
+            Cmd::WatchMoveDown if len > 1 && self.selected + 1 < len => {
+                self.watchlist.swap(self.selected, self.selected + 1);
+                self.selected += 1;
+                return vec![Action::SaveWatchlist];
+            }
+            Cmd::WatchMoveUp if self.selected > 0 && len > 1 => {
+                self.watchlist.swap(self.selected, self.selected - 1);
+                self.selected -= 1;
+                return vec![Action::SaveWatchlist];
+            }
+            Cmd::WatchRemove if len > 0 => {
                 let sym = self.watchlist.remove(self.selected);
-                self.flash = Some(format!("removed {sym} — u to undo"));
+                self.flash = Some(format!("removed {sym} — w u to undo"));
                 self.undo = Some((self.selected, sym));
                 if self.selected >= self.watchlist.len() {
                     self.selected = self.watchlist.len().saturating_sub(1);
                 }
                 return vec![Action::SaveWatchlist];
             }
-            KeyCode::Char('u') => {
+            Cmd::WatchUndo => {
                 if let Some((idx, sym)) = self.undo.take() {
                     if !self.in_watchlist(&sym) {
                         let idx = idx.min(self.watchlist.len());
@@ -401,7 +434,7 @@ impl App {
         self.request_history(range).into_iter().collect()
     }
 
-    fn on_detail_key(&mut self, key: KeyEvent) -> Vec<Action> {
+    fn exec_detail(&mut self, cmd: Cmd) -> Vec<Action> {
         let Some(d) = self.detail.as_ref() else {
             self.mode = Mode::Watchlist;
             return vec![];
@@ -411,61 +444,67 @@ impl App {
             .position(|r| *r == d.range)
             .unwrap_or(0);
         let rows = d.bars().map_or(0, Vec::len);
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
-                let back = d.back_to;
+        let last_row = rows.saturating_sub(1);
+        let sym = d.symbol.clone();
+        let back = d.back_to;
+        let scroll = |app: &mut App, f: &dyn Fn(usize) -> usize| {
+            if let Some(d) = app.detail.as_mut() {
+                d.scroll = f(d.scroll).min(last_row);
+            }
+        };
+        let view = |app: &mut App, v: Option<DetailView>| {
+            if let Some(d) = app.detail.as_mut() {
+                d.view = v.unwrap_or(match d.view {
+                    DetailView::Chart => DetailView::Table,
+                    DetailView::Table => DetailView::Chart,
+                });
+            }
+        };
+        match cmd {
+            Cmd::Back => {
                 self.detail = None;
                 self.mode = back;
             }
-            KeyCode::Char('?') => self.show_help = true,
-            KeyCode::Char(c @ '1'..='7') => {
-                let i = (c as usize) - ('1' as usize);
-                return self.set_range(HistoryRange::ALL[i]);
+            Cmd::GoWatchlist => {
+                self.detail = None;
+                self.mode = Mode::Watchlist;
             }
-            KeyCode::Right | KeyCode::Char('l') => {
+            Cmd::Help => self.show_help = true,
+            Cmd::Range(r) => return self.set_range(r),
+            Cmd::NextRange => {
                 let i = (range_idx + 1).min(HistoryRange::ALL.len() - 1);
                 return self.set_range(HistoryRange::ALL[i]);
             }
-            KeyCode::Left | KeyCode::Char('h') => {
+            Cmd::PrevRange => {
                 return self.set_range(HistoryRange::ALL[range_idx.saturating_sub(1)]);
             }
-            KeyCode::Char('t') | KeyCode::Tab => {
-                if let Some(d) = self.detail.as_mut() {
-                    d.view = match d.view {
-                        DetailView::Chart => DetailView::Table,
-                        DetailView::Table => DetailView::Chart,
-                    };
+            Cmd::ToggleView => view(self, None),
+            Cmd::ViewChart => view(self, Some(DetailView::Chart)),
+            Cmd::ViewTable => view(self, Some(DetailView::Table)),
+            Cmd::Down => scroll(self, &|s| s + 1),
+            Cmd::Up => scroll(self, &|s| s.saturating_sub(1)),
+            Cmd::PageDown => scroll(self, &|s| s + 20),
+            Cmd::PageUp => scroll(self, &|s| s.saturating_sub(20)),
+            Cmd::GoTop => scroll(self, &|_| 0),
+            Cmd::GoEnd => scroll(self, &|_| usize::MAX),
+            Cmd::WatchAdd => {
+                if self.in_watchlist(&sym) {
+                    self.flash = Some(format!("{sym} is already on the watchlist"));
+                } else {
+                    return self.toggle_watchlist(sym);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(d) = self.detail.as_mut() {
-                    d.scroll = (d.scroll + 1).min(rows.saturating_sub(1));
+            Cmd::WatchRemove => {
+                if self.in_watchlist(&sym) {
+                    return self.toggle_watchlist(sym);
                 }
+                self.flash = Some(format!("{sym} isn't on the watchlist"));
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if let Some(d) = self.detail.as_mut() {
-                    d.scroll = d.scroll.saturating_sub(1);
-                }
-            }
-            KeyCode::PageDown => {
-                if let Some(d) = self.detail.as_mut() {
-                    d.scroll = (d.scroll + 20).min(rows.saturating_sub(1));
-                }
-            }
-            KeyCode::PageUp => {
-                if let Some(d) = self.detail.as_mut() {
-                    d.scroll = d.scroll.saturating_sub(20);
-                }
-            }
-            KeyCode::Char('a') | KeyCode::Char('w') => {
-                let sym = d.symbol.clone();
-                return self.toggle_watchlist(sym);
-            }
-            KeyCode::Char('/') => {
+            Cmd::Search => {
                 self.detail = None;
                 self.open_search();
             }
-            KeyCode::Char('r') => {
+            Cmd::Refresh => {
                 return self
                     .reload_history()
                     .into_iter()
@@ -496,6 +535,11 @@ mod tests {
         key(KeyCode::Char(c))
     }
 
+    /// Type a sequence of plain characters.
+    fn typ(a: &mut App, keys: &str) -> Vec<Action> {
+        keys.chars().flat_map(|c| a.on_key(ch(c))).collect()
+    }
+
     fn app() -> App {
         let mut a = App::new(vec!["SPY".into(), "QQQ".into(), "AAPL".into()], "IEX");
         a.set_assets(vec![
@@ -524,41 +568,70 @@ mod tests {
             a.on_key(ch('j'));
         }
         assert_eq!(a.selected, 2);
-        a.on_key(ch('g'));
+        typ(&mut a, "gg");
         assert_eq!(a.selected, 0);
+        typ(&mut a, "ge");
+        assert_eq!(a.selected, 2);
+        typ(&mut a, "g2g");
+        assert_eq!(a.selected, 1);
+        // Row past the end clamps.
+        typ(&mut a, "g99g");
+        assert_eq!(a.selected, 2);
         assert_eq!(a.on_key(ch('q')), vec![Action::Quit]);
+    }
+
+    #[test]
+    fn pending_prefix_shows_and_clears() {
+        let mut a = app();
+        a.on_key(ch('w'));
+        assert_eq!(a.pending.as_ref().map(|p| p.prefix), Some('w'));
+        // q after a prefix cancels instead of quitting.
+        assert!(a.on_key(ch('q')).is_empty());
+        assert!(a.pending.is_none());
+        a.on_key(ch('g'));
+        a.on_key(key(KeyCode::Esc));
+        assert!(a.pending.is_none());
     }
 
     #[test]
     fn remove_undo_and_reorder() {
         let mut a = app();
         a.on_key(ch('j')); // QQQ
-        assert_eq!(a.on_key(ch('d')), vec![Action::SaveWatchlist]);
+        assert_eq!(typ(&mut a, "wd"), vec![Action::SaveWatchlist]);
         assert_eq!(a.watchlist, vec!["SPY", "AAPL"]);
-        a.on_key(ch('u'));
+        typ(&mut a, "wu");
         assert_eq!(a.watchlist, vec!["SPY", "QQQ", "AAPL"]);
         assert_eq!(a.selected, 1);
-        a.on_key(ch('J'));
+        typ(&mut a, "wj");
         assert_eq!(a.watchlist, vec!["SPY", "AAPL", "QQQ"]);
         assert_eq!(a.selected, 2);
-        a.on_key(ch('K'));
-        a.on_key(ch('K'));
+        typ(&mut a, "wkwk");
         assert_eq!(a.watchlist, vec!["QQQ", "SPY", "AAPL"]);
         assert_eq!(a.selected, 0);
+        // The old bare keys no longer edit the list.
+        typ(&mut a, "dJK");
+        assert_eq!(a.watchlist, vec!["QQQ", "SPY", "AAPL"]);
     }
 
     #[test]
     fn removing_last_row_moves_selection_up() {
         let mut a = app();
-        a.on_key(ch('G'));
-        a.on_key(ch('d'));
+        typ(&mut a, "ge");
+        typ(&mut a, "wd");
         assert_eq!(a.selected, 1);
-        a.on_key(ch('d'));
-        a.on_key(ch('d'));
+        typ(&mut a, "wdwd");
         assert!(a.watchlist.is_empty());
         // Keys on an empty list are harmless.
-        assert!(a.on_key(ch('d')).is_empty());
+        assert!(typ(&mut a, "wd").is_empty());
+        assert!(typ(&mut a, "g1g").is_empty());
         assert!(a.on_key(key(KeyCode::Enter)).is_empty());
+    }
+
+    #[test]
+    fn watchlist_add_opens_search() {
+        let mut a = app();
+        typ(&mut a, "wa");
+        assert_eq!(a.mode, Mode::Search);
     }
 
     #[test]
@@ -640,6 +713,28 @@ mod tests {
     }
 
     #[test]
+    fn detail_prefixes_view_range_and_go() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Enter)); // SPY
+        assert_eq!(
+            typ(&mut a, "ty"),
+            vec![Action::FetchHistory("SPY".into(), HistoryRange::Year1)]
+        );
+        assert_eq!(a.detail.as_ref().unwrap().range, HistoryRange::Year1);
+        typ(&mut a, "vt");
+        assert_eq!(a.detail.as_ref().unwrap().view, DetailView::Table);
+        typ(&mut a, "vt"); // explicit, not a toggle
+        assert_eq!(a.detail.as_ref().unwrap().view, DetailView::Table);
+        typ(&mut a, "vc");
+        assert_eq!(a.detail.as_ref().unwrap().view, DetailView::Chart);
+        a.on_key(key(KeyCode::Tab));
+        assert_eq!(a.detail.as_ref().unwrap().view, DetailView::Table);
+        typ(&mut a, "gw");
+        assert_eq!(a.mode, Mode::Watchlist);
+        assert!(a.detail.is_none());
+    }
+
+    #[test]
     fn background_refresh_keeps_bars_on_screen() {
         let mut a = app();
         a.on_key(key(KeyCode::Enter)); // SPY, 1D requested
@@ -683,9 +778,15 @@ mod tests {
         a.on_key(ch('n'));
         a.on_key(key(KeyCode::Enter)); // NVDA, not on the list
         assert!(a.quote_symbols().contains(&"NVDA".to_string()));
-        // `a` in detail toggles it onto the list.
-        a.on_key(ch('a'));
+        // `w a` in detail adds it; again is a no-op; `w d` removes.
+        assert_eq!(
+            typ(&mut a, "wa"),
+            vec![Action::SaveWatchlist, Action::RefreshQuotes]
+        );
         assert!(a.in_watchlist("NVDA"));
+        assert!(typ(&mut a, "wa").is_empty());
+        typ(&mut a, "wd");
+        assert!(!a.in_watchlist("NVDA"));
     }
 
     #[test]
