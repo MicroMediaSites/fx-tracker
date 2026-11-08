@@ -42,8 +42,12 @@ pub enum Action {
     SaveWatchlist,
     /// Rebuild the in-play list.
     FetchInPlay,
-    /// Show an article in the reader window (opening it if needed).
-    ReaderShow(String),
+    /// Show an article in the reader window (opening it if needed); `label`
+    /// is the badge shown on the page.
+    ReaderShow {
+        url: String,
+        label: String,
+    },
     /// Close the reader window.
     ReaderClose,
     /// Fetch recent headlines for one symbol.
@@ -123,6 +127,55 @@ impl InPlayState {
         match self.selected_symbol().and_then(|s| self.news.get(&s)) {
             Some(Ok(items)) => items,
             _ => &[],
+        }
+    }
+
+    /// Badge text for the headline under the cursor.
+    pub fn cursor_label(&self) -> String {
+        let n = self.selected_headlines().len();
+        format!(
+            "{} · {} of {} · ctrl+shift+← prev · ctrl+shift+→ next",
+            self.selected_symbol().unwrap_or_default(),
+            self.news_cursor + 1,
+            n
+        )
+    }
+
+    /// `ReaderShow` for the headline under the cursor, if it has a link.
+    pub fn cursor_show(&self) -> Option<Action> {
+        self.cursor_url().map(|url| Action::ReaderShow {
+            url,
+            label: self.cursor_label(),
+        })
+    }
+
+    /// Move the cursor to the next/previous headline *with a link*.
+    pub fn step_linked(&mut self, forward: bool) -> bool {
+        let items = self.selected_headlines();
+        let has = |i: usize| {
+            items
+                .get(i)
+                .and_then(|n| n.url.as_deref())
+                .is_some_and(|u| !u.trim().is_empty())
+        };
+        let n = items.len();
+        let mut i = self.news_cursor;
+        loop {
+            if forward {
+                if i + 1 >= n {
+                    return false;
+                }
+                i += 1;
+            } else {
+                if i == 0 {
+                    return false;
+                }
+                i -= 1;
+            }
+            if has(i) {
+                self.news_cursor = i;
+                return true;
+            }
         }
     }
 
@@ -497,14 +550,25 @@ impl App {
         self.request_news(Utc::now())
     }
 
-    /// The reader window opened, failed, or closed.
-    pub fn set_reader(&mut self, event: super::reader::ReaderEvent) {
-        use super::reader::ReaderEvent;
+    /// The reader window opened, failed, closed, or asked (ctrl+shift+→/←
+    /// pressed in the window) for the next/previous article.
+    pub fn set_reader(&mut self, event: super::reader::ReaderEvent) -> Vec<Action> {
+        use super::reader::{NavDir, ReaderEvent};
         match event {
             ReaderEvent::Opened => self.inplay.reader_open = true,
             ReaderEvent::Error(e) => self.flash = Some(format!("reader: {e}")),
             ReaderEvent::Closed => self.inplay.reader_open = false,
+            ReaderEvent::Nav(dir) => {
+                if self.inplay.step_linked(dir == NavDir::Next) {
+                    return self.inplay.cursor_show().into_iter().collect();
+                }
+                self.flash = Some(match dir {
+                    NavDir::Next => "reader: that was the last linked headline".into(),
+                    NavDir::Prev => "reader: that was the first linked headline".into(),
+                });
+            }
         }
+        vec![]
     }
 
     /// Headline-pane keys (`tab` focus): move the headline cursor, open the
@@ -522,8 +586,8 @@ impl App {
             Cmd::GoTop => self.inplay.news_cursor = 0,
             Cmd::GoEnd => self.inplay.news_cursor = n.saturating_sub(1),
             Cmd::Open => {
-                return Some(match self.inplay.cursor_url() {
-                    Some(u) => vec![Action::ReaderShow(u)],
+                return Some(match self.inplay.cursor_show() {
+                    Some(a) => vec![a],
                     None => {
                         self.flash = Some("this headline has no link".into());
                         vec![]
@@ -534,8 +598,8 @@ impl App {
         }
         // Moving the cursor while the reader is open loads that article.
         if self.inplay.reader_open && self.inplay.news_cursor != before {
-            if let Some(u) = self.inplay.cursor_url() {
-                return Some(vec![Action::ReaderShow(u)]);
+            if let Some(a) = self.inplay.cursor_show() {
+                return Some(vec![a]);
             }
         }
         Some(vec![])
@@ -1361,7 +1425,7 @@ mod tests {
 
     #[test]
     fn headline_focus_opens_the_reader_and_follows_the_cursor() {
-        use crate::tui::reader::ReaderEvent;
+        use crate::tui::reader::{NavDir, ReaderEvent};
         let mut a = app();
         typ(&mut a, "gi");
         a.set_inplay(Ok((
@@ -1389,18 +1453,29 @@ mod tests {
         // tab moves focus into the headlines; enter opens the first article.
         a.on_key(key(KeyCode::Tab));
         assert!(a.inplay.focus_news);
-        assert_eq!(
-            a.on_key(key(KeyCode::Enter)),
-            vec![Action::ReaderShow("https://x/1".into())]
-        );
+        let show = |url: &str, i: usize| Action::ReaderShow {
+            url: url.into(),
+            label: format!("A · {i} of 3 · ctrl+shift+← prev · ctrl+shift+→ next"),
+        };
+        assert_eq!(a.on_key(key(KeyCode::Enter)), vec![show("https://x/1", 1)]);
         a.set_reader(ReaderEvent::Opened);
+        // ctrl+shift+→ in the window: skips the link-less headline 2.
+        assert_eq!(
+            a.set_reader(ReaderEvent::Nav(NavDir::Next)),
+            vec![show("https://x/3", 3)]
+        );
+        // At the end: nothing further, with a note.
+        assert!(a.set_reader(ReaderEvent::Nav(NavDir::Next)).is_empty());
+        assert!(a.flash.as_deref().unwrap_or("").contains("last"));
+        // ctrl+shift+← back to 1.
+        assert_eq!(
+            a.set_reader(ReaderEvent::Nav(NavDir::Prev)),
+            vec![show("https://x/1", 1)]
+        );
         // j moves to a link-less headline: nothing to load.
         assert!(typ(&mut a, "j").is_empty());
         // j again loads article 3 in the open window.
-        assert_eq!(
-            typ(&mut a, "j"),
-            vec![Action::ReaderShow("https://x/3".into())]
-        );
+        assert_eq!(typ(&mut a, "j"), vec![show("https://x/3", 3)]);
         // enter on a headline without a link explains instead of failing.
         typ(&mut a, "k");
         assert!(a.on_key(key(KeyCode::Enter)).is_empty());

@@ -77,9 +77,11 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 
   **Reading articles.** `tab` moves focus into the headlines, `j`/`k` picks a
   headline (`↗` means it has a link), and `enter` opens the article in a
-  chromeless ui-leaf window beside the terminal. While the window is open,
-  moving the cursor loads that article. `x` closes the window, and `tab` or
-  `esc` returns to the list. wickd drives the window over Chrome's DevTools
+  chromeless ui-leaf window. The window has its own keys: **ctrl+shift+→ /
+  ←** load the next or previous linked headline, and a corner badge shows
+  where you are (`NVDA · 3 of 12`). The TUI's `j`/`k` also drive it. `x`
+  closes the window, and `tab` or `esc` returns to the list. If you close
+  the window yourself, the next article just opens a new one. wickd drives the window over Chrome's DevTools
   protocol, on a random loopback port with a throwaway Chrome profile, because
   Benzinga pages refuse to be embedded in another page. That port has no
   authentication while the window is open, so only use it on your own machine.
