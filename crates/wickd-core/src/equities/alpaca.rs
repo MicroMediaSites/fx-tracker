@@ -417,6 +417,9 @@ pub struct NewsItem {
     pub symbols: Vec<String>,
     #[serde(default)]
     pub source: String,
+    /// Link to the full article (may be absent).
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[cfg(test)]
