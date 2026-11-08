@@ -163,7 +163,6 @@ const W: &[Ctx] = &[Ctx::Watchlist];
 const D: &[Ctx] = &[Ctx::Detail];
 const WD: &[Ctx] = &[Ctx::Watchlist, Ctx::Detail];
 const I: &[Ctx] = &[Ctx::InPlay];
-const WI: &[Ctx] = &[Ctx::Watchlist, Ctx::InPlay];
 const DI: &[Ctx] = &[Ctx::Detail, Ctx::InPlay];
 const WDI: &[Ctx] = &[Ctx::Watchlist, Ctx::Detail, Ctx::InPlay];
 
