@@ -74,6 +74,16 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   headlines for the selected symbol. Sources your plan doesn't include show a
   note instead of breaking the screen. Top movers only reset at the open, so
   before then the gap column is the useful one.
+
+  **Reading articles.** `tab` moves focus into the headlines, `j`/`k` picks a
+  headline (`↗` means it has a link), and `enter` opens the article in a
+  chromeless ui-leaf window beside the terminal. While the window is open,
+  moving the cursor loads that article. `x` closes the window, and `tab` or
+  `esc` returns to the list. wickd drives the window over Chrome's DevTools
+  protocol, on a random loopback port with a throwaway Chrome profile, because
+  Benzinga pages refuse to be embedded in another page. That port has no
+  authentication while the window is open, so only use it on your own machine.
+  It needs `ui-leaf` on your PATH.
 - **Search**. Matches ticker or company name over Alpaca's active-equity list,
   cached daily in `~/.wickd/cache/alpaca-assets.json`. `tab` adds or removes a
   symbol, `enter` opens it.

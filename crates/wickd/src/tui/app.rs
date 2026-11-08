@@ -42,6 +42,10 @@ pub enum Action {
     SaveWatchlist,
     /// Rebuild the in-play list.
     FetchInPlay,
+    /// Show an article in the reader window (opening it if needed).
+    ReaderShow(String),
+    /// Close the reader window.
+    ReaderClose,
     /// Fetch recent headlines for one symbol.
     FetchNews(String),
     Quit,
@@ -68,6 +72,12 @@ pub struct InPlayState {
     /// After a failed fetch, don't retry a symbol before this time.
     pub news_retry_after: HashMap<String, DateTime<Utc>>,
     pub news_pending: Vec<String>,
+    /// `tab` moved focus into the headlines pane.
+    pub focus_news: bool,
+    /// Selected headline (index into the selected symbol's headlines).
+    pub news_cursor: usize,
+    /// The reader window is open (it follows the headline cursor).
+    pub reader_open: bool,
 }
 
 /// Rows (from the top of the visible list) that get a NEWS age.
@@ -92,6 +102,9 @@ impl Default for InPlayState {
             news_at: HashMap::new(),
             news_retry_after: HashMap::new(),
             news_pending: Vec::new(),
+            focus_news: false,
+            news_cursor: 0,
+            reader_open: false,
         }
     }
 }
@@ -103,6 +116,22 @@ impl InPlayState {
 
     pub fn selected_symbol(&self) -> Option<String> {
         self.visible().get(self.selected).map(|r| r.symbol.clone())
+    }
+
+    /// Headlines loaded for the selected symbol.
+    pub fn selected_headlines(&self) -> &[NewsItem] {
+        match self.selected_symbol().and_then(|s| self.news.get(&s)) {
+            Some(Ok(items)) => items,
+            _ => &[],
+        }
+    }
+
+    /// Link of the headline under the news cursor.
+    pub fn cursor_url(&self) -> Option<String> {
+        self.selected_headlines()
+            .get(self.news_cursor)
+            .and_then(|n| n.url.clone())
+            .filter(|u| !u.trim().is_empty())
     }
 }
 
@@ -468,6 +497,50 @@ impl App {
         self.request_news(Utc::now())
     }
 
+    /// The reader window opened, failed, or closed.
+    pub fn set_reader(&mut self, event: super::reader::ReaderEvent) {
+        use super::reader::ReaderEvent;
+        match event {
+            ReaderEvent::Opened => self.inplay.reader_open = true,
+            ReaderEvent::Error(e) => self.flash = Some(format!("reader: {e}")),
+            ReaderEvent::Closed => self.inplay.reader_open = false,
+        }
+    }
+
+    /// Headline-pane keys (`tab` focus): move the headline cursor, open the
+    /// article, or hand focus back to the list. `None` = not handled here.
+    fn exec_headlines(&mut self, cmd: Cmd) -> Option<Vec<Action>> {
+        let n = self.inplay.selected_headlines().len();
+        let before = self.inplay.news_cursor;
+        match cmd {
+            Cmd::FocusNews | Cmd::Back => {
+                self.inplay.focus_news = false;
+                return Some(vec![]);
+            }
+            Cmd::Down => self.inplay.news_cursor = (before + 1).min(n.saturating_sub(1)),
+            Cmd::Up => self.inplay.news_cursor = before.saturating_sub(1),
+            Cmd::GoTop => self.inplay.news_cursor = 0,
+            Cmd::GoEnd => self.inplay.news_cursor = n.saturating_sub(1),
+            Cmd::Open => {
+                return Some(match self.inplay.cursor_url() {
+                    Some(u) => vec![Action::ReaderShow(u)],
+                    None => {
+                        self.flash = Some("this headline has no link".into());
+                        vec![]
+                    }
+                });
+            }
+            _ => return None,
+        }
+        // Moving the cursor while the reader is open loads that article.
+        if self.inplay.reader_open && self.inplay.news_cursor != before {
+            if let Some(u) = self.inplay.cursor_url() {
+                return Some(vec![Action::ReaderShow(u)]);
+            }
+        }
+        Some(vec![])
+    }
+
     pub fn set_news(&mut self, symbol: String, result: Result<Vec<NewsItem>, String>) {
         self.inplay.news_pending.retain(|s| *s != symbol);
         // Successes are fresh for the TTL. A failure (e.g. a rate-limit hit)
@@ -489,6 +562,36 @@ impl App {
     }
 
     fn exec_inplay(&mut self, cmd: Cmd) -> Vec<Action> {
+        if self.inplay.focus_news {
+            if let Some(actions) = self.exec_headlines(cmd) {
+                return actions;
+            }
+        }
+        if cmd == Cmd::CloseReader {
+            return if self.inplay.reader_open {
+                vec![Action::ReaderClose]
+            } else {
+                vec![]
+            };
+        }
+        if cmd == Cmd::FocusNews {
+            if self.inplay.selected_headlines().is_empty() {
+                self.flash = Some("no headlines for this symbol yet".into());
+            } else {
+                self.inplay.focus_news = true;
+                self.inplay.news_cursor = 0;
+            }
+            return vec![];
+        }
+        let before_sel = self.inplay.selected;
+        let actions = self.exec_inplay_list(cmd);
+        if self.inplay.selected != before_sel {
+            self.inplay.news_cursor = 0;
+        }
+        actions
+    }
+
+    fn exec_inplay_list(&mut self, cmd: Cmd) -> Vec<Action> {
         let len = self.inplay.visible().len();
         let ip_sel = self.inplay.selected;
         let resort = |app: &mut App, by: SortBy| {
@@ -1224,6 +1327,7 @@ mod tests {
             created_at: t,
             symbols: vec!["A".into()],
             source: "benzinga".into(),
+            url: None,
         };
         a.set_news(
             "A".into(),
@@ -1253,6 +1357,71 @@ mod tests {
         a.inplay.news_pending.clear();
         assert_eq!(typ(&mut a, "r"), vec![Action::FetchInPlay]);
         assert!(a.inplay.news.is_empty());
+    }
+
+    #[test]
+    fn headline_focus_opens_the_reader_and_follows_the_cursor() {
+        use crate::tui::reader::ReaderEvent;
+        let mut a = app();
+        typ(&mut a, "gi");
+        a.set_inplay(Ok((
+            vec![ip_row("A", 9.0, 10.0, 1.0), ip_row("B", 5.0, 10.0, 1.0)],
+            vec![],
+        )));
+        let t: chrono::DateTime<chrono::Utc> = "2026-11-06T12:00:00Z".parse().unwrap();
+        let item = |id: i64, url: Option<&str>| NewsItem {
+            id,
+            headline: format!("h{id}"),
+            summary: String::new(),
+            created_at: t,
+            symbols: vec!["A".into()],
+            source: "benzinga".into(),
+            url: url.map(str::to_string),
+        };
+        a.set_news(
+            "A".into(),
+            Ok(vec![
+                item(1, Some("https://x/1")),
+                item(2, None),
+                item(3, Some("https://x/3")),
+            ]),
+        );
+        // tab moves focus into the headlines; enter opens the first article.
+        a.on_key(key(KeyCode::Tab));
+        assert!(a.inplay.focus_news);
+        assert_eq!(
+            a.on_key(key(KeyCode::Enter)),
+            vec![Action::ReaderShow("https://x/1".into())]
+        );
+        a.set_reader(ReaderEvent::Opened);
+        // j moves to a link-less headline: nothing to load.
+        assert!(typ(&mut a, "j").is_empty());
+        // j again loads article 3 in the open window.
+        assert_eq!(
+            typ(&mut a, "j"),
+            vec![Action::ReaderShow("https://x/3".into())]
+        );
+        // enter on a headline without a link explains instead of failing.
+        typ(&mut a, "k");
+        assert!(a.on_key(key(KeyCode::Enter)).is_empty());
+        assert!(a.flash.as_deref().unwrap_or("").contains("no link"));
+        // esc returns focus to the list; j then moves the list, resetting the cursor.
+        a.on_key(key(KeyCode::Esc));
+        assert!(!a.inplay.focus_news);
+        assert_eq!(a.mode, Mode::InPlay);
+        typ(&mut a, "j");
+        assert_eq!(
+            (a.inplay.selected_symbol().as_deref(), a.inplay.news_cursor),
+            (Some("B"), 0)
+        );
+        // tab on a symbol with no headlines says so.
+        a.on_key(key(KeyCode::Tab));
+        assert!(!a.inplay.focus_news);
+        // x closes the reader window.
+        assert_eq!(typ(&mut a, "x"), vec![Action::ReaderClose]);
+        // Reader closing is tracked.
+        a.set_reader(ReaderEvent::Closed);
+        assert!(!a.inplay.reader_open);
     }
 
     #[test]

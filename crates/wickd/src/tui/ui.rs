@@ -550,10 +550,18 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
 
     // Headlines for the selected symbol.
     let sel = ip.selected_symbol();
-    let title = match &sel {
+    let mut title = match &sel {
         Some(s) => format!(" {s} · headlines "),
         None => " headlines ".into(),
     };
+    if ip.focus_news {
+        title.push_str("· j/k pick · enter open · tab back ");
+    } else {
+        title.push_str("· tab to pick ");
+    }
+    if ip.reader_open {
+        title.push_str("· reader open ");
+    }
     let nblock = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(GRID))
@@ -562,6 +570,7 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(nblock, cols[1]);
     let width = ninner.width.saturating_sub(1) as usize;
     let mut lines: Vec<Line> = Vec::new();
+    let mut picked_line = 0usize;
     match sel.as_ref().and_then(|s| ip.news.get(s)) {
         None if sel.is_some() => lines.push(Line::from(Span::styled(
             "loading…",
@@ -577,7 +586,16 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(DIM),
         ))),
         Some(Ok(items)) => {
-            for n in items {
+            for (i, n) in items.iter().enumerate() {
+                let picked = ip.focus_news && i == ip.news_cursor;
+                if picked {
+                    picked_line = lines.len();
+                }
+                let hl = if picked {
+                    Style::default().bg(Color::Rgb(44, 52, 66))
+                } else {
+                    Style::default()
+                };
                 let when = local(n.created_at);
                 let stamp = if wickd_core::equities::eastern_date(n.created_at)
                     == wickd_core::equities::eastern_date(now)
@@ -586,18 +604,31 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     when.format("%a %b %-d").to_string()
                 };
-                lines.push(Line::from(vec![
-                    Span::styled(stamp, Style::default().fg(ACCENT)),
-                    Span::styled(
-                        format!("  {}", inplay::age(n.created_at, now)),
-                        Style::default().fg(DIM),
-                    ),
-                ]));
+                let link = if n.url.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+                    "  ↗"
+                } else {
+                    "  (no link)"
+                };
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(if picked { "▶ " } else { "" }, Style::default().fg(ACCENT)),
+                        Span::styled(stamp, Style::default().fg(ACCENT)),
+                        Span::styled(
+                            format!("  {}", inplay::age(n.created_at, now)),
+                            Style::default().fg(DIM),
+                        ),
+                        Span::styled(link, Style::default().fg(DIM)),
+                    ])
+                    .style(hl),
+                );
                 for l in wrap(&n.headline, width) {
-                    lines.push(Line::from(Span::styled(
-                        l,
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )));
+                    lines.push(
+                        Line::from(Span::styled(
+                            l,
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ))
+                        .style(hl),
+                    );
                 }
                 if !n.summary.trim().is_empty() {
                     for l in wrap(n.summary.trim(), width).into_iter().take(3) {
@@ -608,7 +639,10 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-    frame.render_widget(Paragraph::new(lines), ninner);
+    // Keep the picked headline on screen.
+    let room = ninner.height.saturating_sub(4) as usize;
+    let scroll = picked_line.saturating_sub(room) as u16;
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), ninner);
 }
 
 /// Greedy word wrap to `width` columns.
@@ -1720,6 +1754,7 @@ mod tests {
                 created_at: now - chrono::Duration::hours(10),
                 symbols: vec!["WDAY".into()],
                 source: "benzinga".into(),
+                url: Some("https://www.benzinga.com/news/1".into()),
             }]),
         );
     }

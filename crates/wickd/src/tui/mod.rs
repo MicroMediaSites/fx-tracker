@@ -28,6 +28,7 @@ pub mod app;
 pub mod chart;
 pub mod inplay;
 pub mod keymap;
+pub mod reader;
 pub mod search;
 pub mod store;
 pub mod ui;
@@ -74,6 +75,7 @@ enum Reply {
     Clock(Result<MarketClock, String>),
     InPlay(Result<(Vec<inplay::Row>, Vec<String>), String>),
     News(String, Result<Vec<NewsItem>, String>),
+    Reader(reader::ReaderEvent),
 }
 
 /// Headline lookback, shared by the list's NEWS column and the side pane so
@@ -283,10 +285,25 @@ pub async fn run(client: AlpacaClient, watchlist: Vec<String>, opts: Options) ->
     let feed_label = client.feed().display_label();
     let history_delayed = client.feed() != wickd_core::equities::alpaca::QuoteFeed::Sip;
     let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
+    // The reader window gets its own task so its commands stay in order.
+    let (reader_tx, reader_rx) = unbounded_channel::<reader::ReaderCmd>();
+    {
+        use crate::commands::view::{resolve_views_root, ui_leaf_bin, views_root_candidates};
+        let root = resolve_views_root(&views_root_candidates(), "reader", |p| p.exists());
+        let tx = reply_tx.clone();
+        tokio::spawn(reader::run(
+            reader_rx,
+            move |ev| {
+                let _ = tx.send(Reply::Reader(ev));
+            },
+            ui_leaf_bin(),
+            root,
+        ));
+    }
     let requests = spawn_worker(client, reply_tx);
     let mut app = App::new(watchlist, feed_label);
     app.history_delayed = history_delayed;
-    tokio::task::spawn_blocking(move || run_loop(app, requests, reply_rx, opts))
+    tokio::task::spawn_blocking(move || run_loop(app, requests, reader_tx, reply_rx, opts))
         .await
         .context("tui task panicked")?
 }
@@ -294,6 +311,7 @@ pub async fn run(client: AlpacaClient, watchlist: Vec<String>, opts: Options) ->
 fn run_loop(
     mut app: App,
     requests: UnboundedSender<Request>,
+    reader_tx: UnboundedSender<reader::ReaderCmd>,
     replies: mpsc::Receiver<Reply>,
     opts: Options,
 ) -> Result<()> {
@@ -349,6 +367,7 @@ fn run_loop(
                 }
                 Reply::InPlay(r) => actions.extend(app.set_inplay(r)),
                 Reply::News(sym, r) => app.set_news(sym, r),
+                Reply::Reader(ev) => app.set_reader(ev),
             }
         }
 
@@ -413,7 +432,26 @@ fn run_loop(
         // 5. Side effects from replies and keys.
         for action in actions {
             match action {
-                Action::Quit => return Ok(()),
+                Action::Quit => {
+                    if app.inplay.reader_open {
+                        // Close the reader window and wait (bounded) for the
+                        // reader task to confirm, instead of guessing a delay.
+                        let (ack_tx, ack_rx) = mpsc::channel();
+                        if reader_tx
+                            .send(reader::ReaderCmd::Close(Some(ack_tx)))
+                            .is_ok()
+                        {
+                            let _ = ack_rx.recv_timeout(Duration::from_secs(4));
+                        }
+                    }
+                    return Ok(());
+                }
+                Action::ReaderShow(url) => {
+                    let _ = reader_tx.send(reader::ReaderCmd::Show(url));
+                }
+                Action::ReaderClose => {
+                    let _ = reader_tx.send(reader::ReaderCmd::Close(None));
+                }
                 Action::RefreshQuotes => {
                     quotes.reset();
                     sparks.reset();

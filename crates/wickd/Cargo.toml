@@ -57,6 +57,12 @@ flate2 = "1"
 ratatui = "0.29"
 crossterm = "0.28"
 
+# News reader window (`wickd tui`): drive the ui-leaf Chrome window over the
+# DevTools protocol (loopback WebSocket + `/json/list` over HTTP).
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+
 [dev-dependencies]
 # Temp data homes for the `wickd tui` store tests.
 tempfile = "3"

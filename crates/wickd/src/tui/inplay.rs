@@ -337,6 +337,7 @@ mod tests {
             created_at: "2026-11-06T12:00:00Z".parse().unwrap(),
             symbols: vec!["AAA".into()],
             source: "benzinga".into(),
+            url: None,
         }];
         let u = vec![
             ("AAA".to_string(), vec![Tag::Gainer]),

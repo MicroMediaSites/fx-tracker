@@ -292,13 +292,13 @@ fn watch_child_args(a: &WatcherArgs) -> Vec<String> {
 }
 
 /// The ui-leaf binary to invoke (`WICKD_UI_LEAF_BIN` override, else `ui-leaf`).
-fn ui_leaf_bin() -> String {
+pub(crate) fn ui_leaf_bin() -> String {
     std::env::var("WICKD_UI_LEAF_BIN").unwrap_or_else(|_| UI_LEAF_BIN.to_string())
 }
 
 /// Ordered candidate locations for the bundled view assets; first that contains
 /// `<view>.tsx` wins. `WICKD_VIEWS_ROOT` takes precedence over all of them.
-fn views_root_candidates() -> Vec<PathBuf> {
+pub(crate) fn views_root_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(p) = std::env::var("WICKD_VIEWS_ROOT") {
         out.push(PathBuf::from(p));
@@ -316,7 +316,7 @@ fn views_root_candidates() -> Vec<PathBuf> {
 
 /// Pick the first candidate directory that contains `<view>.tsx`. Pure: the
 /// caller supplies the existence check so this is unit-testable offline.
-fn resolve_views_root(
+pub(crate) fn resolve_views_root(
     candidates: &[PathBuf],
     view: &str,
     exists: impl Fn(&Path) -> bool,
