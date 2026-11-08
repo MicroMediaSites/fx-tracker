@@ -48,7 +48,7 @@ use wickd_core::config::OandaEnvironment;
 /// Keychain service name. The environment-level item is keyed by the
 /// environment ("practice" / "live"), a dedicated named-account item by
 /// "<env>/<name>"; the stored secret is always the OANDA API key.
-const KEYRING_SERVICE: &str = "wickd";
+pub(crate) const KEYRING_SERVICE: &str = "wickd";
 
 /// The implicit account name a v1 single-account config answers to, and the
 /// account every command resolves when `--account` isn't passed (AGT-625 AC3).
@@ -240,7 +240,7 @@ const KEYCHAIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// thread (Security.framework calls are blocking and uncancellable); on
 /// timeout the thread is abandoned — it parks harmlessly until process
 /// exit — and the caller gets an actionable error instead of a hang.
-fn get_password_bounded(
+pub(crate) fn get_password_bounded(
     entry: keyring::Entry,
     key: &str,
 ) -> Result<std::result::Result<String, keyring::Error>> {

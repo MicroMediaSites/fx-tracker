@@ -25,6 +25,36 @@ feature — meant to be followed together by you and an agent.
 | `watch` | Persistent, monitoring-only signal daemon (NDJSON events; never trades) |
 | `audit` | Read the append-only audit log of execution decisions |
 | `trade report` / `trade baseline` | Account P&L since a recorded per-account baseline |
+| `tui` | Stock ticker TUI: watchlist, symbol search, price-history drill-down (US equities) |
+| `alpaca login` / `status` / `logout` | Store / inspect / remove the Alpaca market-data keys `tui` uses |
+
+## `wickd tui` — stock ticker
+
+An interactive terminal ticker for US stocks and ETFs, backed by Alpaca's
+market-data API. Like `dashboard`, it is interactive rather than JSON. It is
+read-only: it never places orders.
+
+```
+wickd alpaca login     # once: key id + secret from a free Alpaca paper account
+wickd tui              # IEX real-time quotes (free plan)
+wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
+```
+
+- **Watchlist** (`~/.wickd/tui.json`). Shows last, change vs the prior session
+  close, day range, volume and a sparkline of today. `/` searches, `d` removes
+  (`u` undoes), `J`/`K` reorders, and `enter` opens a symbol.
+- **Search**. Matches ticker or company name over Alpaca's active-equity list,
+  cached daily in `~/.wickd/cache/alpaca-assets.json`. `tab` adds or removes a
+  symbol, `enter` opens it.
+- **Symbol view**. `1`–`7` pick 1D/5D/1M/6M/1Y/5Y/MAX, and `t` flips between
+  the chart and a newest-first OHLCV table. The 1D chart marks the prior close.
+- **Data**. Quotes poll every 15s (`--refresh`). On the free plan, live quotes
+  are IEX-only (about 3% of volume). `--feed delayed-sip` trades that for
+  all-exchange quotes 15 minutes behind. History is always consolidated and
+  split-adjusted, and runs 15 minutes behind on the free plan. Times are shown
+  in the local zone.
+- **Keys**. Agents can export `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY`
+  instead of using the keychain item (service `wickd`, account `alpaca`).
 
 ## Named accounts (`--account`)
 
