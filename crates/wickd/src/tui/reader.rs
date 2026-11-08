@@ -84,6 +84,8 @@ pub enum ReaderCmd {
     /// Show this article (opening the window first if needed); `label` is the
     /// badge text shown on the page.
     Show { url: String, label: String },
+    /// Flash a short message on the page badge (e.g. "last linked headline").
+    Notice(String),
     /// Close the window; the sender (if any) is signalled once it's closed,
     /// so the TUI can wait for a clean shutdown instead of guessing a delay.
     Close(Option<std::sync::mpsc::Sender<()>>),
@@ -194,8 +196,27 @@ pub fn page_script(label: &str) -> String {
       "padding:6px 10px;border-radius:6px;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,.4)";
     (document.body || document.documentElement).appendChild(b);
   }};
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", badge);
-  else badge();
+  // Flash a message on the badge, then restore the label.
+  window.__wickdFlash = (msg) => {{
+    const b = document.getElementById("__wickd_badge");
+    if (!b) return;
+    b.textContent = msg;
+    clearTimeout(window.__wickdFlashT);
+    window.__wickdFlashT = setTimeout(() => {{ b.textContent = label; }}, 2500);
+  }};
+  // Give the article itself keyboard focus (not an embedded ad/video frame),
+  // so ctrl+shift+arrows work without clicking first.
+  const focusPage = () => {{
+    try {{
+      window.focus();
+      const a = document.activeElement;
+      if (a && a.tagName === "IFRAME") a.blur();
+    }} catch (e) {{}}
+  }};
+  const ready = () => {{ badge(); focusPage(); }};
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", ready);
+  else ready();
+  window.addEventListener("load", focusPage);
 }})();"#
     )
 }
@@ -459,7 +480,23 @@ impl Session {
         if let Some(e) = r.get("errorText").and_then(Value::as_str) {
             return Err(NavError::Other(format!("couldn't open the article: {e}")));
         }
+        // Raise the window so keyboard focus lands on the new page.
+        let _ = cdp.call("Page.bringToFront", json!({})).await;
         Ok(())
+    }
+
+    /// Flash `text` on the current page's badge (best effort).
+    async fn notice(&mut self, text: &str) {
+        let Some(cdp) = self.cdp.as_mut() else {
+            return;
+        };
+        let js = format!(
+            "window.__wickdFlash && window.__wickdFlash({})",
+            serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into())
+        );
+        let _ = cdp
+            .call("Runtime.evaluate", json!({ "expression": js }))
+            .await;
     }
 
     async fn close(mut self) {
@@ -577,6 +614,11 @@ pub async fn run(
                     }
                 }
                 Some(ReaderCmd::Show { url, label }) => r.show(&url, &label, &events).await,
+                Some(ReaderCmd::Notice(text)) => {
+                    if let Some(s) = r.session.as_mut() {
+                        s.notice(&text).await;
+                    }
+                }
             },
             Some(dir) = nav_rx.recv() => {
                 if r.session.is_some() {
@@ -740,6 +782,29 @@ mod tests {
             .unwrap();
         println!("badge: {badge}");
         assert_eq!(badge["result"]["value"], "TEST · 2 of 2");
+        // The page itself has focus (not a frame).
+        let focus = cdp
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": "document.activeElement?.tagName || ''" }),
+            )
+            .await
+            .unwrap();
+        println!("focus: {focus}");
+        assert_ne!(focus["result"]["value"], "IFRAME");
+        // A notice flashes on the badge.
+        let s = r.session.as_mut().unwrap();
+        s.notice("last linked headline").await;
+        let cdp = s.cdp.as_mut().unwrap();
+        let flashed = cdp
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": "document.getElementById('__wickd_badge')?.textContent" }),
+            )
+            .await
+            .unwrap();
+        println!("flashed: {flashed}");
+        assert_eq!(flashed["result"]["value"], "last linked headline");
         r.close(&events).await;
     }
 

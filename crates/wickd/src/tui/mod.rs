@@ -300,9 +300,11 @@ pub async fn run(client: AlpacaClient, watchlist: Vec<String>, opts: Options) ->
             root,
         ));
     }
+    let budget = client.rate_limit_cell();
     let requests = spawn_worker(client, reply_tx);
     let mut app = App::new(watchlist, feed_label);
     app.history_delayed = history_delayed;
+    app.api_budget = Some(budget);
     tokio::task::spawn_blocking(move || run_loop(app, requests, reader_tx, reply_rx, opts))
         .await
         .context("tui task panicked")?
@@ -451,6 +453,9 @@ fn run_loop(
                 }
                 Action::ReaderClose => {
                     let _ = reader_tx.send(reader::ReaderCmd::Close(None));
+                }
+                Action::ReaderNotice(text) => {
+                    let _ = reader_tx.send(reader::ReaderCmd::Notice(text));
                 }
                 Action::RefreshQuotes => {
                     quotes.reset();

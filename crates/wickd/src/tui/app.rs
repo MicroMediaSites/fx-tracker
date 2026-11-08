@@ -50,6 +50,8 @@ pub enum Action {
     },
     /// Close the reader window.
     ReaderClose,
+    /// Flash a short message on the reader window's badge.
+    ReaderNotice(String),
     /// Fetch recent headlines for one symbol.
     FetchNews(String),
     Quit,
@@ -82,6 +84,9 @@ pub struct InPlayState {
     pub news_cursor: usize,
     /// The reader window is open (it follows the headline cursor).
     pub reader_open: bool,
+    /// What the reader window is paging through: pinned when an article is
+    /// opened, so list rebuilds and selection changes can't move it.
+    pub reader_pin: Option<ReaderPin>,
 }
 
 /// Rows a J/K (shift) step moves in a list.
@@ -114,6 +119,7 @@ impl Default for InPlayState {
             focus_news: false,
             news_cursor: 0,
             reader_open: false,
+            reader_pin: None,
         }
     }
 }
@@ -135,53 +141,42 @@ impl InPlayState {
         }
     }
 
-    /// Badge text for the headline under the cursor.
-    pub fn cursor_label(&self) -> String {
-        let n = self.selected_headlines().len();
-        format!(
-            "{} · {} of {} · ctrl+shift+← prev · ctrl+shift+→ next",
-            self.selected_symbol().unwrap_or_default(),
-            self.news_cursor + 1,
-            n
-        )
+    /// Pin the reader to the selected symbol's headlines at the cursor and
+    /// return the `ReaderShow` for it (if that headline has a link).
+    pub fn pin_cursor(&mut self) -> Option<Action> {
+        let symbol = self.selected_symbol()?;
+        let items = self.selected_headlines().to_vec();
+        self.cursor_url()?;
+        self.reader_pin = Some(ReaderPin {
+            symbol,
+            items,
+            index: self.news_cursor,
+        });
+        self.reader_pin.as_ref().and_then(ReaderPin::show)
     }
 
-    /// `ReaderShow` for the headline under the cursor, if it has a link.
-    pub fn cursor_show(&self) -> Option<Action> {
-        self.cursor_url().map(|url| Action::ReaderShow {
-            url,
-            label: self.cursor_label(),
-        })
-    }
-
-    /// Move the cursor to the next/previous headline *with a link*.
-    pub fn step_linked(&mut self, forward: bool) -> bool {
-        let items = self.selected_headlines();
-        let has = |i: usize| {
-            items
-                .get(i)
-                .and_then(|n| n.url.as_deref())
-                .is_some_and(|u| !u.trim().is_empty())
+    /// Step the pinned reader to the next/previous *linked* headline. Keeps
+    /// the TUI's headline cursor in sync when it's on the same symbol.
+    pub fn step_pin(&mut self, forward: bool) -> Result<Action, String> {
+        let selected = self.selected_symbol();
+        let Some(pin) = self.reader_pin.as_mut() else {
+            return Err("no article open".into());
         };
-        let n = items.len();
-        let mut i = self.news_cursor;
-        loop {
-            if forward {
-                if i + 1 >= n {
-                    return false;
-                }
-                i += 1;
-            } else {
-                if i == 0 {
-                    return false;
-                }
-                i -= 1;
-            }
-            if has(i) {
-                self.news_cursor = i;
-                return true;
-            }
+        if pin.items.is_empty() {
+            return Err("headlines unavailable".into());
         }
+        let Some(i) = pin.next_linked(forward) else {
+            return Err(if forward {
+                "last linked headline".into()
+            } else {
+                "first linked headline".into()
+            });
+        };
+        pin.index = i;
+        if selected.as_deref() == Some(pin.symbol.as_str()) {
+            self.news_cursor = i;
+        }
+        pin.show().ok_or_else(|| "this headline has no link".into())
     }
 
     /// Link of the headline under the news cursor.
@@ -202,6 +197,61 @@ pub struct FindState {
     pub selected: usize,
     /// The list cursor before `g f`, restored on `esc`.
     pub saved: usize,
+}
+
+/// The reader's own copy of the headlines it pages through.
+#[derive(Debug, Clone)]
+pub struct ReaderPin {
+    pub symbol: String,
+    pub items: Vec<NewsItem>,
+    pub index: usize,
+}
+
+impl ReaderPin {
+    fn url(&self, i: usize) -> Option<String> {
+        self.items
+            .get(i)
+            .and_then(|n| n.url.clone())
+            .filter(|u| !u.trim().is_empty())
+    }
+
+    pub fn label(&self) -> String {
+        format!(
+            "{} · {} of {} · ctrl+shift+← prev · ctrl+shift+→ next",
+            self.symbol,
+            self.index + 1,
+            self.items.len()
+        )
+    }
+
+    pub fn show(&self) -> Option<Action> {
+        self.url(self.index).map(|url| Action::ReaderShow {
+            url,
+            label: self.label(),
+        })
+    }
+
+    /// Index of the next/previous headline with a link.
+    fn next_linked(&self, forward: bool) -> Option<usize> {
+        let n = self.items.len();
+        let mut i = self.index;
+        loop {
+            if forward {
+                if i + 1 >= n {
+                    return None;
+                }
+                i += 1;
+            } else {
+                if i == 0 {
+                    return None;
+                }
+                i -= 1;
+            }
+            if self.url(i).is_some() {
+                return Some(i);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -296,6 +346,8 @@ pub struct App {
     /// Last removed watchlist entry, for `u`ndo.
     undo: Option<(usize, String)>,
     pub feed_label: &'static str,
+    /// Live Alpaca market-data budget (shared with the client).
+    pub api_budget: Option<wickd_core::equities::alpaca::RateLimitCell>,
     /// History runs ~15 min behind (any plan without real-time SIP).
     pub history_delayed: bool,
 }
@@ -324,6 +376,7 @@ impl App {
             undo: None,
             feed_label,
             history_delayed: true,
+            api_budget: None,
         }
     }
 
@@ -584,13 +637,11 @@ impl App {
             ReaderEvent::Error(e) => self.flash = Some(format!("reader: {e}")),
             ReaderEvent::Closed => self.inplay.reader_open = false,
             ReaderEvent::Nav(dir) => {
-                if self.inplay.step_linked(dir == NavDir::Next) {
-                    return self.inplay.cursor_show().into_iter().collect();
-                }
-                self.flash = Some(match dir {
-                    NavDir::Next => "reader: that was the last linked headline".into(),
-                    NavDir::Prev => "reader: that was the first linked headline".into(),
-                });
+                // Feedback goes to the window's badge — that's where you are.
+                return vec![match self.inplay.step_pin(dir == NavDir::Next) {
+                    Ok(show) => show,
+                    Err(msg) => Action::ReaderNotice(msg),
+                }];
             }
         }
         vec![]
@@ -616,7 +667,7 @@ impl App {
             Cmd::GoTop => self.inplay.news_cursor = 0,
             Cmd::GoEnd => self.inplay.news_cursor = n.saturating_sub(1),
             Cmd::Open => {
-                return Some(match self.inplay.cursor_show() {
+                return Some(match self.inplay.pin_cursor() {
                     Some(a) => vec![a],
                     None => {
                         self.flash = Some("this headline has no link".into());
@@ -627,8 +678,10 @@ impl App {
             _ => return None,
         }
         // Moving the cursor while the reader is open loads that article.
+        // Moving the cursor in the TUI while the reader is open re-pins it
+        // to what you picked.
         if self.inplay.reader_open && self.inplay.news_cursor != before {
-            if let Some(a) = self.inplay.cursor_show() {
+            if let Some(a) = self.inplay.pin_cursor() {
                 return Some(vec![a]);
             }
         }
@@ -651,7 +704,12 @@ impl App {
                 now + chrono::Duration::seconds(NEWS_RETRY_SECONDS),
             );
         }
-        self.inplay.news.insert(symbol, result);
+        // A failed refresh keeps the headlines we already had: wiping them
+        // would leave the pane, the NEWS column and the reader with nothing.
+        let had_good = matches!(self.inplay.news.get(&symbol), Some(Ok(_)));
+        if result.is_ok() || !had_good {
+            self.inplay.news.insert(symbol, result);
+        }
         self.apply_news_cache();
     }
 
@@ -708,10 +766,13 @@ impl App {
             Cmd::GoTop => self.inplay.selected = 0,
             Cmd::GoEnd if len > 0 => self.inplay.selected = len - 1,
             Cmd::Refresh => {
-                self.inplay.news.clear();
-                self.inplay.news_at.clear();
-                self.inplay.news_retry_after.clear();
-                self.inplay.news_pending.clear();
+                // Rebuild the list; refetch only the selected symbol's
+                // headlines (the rest keep their 10-minute cache) so `r`
+                // can't burn the API budget.
+                if let Some(sym) = self.inplay.selected_symbol() {
+                    self.inplay.news_at.remove(&sym);
+                    self.inplay.news_retry_after.remove(&sym);
+                }
                 if !self.inplay.loading {
                     self.inplay.loading = true;
                     return vec![Action::FetchInPlay];
@@ -1560,10 +1621,14 @@ mod tests {
         assert!(a.request_news(chrono::Utc::now()).is_empty());
         let after = chrono::Utc::now() + chrono::Duration::seconds(NEWS_RETRY_SECONDS + 1);
         assert_eq!(a.request_news(after), vec![Action::FetchNews("A".into())]);
-        // r clears the cache and refetches.
+        // r rebuilds the list and refetches only the selected symbol's
+        // headlines, keeping the cached ones on screen meanwhile.
         a.inplay.news_pending.clear();
+        a.set_news("A".into(), Ok(vec![item(1, t)]));
         assert_eq!(typ(&mut a, "r"), vec![Action::FetchInPlay]);
-        assert!(a.inplay.news.is_empty());
+        assert!(a.inplay.news.contains_key("A"));
+        let acts = a.set_inplay(Ok((vec![ip_row("A", 9.5, 10.0, 1.0)], vec![])));
+        assert_eq!(acts, vec![Action::FetchNews("A".into())]);
     }
 
     #[test]
@@ -1607,9 +1672,11 @@ mod tests {
             a.set_reader(ReaderEvent::Nav(NavDir::Next)),
             vec![show("https://x/3", 3)]
         );
-        // At the end: nothing further, with a note.
-        assert!(a.set_reader(ReaderEvent::Nav(NavDir::Next)).is_empty());
-        assert!(a.flash.as_deref().unwrap_or("").contains("last"));
+        // At the end: a notice for the window's badge instead of silence.
+        assert_eq!(
+            a.set_reader(ReaderEvent::Nav(NavDir::Next)),
+            vec![Action::ReaderNotice("last linked headline".into())]
+        );
         // ctrl+shift+← back to 1.
         assert_eq!(
             a.set_reader(ReaderEvent::Nav(NavDir::Prev)),
@@ -1749,6 +1816,53 @@ mod tests {
         typ(&mut a, "aap");
         a.on_key(key(KeyCode::Enter));
         assert_eq!(a.selected_symbol(), Some("AAPL"));
+    }
+
+    #[test]
+    fn reader_pin_survives_refresh_failures_and_list_rebuilds() {
+        use crate::tui::reader::{NavDir, ReaderEvent};
+        let mut a = app();
+        typ(&mut a, "gi");
+        a.set_inplay(Ok((
+            vec![ip_row("A", 9.0, 10.0, 1.0), ip_row("B", 5.0, 10.0, 1.0)],
+            vec![],
+        )));
+        let t: chrono::DateTime<chrono::Utc> = "2026-11-06T12:00:00Z".parse().unwrap();
+        let item = |id: i64| NewsItem {
+            id,
+            headline: format!("h{id}"),
+            summary: String::new(),
+            created_at: t,
+            symbols: vec!["A".into()],
+            source: "benzinga".into(),
+            url: Some(format!("https://x/{id}")),
+        };
+        a.set_news("A".into(), Ok(vec![item(1), item(2), item(3)]));
+        a.on_key(key(KeyCode::Tab));
+        a.on_key(key(KeyCode::Enter)); // pins A, article 1
+        a.set_reader(ReaderEvent::Opened);
+        // A refresh of A's headlines fails (rate limit): the good ones stay.
+        a.set_news("A".into(), Err("Alpaca rate limit hit".into()));
+        assert_eq!(a.inplay.selected_headlines().len(), 3);
+        // The list rebuilds and B now sorts first: the reader stays on A.
+        a.set_inplay(Ok((
+            vec![ip_row("B", 20.0, 10.0, 1.0), ip_row("A", 9.0, 10.0, 1.0)],
+            vec![],
+        )));
+        let acts = a.set_reader(ReaderEvent::Nav(NavDir::Next));
+        assert_eq!(
+            acts,
+            vec![Action::ReaderShow {
+                url: "https://x/2".into(),
+                label: "A · 2 of 3 · ctrl+shift+← prev · ctrl+shift+→ next".into(),
+            }]
+        );
+        // With nothing pinned, nav explains itself on the badge.
+        a.inplay.reader_pin = None;
+        assert_eq!(
+            a.set_reader(ReaderEvent::Nav(NavDir::Next)),
+            vec![Action::ReaderNotice("no article open".into())]
+        );
     }
 
     #[test]

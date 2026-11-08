@@ -19,6 +19,15 @@ use super::keymap::{self, Ctx, Entry};
 const UP: Color = Color::Rgb(8, 153, 129);
 const DOWN: Color = Color::Rgb(242, 54, 69);
 const GRID: Color = Color::Rgb(48, 54, 66);
+/// Selected-row highlight: a subtle background, never inverted colours (an
+/// inverted row turns coloured cells — sparklines, change % — into blocks).
+const SELECTED_BG: Color = Color::Rgb(44, 52, 66);
+
+fn selected_row() -> Style {
+    Style::default()
+        .bg(SELECTED_BG)
+        .add_modifier(Modifier::BOLD)
+}
 const DIM: Color = Color::DarkGray;
 const ACCENT: Color = Color::Cyan;
 
@@ -169,10 +178,17 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         }
         None => left.push(Span::styled("market …", Style::default().fg(DIM))),
     }
-    let right = match app.last_quotes {
+    let budget = app
+        .api_budget
+        .as_ref()
+        .and_then(|c| c.lock().ok().and_then(|g| *g));
+    let quotes = match app.last_quotes {
         Some(t) => format!("quotes {} · {}", app.feed_label, t.format("%-I:%M:%S %p")),
         None => format!("quotes {} · loading…", app.feed_label),
     };
+    let api = budget.map(|b| format!("api {}/{}  ", b.remaining, b.limit));
+    let api_low = budget.is_some_and(|b| b.limit > 0 && b.remaining * 5 < b.limit);
+    let right = format!("{}{quotes}", api.clone().unwrap_or_default());
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -181,8 +197,18 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
     frame.render_widget(Paragraph::new(Line::from(left)), cols[0]);
+    let mut spans = Vec::new();
+    if let Some(a) = api {
+        let st = if api_low {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(DIM)
+        };
+        spans.push(Span::styled(a, st));
+    }
+    spans.push(Span::styled(quotes, Style::default().fg(DIM)));
     frame.render_widget(
-        Paragraph::new(Span::styled(right, Style::default().fg(DIM))).alignment(Alignment::Right),
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
         cols[1],
     );
 }
@@ -411,7 +437,7 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
         .header(header)
         .block(block)
         .column_spacing(2)
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .row_highlight_style(selected_row());
     let sel = app.find.as_ref().map_or(app.selected, |f| f.selected);
     let mut state = TableState::default().with_selected(Some(sel));
     frame.render_stateful_widget(table, area, &mut state);
@@ -575,11 +601,7 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
         let table = Table::new(rows, widths)
             .header(head)
             .column_spacing(1)
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::Rgb(44, 52, 66))
-                    .add_modifier(Modifier::BOLD),
-            );
+            .row_highlight_style(selected_row());
         let sel = app.find.as_ref().map_or(ip.selected, |f| f.selected);
         let mut state = TableState::default().with_selected(Some(sel));
         frame.render_stateful_widget(table, parts[1], &mut state);
@@ -629,7 +651,7 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
                     picked_line = lines.len();
                 }
                 let hl = if picked {
-                    Style::default().bg(Color::Rgb(44, 52, 66))
+                    Style::default().bg(SELECTED_BG)
                 } else {
                     Style::default()
                 };
@@ -777,7 +799,7 @@ fn render_search(frame: &mut Frame, area: Rect, app: &App) {
     )
     .block(block.title(format!(" {} match(es) ", app.search.results.len())))
     .column_spacing(2)
-    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    .row_highlight_style(selected_row());
     let mut state = TableState::default().with_selected(Some(app.search.selected));
     frame.render_stateful_widget(table, chunks[1], &mut state);
 }
@@ -1189,7 +1211,7 @@ fn render_bar_table(
         Style::default().fg(DIM),
     )))
     .column_spacing(2)
-    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    .row_highlight_style(selected_row());
     let mut state = TableState::default().with_selected(Some(scroll));
     frame.render_stateful_widget(table, area, &mut state);
 }
@@ -1794,6 +1816,38 @@ mod tests {
                 url: Some("https://www.benzinga.com/news/1".into()),
             }]),
         );
+    }
+
+    #[test]
+    fn selected_row_is_a_background_not_inverted_and_budget_shows() {
+        let mut app = sample_app();
+        app.api_budget = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+            wickd_core::equities::alpaca::RateLimit {
+                limit: 200,
+                remaining: 31,
+            },
+        ))));
+        let mut term = Terminal::new(TestBackend::new(130, 12)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        // Row 3 (header line + border + column header) is the selected SPY row.
+        let row: Vec<_> = (0..130u16).map(|x| buf[(x, 3)].clone()).collect();
+        assert!(row.iter().any(|c| c.symbol() == "S"), "selected row is SPY");
+        assert!(row.iter().all(|c| !c.modifier.contains(Modifier::REVERSED)));
+        assert!(row.iter().filter(|c| c.bg == SELECTED_BG).count() > 50);
+        // Sparkline cells keep their colour on the highlighted row.
+        assert!(row
+            .iter()
+            .any(|c| "▁▂▃▄▅▆▇█".contains(c.symbol()) && c.fg == DOWN));
+        // The API budget shows in the header.
+        let header: String = (0..130u16)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(header.contains("api 31/200"), "{header}");
+        // Low budget (<20%) is highlighted.
+        let low =
+            (0..130u16).find(|&x| buf[(x, 0)].symbol() == "a" && buf[(x + 1, 0)].symbol() == "p");
+        assert_eq!(buf[(low.unwrap(), 0)].fg, Color::Yellow);
     }
 
     #[test]

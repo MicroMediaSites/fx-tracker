@@ -111,6 +111,28 @@ pub struct AlpacaClient {
     data_base: String,
     trading_base: String,
     feed: QuoteFeed,
+    /// Latest market-data rate-limit headers (shared by clones).
+    rate: RateLimitCell,
+}
+
+/// The market-data API's per-minute budget, from its `X-RateLimit-*`
+/// response headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    pub limit: u32,
+    pub remaining: u32,
+}
+
+/// Shared, updated on every market-data response.
+pub type RateLimitCell = std::sync::Arc<std::sync::Mutex<Option<RateLimit>>>;
+
+/// Parse `X-RateLimit-Limit` / `X-RateLimit-Remaining`.
+pub fn parse_rate_limit(headers: &reqwest::header::HeaderMap) -> Option<RateLimit> {
+    let num = |name: &str| -> Option<u32> { headers.get(name)?.to_str().ok()?.trim().parse().ok() };
+    Some(RateLimit {
+        limit: num("x-ratelimit-limit")?,
+        remaining: num("x-ratelimit-remaining")?,
+    })
 }
 
 #[derive(Deserialize)]
@@ -152,7 +174,18 @@ impl AlpacaClient {
             data_base: data_base.trim_end_matches('/').to_string(),
             trading_base: trading_base.trim_end_matches('/').to_string(),
             feed,
+            rate: RateLimitCell::default(),
         }
+    }
+
+    /// The latest market-data rate-limit reading, if any response carried one.
+    pub fn rate_limit(&self) -> Option<RateLimit> {
+        self.rate.lock().ok().and_then(|g| *g)
+    }
+
+    /// A handle that keeps reflecting the latest reading (for UIs).
+    pub fn rate_limit_cell(&self) -> RateLimitCell {
+        self.rate.clone()
     }
 
     pub fn feed(&self) -> QuoteFeed {
@@ -174,6 +207,18 @@ impl AlpacaClient {
             .await
             .map_err(|e| AlpacaError::Network(e.without_url().to_string()))?;
         let status = resp.status();
+        if url.starts_with(&self.data_base) {
+            let reading = parse_rate_limit(resp.headers()).or_else(|| {
+                // A 429 without headers still means the budget is spent.
+                (status == StatusCode::TOO_MANY_REQUESTS).then(|| RateLimit {
+                    limit: self.rate_limit().map_or(0, |r| r.limit),
+                    remaining: 0,
+                })
+            });
+            if let (Some(r), Ok(mut g)) = (reading, self.rate.lock()) {
+                *g = Some(r);
+            }
+        }
         let body = resp
             .text()
             .await
@@ -636,6 +681,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bars["ABCD"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_headers_are_tracked_and_shared() {
+        let server = MockServer::start().await;
+        Mock::given(path("/v2/stocks/snapshots"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("X-RateLimit-Limit", "200")
+                    .insert_header("X-RateLimit-Remaining", "183")
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&server)
+            .await;
+        let c = client(&server, QuoteFeed::Iex).await;
+        let cell = c.rate_limit_cell();
+        assert_eq!(c.rate_limit(), None);
+        c.snapshots(&["AAPL".into()]).await.unwrap();
+        let want = Some(RateLimit { limit: 200, remaining: 183 });
+        assert_eq!(c.rate_limit(), want);
+        // A clone (as the worker holds) and the cell see the same reading.
+        assert_eq!(c.clone().rate_limit(), want);
+        assert_eq!(*cell.lock().unwrap(), want);
     }
 
     #[test]
