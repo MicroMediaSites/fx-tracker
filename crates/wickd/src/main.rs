@@ -81,6 +81,7 @@ use commands::strategy::StrategyArgs;
 use commands::stream::StreamArgs;
 use commands::trade::TradeArgs;
 use commands::list::ListArgs;
+use commands::quote::QuoteArgs;
 use commands::tui::TuiArgs;
 use commands::view::ViewArgs;
 use commands::watch::WatchArgs;
@@ -126,6 +127,8 @@ enum Command {
     /// Named symbol lists with notes (agent-writable; TUI watchlist sections):
     /// ls | show | add | rm | clear | delete.
     List(ListArgs),
+    /// Daily stock prices (last bar, previous close, change; --days N) as JSON.
+    Quote(QuoteArgs),
     /// List built-in strategies, or run one over candles → JSON signals.
     Strategy(StrategyArgs),
     /// Backtest a strategy over historical candles → JSON metrics + trades.
@@ -180,6 +183,7 @@ async fn main() {
         Command::Dashboard(args) => commands::dashboard::run(args, out).await,
         Command::Tui(args) => commands::tui::run(args, out).await,
         Command::List(args) => commands::list::run(args, out).await,
+        Command::Quote(args) => commands::quote::run(args, out).await,
         Command::Info(args) => commands::info::run(args, out).await,
         Command::Alpaca(args) => commands::alpaca::run(args, out).await,
         Command::Strategy(args) => commands::strategy::run(args, out).await,
