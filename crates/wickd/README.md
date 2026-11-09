@@ -28,10 +28,10 @@ feature — meant to be followed together by you and an agent.
 | `tui` | Stock ticker TUI: watchlist, symbol search, price-history drill-down (US equities) |
 | `alpaca login` / `status` / `logout` | Store / inspect / remove the Alpaca market-data keys `tui` uses |
 
-## `wickd tui` — stock ticker
+## `wickd tui` — stock and forex ticker
 
-An interactive terminal ticker for US stocks and ETFs, backed by Alpaca's
-market-data API. Like `dashboard`, it is interactive rather than JSON. It is
+An interactive terminal ticker for US stocks and ETFs (Alpaca market data)
+and forex pairs (OANDA, streamed live). Like `dashboard`, it is interactive rather than JSON. It is
 read-only: it never places orders.
 
 ```
@@ -51,7 +51,7 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   back out (`esc`), search (`/`), refresh (`r`) and quit (`q`). A prefix letter
   opens a category, and a panel lists the next keys:
   - `g` go to: `g g` top, `g e` end, `g <n> g` row n, `g w` watchlist, `g i`
-    in play today.
+    in play today, `g s` / `g x` the stocks / forex section.
   - `w` watchlist: `w a` add, `w d` remove, `w u` undo, `w j`/`w k` move.
   - `t` time range: `t d`/`t w`/`t m`/`t 6`/`t y`/`t 5`/`t a` for
     1D/5D/1M/6M/1Y/5Y/MAX.
@@ -65,8 +65,24 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   `esc` cancels a pending prefix, and `?` lists every key. The help screen,
   the footer and the panel are all generated from the one keymap table
   (`src/tui/keymap.rs`).
-- **Watchlist** (`~/.wickd/tui.json`). Shows last, change vs the prior session
-  close, day range, volume and a sparkline of today.
+- **Watchlist** (`~/.wickd/tui.json`). Two sections: stocks, then forex pairs.
+  Stocks show last, change vs the prior session close, day range, volume and a
+  sparkline of today. Moves (`w j`/`w k`) stay inside a section, and a new
+  symbol lands at the end of its own section.
+- **Forex**. Pairs use OANDA names (`EUR_USD`; anything with `_` is a pair) and
+  read the OANDA **practice** account (read-only: prices only). Rows show bid,
+  ask, spread in pips, change in pips and % since the trading day's open
+  (17:00 New York), the day range and a sparkline of the trading day. Prices
+  use OANDA's precision: 5 decimals, 3 for JPY-quoted pairs. Rows tick live
+  from the stream daemon (below); the section title says `live (stream)`, or
+  `refresh 15s` when the daemon isn't running and rows fall back to the quote
+  poll. A pair's chart has the same ranges and tools as a stock's: 1D/5D are
+  whole trading days, the newest candle updates with every tick, the 1D
+  reference line is the day open, volume is OANDA's tick volume, and there is
+  no session filter (`v e` says forex trades 24/5). Pairs have no news or
+  in-play list. Existing watchlists get EUR_USD, GBP_USD, USD_JPY, AUD_USD and
+  USD_CAD once; removing them sticks. Needs OANDA practice credentials
+  (`wickd login`).
 - **In play** (`g i`). Lists what is worth watching today. It merges top
   movers, the most active names and your watchlist, then shows for each name:
   - change against yesterday's close (the gap, in pre-market);
@@ -98,8 +114,9 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   Benzinga pages refuse to be embedded in another page. That port has no
   authentication while the window is open, so only use it on your own machine.
   It needs `ui-leaf` on your PATH.
-- **Search**. Matches ticker or company name over Alpaca's active-equity list,
-  cached daily in `~/.wickd/cache/alpaca-assets.json`. `tab` adds or removes a
+- **Search**. Matches ticker or company name over Alpaca's active-equity list
+  plus OANDA's instruments (`eur` lists every EUR pair), both cached daily in
+  `~/.wickd/cache/` (`alpaca-assets.json`, `oanda-instruments.json`). `tab` adds or removes a
   symbol, `enter` opens it.
 - **Symbol view**. Covers 1D to MAX (`1`–`7` are shortcuts for the ranges).
   The default is a candlestick chart using the desktop app's hollow-candle

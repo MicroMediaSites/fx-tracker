@@ -1230,6 +1230,10 @@ impl App {
             }
             Cmd::ZoomReset => d.chart.zoom_fit(),
             Cmd::ToggleExtended => {
+                if super::fx::is_fx(&d.symbol) {
+                    self.flash = Some("forex trades 24/5 — every bar is shown".into());
+                    return;
+                }
                 if !d.range.intraday() {
                     self.flash = Some("extended hours only apply to 1D, 5D and 1M".into());
                     return;
