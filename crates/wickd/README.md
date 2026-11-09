@@ -27,6 +27,7 @@ feature — meant to be followed together by you and an agent.
 | `trade report` / `trade baseline` | Account P&L since a recorded per-account baseline |
 | `tui` | Stock ticker TUI: watchlist, symbol search, price-history drill-down (US equities) |
 | `list` | Named symbol lists (agent-writable; TUI watchlist sections) |
+| `quote` | Daily stock prices: last bar, previous close, change (JSON) |
 | `alpaca login` / `status` / `logout` | Store / inspect / remove the Alpaca market-data keys `tui` uses |
 | `info` | What a stock or forex pair is: plain-language summary, facts, industry (JSON) |
 
@@ -229,6 +230,32 @@ wickd list delete mon-11-9
 - Names: `a-z`, `0-9`, `-`, `_` (max 32).
 - Safe to run while the TUI is open or from several agents at once: every write
   re-reads the file under a lock and replaces it atomically.
+
+## `wickd quote` — daily stock prices
+
+The numbers a plan needs ("buy above 268.60", not "above Friday's close"),
+for any stock, as JSON. One Alpaca request per call, consolidated (SIP) daily
+bars; needs the same keys as `wickd tui` (`wickd alpaca login`).
+
+```sh
+wickd quote NET ABNB          # several at once (commas work too)
+wickd quote NVDA --days 20    # plus the last 20 daily bars
+```
+
+Per symbol under `quotes`:
+
+- `last`: the newest daily bar (`date`, `open`, `high`, `low`, `close`,
+  `volume`, `complete`). During the session it's today's bar so far
+  (`complete: false`).
+- `prev_close`, `chg`, `chg_pct`: change of `last` against the close before
+  it.
+- `last_complete`: the newest finished day, the one to quote levels from
+  (Friday's high/low/close over a weekend or before the open).
+- `bars`: only with `--days N` (max 400), oldest first.
+
+Symbols with no data come back under `missing`. Prices are rounded to cents.
+Forex pairs aren't covered yet (use the TUI). Exit 2 means no or rejected
+Alpaca keys; exit 4 means an invalid symbol.
 
 ## `wickd info` — what is this symbol?
 
