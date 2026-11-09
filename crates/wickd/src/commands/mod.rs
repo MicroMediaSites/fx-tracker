@@ -14,6 +14,7 @@ pub mod feed;
 pub mod info;
 pub mod instruments;
 pub mod list;
+pub mod quote;
 pub mod login;
 pub mod pending;
 pub mod queue;
