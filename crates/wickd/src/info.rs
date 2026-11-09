@@ -112,6 +112,37 @@ pub struct SymbolInfo {
     #[serde(default)]
     pub notes: Vec<String>,
     pub fetched_at: DateTime<Utc>,
+    /// The named lists (`wickd list`) this symbol is on, with their notes.
+    /// Read fresh on every call, never cached.
+    #[serde(default)]
+    pub lists: Vec<ListNote>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ListNote {
+    pub list: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Which lists hold `symbol` (and why), from `~/.wickd/lists.json`.
+pub fn list_notes(symbol: &str) -> Vec<ListNote> {
+    let Ok(path) = crate::lists::lists_path() else {
+        return Vec::new();
+    };
+    list_notes_in(&crate::lists::load_at(&path).unwrap_or_default(), symbol)
+}
+
+fn list_notes_in(file: &crate::lists::ListsFile, symbol: &str) -> Vec<ListNote> {
+    file.lists
+        .iter()
+        .filter_map(|(name, entries)| {
+            entries.iter().find(|e| e.symbol == symbol).map(|e| ListNote {
+                list: name.clone(),
+                note: e.note.clone(),
+            })
+        })
+        .collect()
 }
 
 impl SymbolInfo {
@@ -143,7 +174,8 @@ pub async fn fetch(symbol: &str, refresh: bool) -> Result<SymbolInfo> {
     let home = home()?;
     let now = Utc::now();
     if !refresh {
-        if let Some(c) = cached_in(&home, &symbol, now) {
+        if let Some(mut c) = cached_in(&home, &symbol, now) {
+            c.lists = list_notes(&symbol);
             return Ok(c);
         }
     }
@@ -156,10 +188,13 @@ pub async fn fetch(symbol: &str, refresh: bool) -> Result<SymbolInfo> {
     } else {
         fetch_stock(&http, &home, &symbol, now, &mut failed).await?
     };
+    let mut info = info;
+    info.lists.clear();
     if !failed {
         // Cache write failure only costs a refetch.
         let _ = save_in(&home, &info);
     }
+    info.lists = list_notes(&symbol);
     Ok(info)
 }
 
@@ -259,6 +294,7 @@ async fn fetch_stock(
         currencies: Vec::new(),
         notes: Vec::new(),
         fetched_at: now,
+        lists: Vec::new(),
     };
     // Name + flags from Alpaca (keys optional: fall back to the cached
     // symbol list for the name).
@@ -778,6 +814,7 @@ async fn fetch_pair(
         currencies: Vec::new(),
         notes: Vec::new(),
         fetched_at: now,
+        lists: Vec::new(),
     };
     // OANDA instrument facts (practice account, read-only).
     match crate::commands::client::resolve("practice", crate::vault_store::DEFAULT_ACCOUNT) {
@@ -838,6 +875,21 @@ async fn fetch_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_notes_name_every_list_holding_the_symbol() {
+        let mut f = crate::lists::ListsFile::default();
+        let now = Utc::now();
+        crate::lists::add(&mut f, "tomorrow", &["NVDA".into()], Some("watch 185"), now);
+        crate::lists::add(&mut f, "swing", &["NVDA".into(), "AMD".into()], None, now);
+        let notes = list_notes_in(&f, "NVDA");
+        assert_eq!(notes.len(), 2);
+        assert!(notes.contains(&ListNote {
+            list: "tomorrow".into(),
+            note: Some("watch 185".into())
+        }));
+        assert!(list_notes_in(&f, "TSLA").is_empty());
+    }
 
     #[test]
     fn search_query_drops_share_class_but_keeps_company_words() {
@@ -975,6 +1027,7 @@ mod tests {
             currencies: vec![],
             notes: vec![],
             fetched_at: now,
+            lists: Vec::new(),
         };
         save_in(dir.path(), &info).unwrap();
         assert_eq!(

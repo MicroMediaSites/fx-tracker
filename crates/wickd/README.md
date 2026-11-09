@@ -229,6 +229,8 @@ OANDA doesn't offer) exits 4 with error kind `not_found`. `kind` is always
 - `notes` lists any source that couldn't be reached, or was skipped (no
   Alpaca keys). A card where a source failed is returned but not cached;
   missing keys don't stop caching.
+- `lists` names every `wickd list` the symbol is on, with its note (read
+  fresh each call, never cached).
 
 Cards are cached in `~/.wickd/cache/info/<SYM>.json` for 30 days, and the
 SEC ticker map in `~/.wickd/cache/sec-tickers.json` for 7. SEC requests
