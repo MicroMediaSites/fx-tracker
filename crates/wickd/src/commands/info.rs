@@ -20,8 +20,8 @@ pub struct InfoArgs {
 }
 
 pub async fn run(args: InfoArgs, out: Out) -> ! {
-    if info::normalize(&args.symbol).is_empty() {
-        out.fail(exit::VALIDATION, "invalid_symbol", "symbol is empty");
+    if let Err(e) = info::validate(&args.symbol) {
+        out.fail(exit::VALIDATION, "invalid_symbol", format!("{e:#}"));
     }
     match info::fetch(&args.symbol, args.refresh).await {
         Ok(card) => {

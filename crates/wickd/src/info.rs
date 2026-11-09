@@ -97,7 +97,7 @@ pub struct SymbolInfo {
     pub symbol: String,
     pub name: String,
     /// `stock` or `forex`.
-    pub kind: String,
+    pub kind: SymbolKind,
     pub exchange: Option<String>,
     pub facts: Vec<Fact>,
     /// Plain-language description (Wikipedia for stocks; what the quote
@@ -159,6 +159,47 @@ pub fn normalize(symbol: &str) -> String {
     symbol.trim().to_ascii_uppercase().replace('/', "_")
 }
 
+/// A symbol can only be letters, digits, `.`, `_` and `-` (first char a
+/// letter or digit, at most 20, no `..`). It names a cache file and goes in
+/// request paths, so anything else is rejected before either happens.
+pub fn validate(symbol: &str) -> Result<String> {
+    let s = normalize(symbol);
+    let ok = !s.is_empty()
+        && s.len() <= 20
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !s.contains("..");
+    if !ok {
+        return Err(InvalidSymbol(symbol.trim().to_string()).into());
+    }
+    Ok(s)
+}
+
+/// The symbol isn't a well-formed ticker or pair name.
+#[derive(Debug)]
+pub struct InvalidSymbol(pub String);
+
+impl std::fmt::Display for InvalidSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid symbol '{}': use a ticker (QQQ, BRK.B) or an OANDA pair (EUR_USD)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for InvalidSymbol {}
+
+/// Stock or forex pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SymbolKind {
+    Stock,
+    Forex,
+}
+
 pub fn is_fx(symbol: &str) -> bool {
     symbol.contains('_')
 }
@@ -167,10 +208,7 @@ pub fn is_fx(symbol: &str) -> bool {
 
 /// The info card for `symbol`, from the cache when fresh (unless `refresh`).
 pub async fn fetch(symbol: &str, refresh: bool) -> Result<SymbolInfo> {
-    let symbol = normalize(symbol);
-    if symbol.is_empty() {
-        return Err(anyhow!("empty symbol"));
-    }
+    let symbol = validate(symbol)?;
     let home = home()?;
     let now = Utc::now();
     if !refresh {
@@ -204,7 +242,11 @@ pub struct NotFound(pub String);
 
 impl std::fmt::Display for NotFound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown symbol: {}", self.0)
+        write!(
+            f,
+            "unknown symbol: {} — not a listed stock on Alpaca, and not an OANDA pair (pairs look like EUR_USD)",
+            self.0
+        )
     }
 }
 
@@ -285,7 +327,7 @@ async fn fetch_stock(
     let mut info = SymbolInfo {
         symbol: symbol.to_string(),
         name: String::new(),
-        kind: "stock".into(),
+        kind: SymbolKind::Stock,
         exchange: None,
         facts: Vec::new(),
         summary: None,
@@ -323,6 +365,11 @@ async fn fetch_stock(
         if let Some(a) = cached_asset_name(home, symbol) {
             info.name = a;
         }
+    }
+    // Without Alpaca keys, a symbol missing from the cached stock list too is
+    // unknown (rather than a blank card cached for a month).
+    if info.name.is_empty() && !*failed {
+        return Err(NotFound(symbol.to_string()).into());
     }
 
     let (wiki, sec) = tokio::join!(
@@ -805,7 +852,7 @@ async fn fetch_pair(
     let mut info = SymbolInfo {
         symbol: symbol.to_string(),
         name: format!("{base}/{quote}"),
-        kind: "forex".into(),
+        kind: SymbolKind::Forex,
         exchange: Some("OANDA".into()),
         facts: Vec::new(),
         summary: None,
@@ -826,13 +873,17 @@ async fn fetch_pair(
                 }
                 None => return Err(NotFound(symbol.to_string()).into()),
             },
-            Err(e) => {
-                info.notes.push(format!("OANDA: {e}"));
+            // The client error isn't echoed: its text can include the
+            // account id from the request URL.
+            Err(_) => {
+                info.notes.push("OANDA: instrument list unavailable".into());
                 *failed = true;
             }
         },
         // No credentials is a setup choice, not a passing failure.
-        Err(e) => info.notes.push(format!("OANDA: {e:#}")),
+        Err(_) => info
+            .notes
+            .push("OANDA: no practice credentials (`wickd login`)".into()),
     }
     // Each currency's article.
     for code in [base, quote] {
@@ -875,6 +926,17 @@ async fn fetch_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbols_that_could_escape_the_cache_are_rejected() {
+        assert_eq!(validate(" qqq ").unwrap(), "QQQ");
+        assert_eq!(validate("eur/usd").unwrap(), "EUR_USD");
+        assert_eq!(validate("brk.b").unwrap(), "BRK.B");
+        for bad in ["../../CONFIG", "/tmp/x", "", "..", "A..B", ".HIDDEN", "A B", "X\\Y"] {
+            let e = validate(bad).unwrap_err();
+            assert!(e.downcast_ref::<InvalidSymbol>().is_some(), "{bad}");
+        }
+    }
 
     #[test]
     fn list_notes_name_every_list_holding_the_symbol() {
@@ -1018,7 +1080,7 @@ mod tests {
         let info = SymbolInfo {
             symbol: "QQQ".into(),
             name: "Invesco QQQ Trust, Series 1".into(),
-            kind: "stock".into(),
+            kind: SymbolKind::Stock,
             exchange: Some("NASDAQ".into()),
             facts: vec![],
             summary: Some("An ETF.".into()),
