@@ -532,50 +532,56 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
         None => ((0..app.total_rows()).collect(), Some(app.selected)),
     };
     let lr = app.list_rows();
-    // Lists first, each at its natural height (capped so the watchlist keeps
-    // at least ~8 lines), then the stocks/forex sections in what's left.
+    // Lists first: the open one as a table, every other list as a one-line
+    // header (`g l` opens the next). The watchlist keeps a readable share:
+    // its natural height, up to half the screen.
     let area = if app.lists.is_empty() {
         area
     } else {
-        let mut heights: Vec<u16> = Vec::new();
-        let mut base = 0;
-        let mut sections: Vec<(String, Vec<usize>)> = Vec::new();
-        for (name, entries) in &app.lists {
-            let rows: Vec<usize> = shown
-                .iter()
-                .copied()
-                .filter(|&r| r >= base && r < base + entries.len())
-                .collect();
-            heights.push(rows.len().max(1) as u16 + 3);
-            sections.push((format!(" {name} · {} · list ", entries.len()), rows));
-            base += entries.len();
+        let rows: Vec<usize> = shown.iter().copied().filter(|&r| r < lr).collect();
+        let plan = sel.and_then(|s| app.row_entry(s)).filter(|e| plan_lines(e) > 0);
+        let plan_h: u16 = plan.map_or(0, |e| plan_lines(e) + 2);
+        let collapsed = app.lists.len() as u16 - 1;
+        let start = app.fx_start();
+        let watch_natural = (start.min(1) * (start + 3)
+            + (app.watchlist.len() - start).min(1) * (app.watchlist.len() - start + 3))
+            as u16;
+        let watch_need = watch_natural.min(area.height / 2);
+        let list_natural = rows.len().max(1) as u16 + 3;
+        let list_h = list_natural
+            .min(area.height.saturating_sub(collapsed + plan_h + watch_need))
+            .max(5);
+        // Headers before the open list, the open list, headers after.
+        let mut constraints = Vec::new();
+        for i in 0..app.lists.len() {
+            constraints.push(Constraint::Length(if i == app.expanded { list_h } else { 1 }));
         }
-        // The selected list row's full plan (why/call/constraints/signal)
-        // sits under the list sections.
-        let plan = sel.and_then(|s| app.row_entry(s));
-        let plan_h: u16 = if plan.is_some() { 6 } else { 0 };
-        let budget = area.height.saturating_sub(8 + plan_h).max(4);
-        let total: u16 = heights.iter().sum::<u16>().min(budget);
+        constraints.push(Constraint::Length(plan_h));
+        constraints.push(Constraint::Min(0));
         let parts = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(total),
-                Constraint::Length(plan_h),
-                Constraint::Min(0),
-            ])
+            .constraints(constraints)
             .split(area);
+        for (i, (name, entries)) in app.lists.iter().enumerate() {
+            if i == app.expanded {
+                let title = format!(" {name} · {} · list · g l next ", entries.len());
+                let pos = sel.and_then(|s| rows.iter().position(|&r| r == s));
+                render_list_table(frame, parts[i], app, &rows, pos, title);
+            } else {
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(" ▸ ", Style::default().fg(ACCENT)),
+                        Span::styled(name.clone(), Style::default().fg(Color::Gray)),
+                        Span::styled(format!(" · {}", entries.len()), Style::default().fg(DIM)),
+                    ])),
+                    parts[i],
+                );
+            }
+        }
         if let Some(e) = plan {
-            render_plan(frame, parts[1], e);
+            render_plan(frame, parts[app.lists.len()], e);
         }
-        let list_parts = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(heights.iter().map(|h| Constraint::Length(*h)).collect::<Vec<_>>())
-            .split(parts[0]);
-        for ((title, rows), rect) in sections.iter().zip(list_parts.iter()) {
-            let pos = sel.and_then(|s| rows.iter().position(|&r| r == s));
-            render_list_table(frame, *rect, app, rows, pos, title.clone());
-        }
-        parts[2]
+        parts[app.lists.len() + 1]
     };
     // The rest works in watchlist indices.
     let shown: Vec<usize> = shown.into_iter().filter(|&r| r >= lr).map(|r| r - lr).collect();
@@ -642,25 +648,25 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
     render_fx_table(frame, parts[1], app, &pairs, pos(&pairs), fx_title);
 }
 
-/// The selected list entry's plan: why, call, constraints, signal (empty
-/// fields say so, so a missing call before the open stands out).
+/// Lines the plan panel needs for an entry: its call and signal (the why is
+/// already in the row). 0 = no panel.
+fn plan_lines(e: &crate::lists::Entry) -> u16 {
+    u16::from(e.call.is_some()) + u16::from(e.signal.is_some())
+}
+
+/// The selected list entry's plan, in Matt's words: "<why>. Expect: <call>.
+/// Go: <signal>." — the why is the row, so the panel shows expect and go,
+/// only the ones that are filled in.
 fn render_plan(frame: &mut Frame, area: Rect, e: &crate::lists::Entry) {
-    let dim = Style::default().fg(DIM);
-    let line = |label: &str, v: &Option<String>| {
-        Line::from(vec![
-            Span::styled(format!(" {label:<12}"), Style::default().fg(ACCENT)),
-            match v {
-                Some(v) => Span::raw(v.clone()),
-                None => Span::styled("—", dim),
-            },
-        ])
-    };
-    let lines = vec![
-        line("why", &e.why),
-        line("call", &e.call),
-        line("constraints", &e.constraints),
-        line("signal", &e.signal),
-    ];
+    let mut lines = Vec::new();
+    for (label, v) in [("expect", &e.call), ("go", &e.signal)] {
+        if let Some(v) = v {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {label:<7}"), Style::default().fg(ACCENT)),
+                Span::raw(v.clone()),
+            ]));
+        }
+    }
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(ratatui::widgets::Wrap { trim: true })
@@ -669,7 +675,7 @@ fn render_plan(frame: &mut Frame, area: Rect, e: &crate::lists::Entry) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(ACCENT))
                     .title(Span::styled(
-                        format!(" {} · plan ", e.symbol),
+                        format!(" {} ", e.symbol),
                         Style::default().add_modifier(Modifier::BOLD),
                     )),
             ),
@@ -2460,6 +2466,65 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// Matt's "train wreck" case: five day lists × 18 symbols, 9 stocks and 5
+    /// pairs, on a ~158×46 terminal. Offline (sample quotes only).
+    /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_day_lists -- --ignored`
+    #[test]
+    #[ignore]
+    fn snapshot_day_lists() {
+        let dir = std::env::var("WICKD_TUI_SNAPSHOT_DIR").expect("set WICKD_TUI_SNAPSHOT_DIR");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = sample_app();
+        for s in ["AAPL", "MSFT", "AMZN", "META", "GOOGL", "WDAY"] {
+            app.toggle_watchlist(s.to_string());
+        }
+        for p in fx::DEFAULT_PAIRS {
+            app.toggle_watchlist(p.to_string());
+        }
+        let syms = [
+            "NET", "ABNB", "FROG", "IREN", "IONQ", "AXON", "DKNG", "TEAM", "AMD", "LRCX", "CEG",
+            "NVDA", "TSLA", "PLTR", "SHOP", "SNOW", "COIN", "UBER",
+        ];
+        let made: DateTime<Utc> = "2026-11-09T06:00:00Z".parse().unwrap();
+        let mut f = crate::lists::ListsFile::default();
+        for day in ["fri-11-13", "mon-11-9", "thu-11-12", "tue-11-10", "wed-11-11"] {
+            for (i, s) in syms.iter().enumerate() {
+                let plan = crate::lists::Plan {
+                    why: Some(format!("{s}: earnings reaction, {}% Fri", 5 + i)),
+                    call: (i % 3 != 2).then(|| "Holds Friday's close and drifts higher".into()),
+                    constraints: Some("stop below Fri low".into()),
+                    signal: (i % 3 == 0)
+                        .then(|| "Above Fri close after 8:00 on heavy volume".into()),
+                };
+                crate::lists::add(&mut f, day, &[s.to_string()], &plan, made);
+            }
+        }
+        app.set_lists(f);
+        app.flash = None;
+        let (w, h) = (158u16, 46u16);
+        let shoot = |app: &App, name: &str| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, app)).unwrap();
+            std::fs::write(
+                format!("{dir}/{name}.html"),
+                to_html(term.backend().buffer(), name),
+            )
+            .unwrap();
+        };
+        // Open mon-11-9 (Matt's "today"), cursor on its first row.
+        app.expanded = 0;
+        app.selected = 0;
+        shoot(&app, "1-mon-open-expect-go");
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('l'));
+        app.flash = None;
+        shoot(&app, "2-g-l-opens-tue");
+        // A row with neither call nor signal: no plan panel.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        shoot(&app, "3-row-without-plan");
     }
 
     /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_charts -- --ignored`
