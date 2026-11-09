@@ -209,7 +209,9 @@ wickd info eur/usd          # forex pair (EUR_USD)
 wickd info NVDA --refresh   # skip the 30-day cache
 ```
 
-Prints one JSON card (the same one the TUI shows):
+Prints one JSON card. An unknown symbol (not listed on Alpaca, or a pair
+OANDA doesn't offer) exits 4 with error kind `not_found`. `kind` is always
+`stock` or `forex`.
 
 - **Stocks**: `summary` is the Wikipedia article's opening paragraph, found
   by searching the company name and accepted only when the article title
@@ -224,8 +226,9 @@ Prints one JSON card (the same one the TUI shows):
   base unit buys), `currencies` has each currency's Wikipedia summary, and
   `facts` has OANDA's pip size, price decimals, margin rate and leverage,
   and minimum trade (practice account, read-only).
-- `notes` lists any source that couldn't be reached. A card with notes is
-  returned but not cached.
+- `notes` lists any source that couldn't be reached, or was skipped (no
+  Alpaca keys). A card where a source failed is returned but not cached;
+  missing keys don't stop caching.
 
 Cards are cached in `~/.wickd/cache/info/<SYM>.json` for 30 days, and the
 SEC ticker map in `~/.wickd/cache/sec-tickers.json` for 7. SEC requests

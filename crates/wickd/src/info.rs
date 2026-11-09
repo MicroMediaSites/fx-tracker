@@ -1,7 +1,8 @@
 //! Symbol info: "what is this thing?" for any stock or forex pair
 //! (wickd-lists AGT-2393, decisions D-5/D-6).
 //!
-//! Shared by `wickd info <SYM>` (JSON, for agents) and the TUI's info card.
+//! Backs `wickd info <SYM>` (JSON, for agents); the TUI's info card
+//! (AGT-2394) is meant to reuse it.
 //!
 //! - **Stocks**: Alpaca's asset details (exchange, class, and what Alpaca lets
 //!   you do: trade, short, margin, fractional shares); a plain-language
@@ -14,8 +15,10 @@
 //!   and leverage, minimum trade size).
 //!
 //! Results are cached under `~/.wickd/cache/info/<SYM>.json` for 30 days
-//! (`--refresh` refetches). A fetch with any source failure is returned but
-//! not cached, so a transient error never sticks for a month.
+//! (`--refresh` refetches). A fetch where a source failed (network, HTTP
+//! error) is returned but not cached, so a transient error never sticks for
+//! a month; missing keys don't block caching. An unknown symbol (Alpaca 404,
+//! or a pair OANDA doesn't offer) is a [`NotFound`] error.
 //!
 //! Caller IDs: SEC requires a contact in the User-Agent; Matt authorised
 //! `pardini.matthew@gmail.com` for SEC only (2026-11-08). Wikipedia gets the
@@ -31,7 +34,7 @@ use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use wickd_core::equities::alpaca::{AlpacaClient, AssetDetail, QuoteFeed};
+use wickd_core::equities::alpaca::{AlpacaClient, AlpacaError, AssetDetail, QuoteFeed};
 use wickd_core::oanda::endpoints;
 use wickd_core::oanda::types::OandaInstrument;
 
@@ -145,17 +148,32 @@ pub async fn fetch(symbol: &str, refresh: bool) -> Result<SymbolInfo> {
         }
     }
     let http = http()?;
+    // Set when a source failed transiently (network, HTTP error): such a
+    // card is returned but not cached. Missing keys don't count.
+    let mut failed = false;
     let info = if is_fx(&symbol) {
-        fetch_pair(&http, &symbol, now).await?
+        fetch_pair(&http, &symbol, now, &mut failed).await?
     } else {
-        fetch_stock(&http, &home, &symbol, now).await?
+        fetch_stock(&http, &home, &symbol, now, &mut failed).await?
     };
-    if info.notes.is_empty() {
+    if !failed {
         // Cache write failure only costs a refetch.
         let _ = save_in(&home, &info);
     }
     Ok(info)
 }
+
+/// The symbol isn't a listed stock (Alpaca 404) or isn't offered by OANDA.
+#[derive(Debug)]
+pub struct NotFound(pub String);
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown symbol: {}", self.0)
+    }
+}
+
+impl std::error::Error for NotFound {}
 
 fn home() -> Result<PathBuf> {
     wickd_core::paths::wickd_data_home().map_err(|e| anyhow!(e))
@@ -227,6 +245,7 @@ async fn fetch_stock(
     home: &Path,
     symbol: &str,
     now: DateTime<Utc>,
+    failed: &mut bool,
 ) -> Result<SymbolInfo> {
     let mut info = SymbolInfo {
         symbol: symbol.to_string(),
@@ -250,9 +269,16 @@ async fn fetch_stock(
                 .await
             {
                 Ok(a) => apply_asset(&mut info, &a),
-                Err(e) => info.notes.push(format!("Alpaca: {e}")),
+                Err(AlpacaError::Http { status: 404, .. }) => {
+                    return Err(NotFound(symbol.to_string()).into())
+                }
+                Err(e) => {
+                    info.notes.push(format!("Alpaca: {e}"));
+                    *failed = true;
+                }
             }
         }
+        // No keys is a setup choice, not a passing failure: still cacheable.
         _ => info
             .notes
             .push("Alpaca: no keys (`wickd alpaca login`); trading flags omitted".into()),
@@ -273,11 +299,17 @@ async fn fetch_stock(
             info.source = Some(source);
         }
         Ok(None) => {}
-        Err(e) => info.notes.push(format!("Wikipedia: {e:#}")),
+        Err(e) => {
+            info.notes.push(format!("Wikipedia: {e:#}"));
+            *failed = true;
+        }
     }
     match sec {
         Ok(p) => info.sec = p,
-        Err(e) => info.notes.push(format!("SEC: {e:#}")),
+        Err(e) => {
+            info.notes.push(format!("SEC: {e:#}"));
+            *failed = true;
+        }
     }
     if info.name.is_empty() {
         info.name = symbol.to_string();
@@ -714,7 +746,12 @@ fn pair_facts(i: &OandaInstrument) -> Vec<Fact> {
     out
 }
 
-async fn fetch_pair(http: &Client, symbol: &str, now: DateTime<Utc>) -> Result<SymbolInfo> {
+async fn fetch_pair(
+    http: &Client,
+    symbol: &str,
+    now: DateTime<Utc>,
+    failed: &mut bool,
+) -> Result<SymbolInfo> {
     let (base, quote) = symbol
         .split_once('_')
         .ok_or_else(|| anyhow!("not a pair: {symbol}"))?;
@@ -739,12 +776,14 @@ async fn fetch_pair(http: &Client, symbol: &str, now: DateTime<Utc>) -> Result<S
                     info.name = i.display_name.clone();
                     info.facts = pair_facts(&i);
                 }
-                None => info
-                    .notes
-                    .push(format!("OANDA: {symbol} isn't offered on this account")),
+                None => return Err(NotFound(symbol.to_string()).into()),
             },
-            Err(e) => info.notes.push(format!("OANDA: {e}")),
+            Err(e) => {
+                info.notes.push(format!("OANDA: {e}"));
+                *failed = true;
+            }
         },
+        // No credentials is a setup choice, not a passing failure.
         Err(e) => info.notes.push(format!("OANDA: {e:#}")),
     }
     // Each currency's article.
@@ -764,7 +803,10 @@ async fn fetch_pair(http: &Client, symbol: &str, now: DateTime<Utc>) -> Result<S
                         c.url = Some(src.url);
                     }
                 }
-                Err(e) => info.notes.push(format!("Wikipedia ({code}): {e:#}")),
+                Err(e) => {
+                    info.notes.push(format!("Wikipedia ({code}): {e:#}"));
+                    *failed = true;
+                }
             }
         }
         info.currencies.push(c);
