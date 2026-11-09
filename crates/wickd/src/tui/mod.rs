@@ -649,6 +649,21 @@ fn run_loop(
                     }
                     lists_seen = None; // reload to the file's truth
                 }
+                Action::RestoreToList { list, entry } => {
+                    let r = crate::lists::lists_path().and_then(|p| {
+                        crate::lists::update_at(&p, |f| {
+                            let e = f.lists.entry(list.clone()).or_default();
+                            if !e.iter().any(|x| x.symbol == entry.symbol) {
+                                e.push(entry.clone());
+                            }
+                            Ok(())
+                        })
+                    });
+                    if let Err(e) = r {
+                        app.flash = Some(format!("could not update list {list}: {e:#}"));
+                    }
+                    lists_seen = None;
+                }
             }
         }
     }

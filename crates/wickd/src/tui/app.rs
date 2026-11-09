@@ -51,6 +51,11 @@ pub enum Action {
     SaveWatchlist,
     /// Remove a symbol from a named list (`~/.wickd/lists.json`).
     RemoveFromList { list: String, symbol: String },
+    /// Put a removed entry back on a named list (`w u`), note included.
+    RestoreToList {
+        list: String,
+        entry: crate::lists::Entry,
+    },
     /// Rebuild the in-play list.
     FetchInPlay,
     /// Show an article in the reader window (opening it if needed); `label`
@@ -410,6 +415,8 @@ pub struct App {
     pub flash: Option<String>,
     /// Last removed watchlist entry, for `u`ndo.
     undo: Option<(usize, String)>,
+    /// Last entry removed from a named list (list, entry), for `w u`.
+    undo_list: Option<(String, crate::lists::Entry)>,
     pub feed_label: &'static str,
     /// Live Alpaca market-data budget (shared with the client).
     pub api_budget: Option<wickd_core::equities::alpaca::RateLimitCell>,
@@ -445,6 +452,7 @@ impl App {
             last_quotes: None,
             flash: None,
             undo: None,
+            undo_list: None,
             feed_label,
             history_delayed: true,
             api_budget: None,
@@ -855,9 +863,12 @@ impl App {
                 if let Some(ScreenRow::List(li, ei)) = self.row(self.selected) {
                     // Optimistic: drop it here; the file write follows.
                     let (list, entries) = &mut self.lists[li];
-                    let symbol = entries.remove(ei).symbol;
+                    let entry = entries.remove(ei);
+                    let symbol = entry.symbol.clone();
                     let list = list.clone();
-                    self.flash = Some(format!("removed {symbol} from {list}"));
+                    self.flash = Some(format!("removed {symbol} from {list} — w u to undo"));
+                    self.undo_list = Some((list.clone(), entry));
+                    self.undo = None;
                     self.selected = self.selected.min(self.total_rows().saturating_sub(1));
                     return vec![Action::RemoveFromList { list, symbol }];
                 }
@@ -865,8 +876,15 @@ impl App {
                 let sym = self.watchlist.remove(w);
                 self.flash = Some(format!("removed {sym} — w u to undo"));
                 self.undo = Some((w, sym));
+                self.undo_list = None;
                 self.selected = self.selected.min(self.total_rows().saturating_sub(1));
                 return vec![Action::SaveWatchlist];
+            }
+            Cmd::WatchUndo if self.undo_list.is_some() => {
+                if let Some((list, entry)) = self.undo_list.take() {
+                    self.flash = Some(format!("restored {} to {list}", entry.symbol));
+                    return vec![Action::RestoreToList { list, entry }];
+                }
             }
             Cmd::WatchUndo => {
                 if let Some((idx, sym)) = self.undo.take() {
@@ -1857,6 +1875,13 @@ mod tests {
         );
         assert_eq!(a.list_rows(), 1);
         assert_eq!(a.watchlist, ["SPY", "EUR_USD"]);
+        // w u puts it back, note and all.
+        let acts = {
+            a.on_key(key(KeyCode::Char('w')));
+            a.on_key(key(KeyCode::Char('u')))
+        };
+        assert!(matches!(&acts[..], [Action::RestoreToList { list, entry }]
+            if list == "tomorrow" && entry.symbol == "NVDA" && entry.note.as_deref() == Some("why")));
         // Moving a list row is a no-op; moving a watchlist row still works.
         typ(&mut a, "wj");
         assert_eq!(a.selected_symbol(), Some("GBP_USD"));

@@ -54,7 +54,7 @@ pub fn no_list(name: &str) -> anyhow::Error {
     invalid(format!("no list '{name}' (see `wickd list ls`)"))
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub symbol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
