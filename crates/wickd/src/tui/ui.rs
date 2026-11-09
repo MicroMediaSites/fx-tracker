@@ -94,6 +94,16 @@ pub fn sparkline(values: &[f64], width: usize) -> String {
         .collect()
 }
 
+/// Style for a price by its last move: green after an uptick, red after a
+/// downtick, default before the first change.
+fn tick_style(app: &App, key: &str) -> Style {
+    match app.ticks.dir(key) {
+        1 => Style::default().fg(UP),
+        -1 => Style::default().fg(DOWN),
+        _ => Style::default(),
+    }
+}
+
 fn change_color(c: Option<f64>) -> Color {
     match c {
         Some(c) if c > 0.0 => UP,
@@ -475,7 +485,8 @@ fn render_stock_table(
         Row::new(vec![
             Cell::from(sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
             Cell::from(name),
-            Cell::from(Line::from(last).alignment(Alignment::Right)),
+            Cell::from(Line::from(last).alignment(Alignment::Right))
+                .style(tick_style(app, &format!("{sym}:last"))),
             Cell::from(Line::from(chg).alignment(Alignment::Right))
                 .style(Style::default().fg(color)),
             Cell::from(Line::from(pct).alignment(Alignment::Right))
@@ -502,6 +513,26 @@ fn render_stock_table(
         .row_highlight_style(selected_row());
     let mut state = TableState::default().with_selected(sel);
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn fmt_fx5(p: f64) -> String {
+    format!("{p:.5}")
+}
+
+fn fmt_fx3(p: f64) -> String {
+    format!("{p:.3}")
+}
+
+/// Chart/table price formatter for a symbol: OANDA precision for pairs
+/// (5 decimals, 3 for JPY quotes), the stock formatter otherwise.
+fn price_fmt(sym: &str) -> fn(f64) -> String {
+    if !fx::is_fx(sym) {
+        fmt_price
+    } else if fx::decimals(sym) == 3 {
+        fmt_fx3
+    } else {
+        fmt_fx5
+    }
 }
 
 /// A pair's price at OANDA's precision (5 decimals, 3 for JPY quotes).
@@ -558,8 +589,8 @@ fn render_fx_table(
         let spark = q.map(|q| sparkline(&q.closes, spark_w)).unwrap_or_default();
         Row::new(vec![
             Cell::from(sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
-            cell(bid),
-            cell(ask),
+            cell(bid).style(tick_style(app, &format!("{sym}:bid"))),
+            cell(ask).style(tick_style(app, &format!("{sym}:ask"))),
             cell(spread).style(Style::default().fg(DIM)),
             cell(pips).style(Style::default().fg(color)),
             cell(pct).style(Style::default().fg(color)),
@@ -719,7 +750,8 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
             Row::new(vec![
                 Cell::from(r.symbol.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
                 Cell::from(name),
-                right(r.last.map(fmt_price).unwrap_or_else(|| "—".into())),
+                right(r.last.map(fmt_price).unwrap_or_else(|| "—".into()))
+                    .style(tick_style(app, &format!("{}:last", r.symbol))),
                 right(chg).style(Style::default().fg(chg_c)),
                 right(fo).style(Style::default().fg(fo_c)),
                 right(r.volume.map(fmt_volume).unwrap_or_else(|| "—".into())),
@@ -976,11 +1008,33 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, d: &DetailState) {
     if app.in_watchlist(&d.symbol) {
         title.push(Span::styled("  ★ watchlist", Style::default().fg(ACCENT)));
     }
+    let fxq = app.fx_quotes.get(&d.symbol);
+    let (price_line, stats_line) = if fx::is_fx(&d.symbol) {
+        fx_header_lines(app, &d.symbol, fxq)
+    } else {
+        stock_header_lines(app, &d.symbol, snap)
+    };
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(title), price_line, stats_line]).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(DIM)),
+        ),
+        chunks[0],
+    );
+    render_detail_body(frame, chunks[1], chunks[2], app, d, snap);
+}
+
+fn stock_header_lines(
+    app: &App,
+    sym: &str,
+    snap: Option<&Snapshot>,
+) -> (Line<'static>, Line<'static>) {
     let (last, chg, pct, color) = quote_cells(snap);
     let price_line = Line::from(vec![
         Span::styled(
             format!(" {last} "),
-            Style::default().add_modifier(Modifier::BOLD),
+            tick_style(app, &format!("{sym}:last")).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("{chg} ({pct})"), Style::default().fg(color)),
         Span::styled(
@@ -995,16 +1049,79 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, d: &DetailState) {
             Style::default().fg(DIM),
         ),
     ]);
-    let stats_line = Line::from(stat_spans(snap));
-    frame.render_widget(
-        Paragraph::new(vec![Line::from(title), price_line, stats_line]).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(DIM)),
-        ),
-        chunks[0],
-    );
+    (price_line, Line::from(stat_spans(app, sym, snap)))
+}
 
+/// Forex header: mid price, change in pips and % since the trading day's
+/// open (17:00 New York), then open/high/low, bid × ask and spread.
+fn fx_header_lines(
+    app: &App,
+    sym: &str,
+    q: Option<&fx::FxQuote>,
+) -> (Line<'static>, Line<'static>) {
+    let live = app.fx_live;
+    let Some(q) = q else {
+        return (
+            Line::from(Span::styled(" loading quote…", Style::default().fg(DIM))),
+            Line::default(),
+        );
+    };
+    let chg = q.change();
+    let color = change_color(chg.and_then(|c| c.to_f64()));
+    let pips = chg.map(|c| format!("{} pips", signed_1dp(fx::pips(sym, c), 1)));
+    let pct = q.change_pct().map(|p| format!("{}%", signed_1dp(p, 2)));
+    let change = match (pips, pct) {
+        (Some(a), Some(b)) => format!("{a} ({b})"),
+        _ => String::new(),
+    };
+    let when = if live {
+        "   live".to_string()
+    } else {
+        format!("   last tick {}", local(q.time).format("%b %-d %-I:%M:%S %p"))
+    };
+    let price_line = Line::from(vec![
+        Span::styled(
+            format!(" {} ", fx_price(sym, q.mid())),
+            tick_style(app, &format!("{sym}:mid")).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(change, Style::default().fg(color)),
+        Span::styled(when, Style::default().fg(DIM)),
+    ]);
+    let mut stats: Vec<Span<'static>> = Vec::new();
+    let mut push = |label: &str, value: String| {
+        stats.push(Span::styled(format!(" {label} "), Style::default().fg(DIM)));
+        stats.push(Span::raw(format!("{value} ")));
+    };
+    for (label, v) in [("open", q.open), ("high", q.high), ("low", q.low)] {
+        if let Some(v) = v {
+            push(label, fx_price(sym, v));
+        }
+    }
+    stats.extend(bid_ask_spans(
+        app,
+        sym,
+        fx_price(sym, q.bid),
+        fx_price(sym, q.ask),
+    ));
+    let mut push = |label: &str, value: String| {
+        stats.push(Span::styled(format!(" {label} "), Style::default().fg(DIM)));
+        stats.push(Span::raw(format!("{value} ")));
+    };
+    push(
+        "spread",
+        format!("{:.1} pips", fx::pips(sym, q.ask - q.bid).round_dp(1)),
+    );
+    (price_line, Line::from(stats))
+}
+
+fn render_detail_body(
+    frame: &mut Frame,
+    tabs_area: Rect,
+    body: Rect,
+    app: &App,
+    d: &DetailState,
+    snap: Option<&Snapshot>,
+) {
     // Range tabs + range summary.
     let selected = HistoryRange::ALL
         .iter()
@@ -1022,7 +1139,7 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, d: &DetailState) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(tabs_w), Constraint::Min(10)])
-        .split(chunks[1]);
+        .split(tabs_area);
     frame.render_widget(
         Tabs::new(tab_titles)
             .select(selected)
@@ -1037,7 +1154,6 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, d: &DetailState) {
 
     // Body.
     let body_block = Block::default().borders(Borders::ALL);
-    let body = chunks[2];
     if let Some(err) = &d.error {
         frame.render_widget(
             Paragraph::new(format!("could not load history: {err}"))
@@ -1065,18 +1181,27 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, d: &DetailState) {
             );
         }
         Some(bars) => match d.view {
-            DetailView::Candles => {
-                render_chart_view(frame, body, d, snap, Style2::Candles, app.history_delayed)
+            DetailView::Candles => render_chart_view(frame, body, app, d, snap, Style2::Candles),
+            DetailView::Line => render_chart_view(frame, body, app, d, snap, Style2::Line),
+            DetailView::Table => {
+                render_bar_table(frame, body, d.range, bars, d.scroll, price_fmt(&d.symbol))
             }
-            DetailView::Line => {
-                render_chart_view(frame, body, d, snap, Style2::Line, app.history_delayed)
-            }
-            DetailView::Table => render_bar_table(frame, body, d.range, bars, d.scroll),
         },
     }
 }
 
-fn stat_spans(snap: Option<&Snapshot>) -> Vec<Span<'static>> {
+/// ` bid/ask 1.2 × 1.3 ` with each side coloured by its last move.
+fn bid_ask_spans(app: &App, sym: &str, bid: String, ask: String) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(" bid/ask ", Style::default().fg(DIM)),
+        Span::styled(bid, tick_style(app, &format!("{sym}:bid"))),
+        Span::raw(" × "),
+        Span::styled(ask, tick_style(app, &format!("{sym}:ask"))),
+        Span::raw(" "),
+    ]
+}
+
+fn stat_spans(app: &App, sym: &str, snap: Option<&Snapshot>) -> Vec<Span<'static>> {
     let Some(s) = snap else {
         return vec![Span::styled(" loading quote…", Style::default().fg(DIM))];
     };
@@ -1099,16 +1224,14 @@ fn stat_spans(snap: Option<&Snapshot>) -> Vec<Span<'static>> {
     }
     if let Some(q) = &s.latest_quote {
         if q.bid > 0.0 && q.ask > 0.0 {
-            push(
-                "bid/ask",
-                format!("{} × {}", fmt_price(q.bid), fmt_price(q.ask)),
-            );
+            out.extend(bid_ask_spans(app, sym, fmt_price(q.bid), fmt_price(q.ask)));
         }
     }
     out
 }
 
 fn range_summary(d: &DetailState) -> Line<'static> {
+    let fmt_price = price_fmt(&d.symbol);
     let Some(bars) = d.bars().filter(|b| !b.is_empty()) else {
         return Line::from(Span::styled(
             if d.is_loading() { "loading… " } else { "" },
@@ -1226,15 +1349,31 @@ fn axis_boundary(
 fn render_chart_view(
     frame: &mut Frame,
     area: Rect,
+    app: &App,
     d: &DetailState,
     snap: Option<&Snapshot>,
     style: Style2,
-    delayed: bool,
 ) {
     let range = d.range;
-    let reference = (range == HistoryRange::Day1)
-        .then(|| snap.and_then(Snapshot::prev_close))
-        .flatten();
+    let is_fx = fx::is_fx(&d.symbol);
+    let fxq = app.fx_quotes.get(&d.symbol);
+    let fmt_price = price_fmt(&d.symbol);
+    // Pairs stream live from OANDA: never "delayed".
+    let delayed = app.history_delayed && !is_fx;
+    // 1D reference line: previous close for stocks, the trading day's open
+    // (17:00 New York) for pairs.
+    let reference = if range != HistoryRange::Day1 {
+        None
+    } else if is_fx {
+        fxq.and_then(|q| q.open).and_then(|o| o.to_f64())
+    } else {
+        snap.and_then(Snapshot::prev_close)
+    };
+    let last_price = if is_fx {
+        fxq.and_then(|q| q.mid().to_f64())
+    } else {
+        snap.and_then(Snapshot::last)
+    };
     let Some((candles, extended)) = d.candles() else {
         return;
     };
@@ -1282,7 +1421,9 @@ fn render_chart_view(
     } else if let Zoom::Merge(k) = zoom {
         title.push_str(&format!(" × {k}"));
     }
-    if range.intraday() {
+    if is_fx {
+        title.push_str(" · 24/5 · tick volume");
+    } else if range.intraday() {
         title.push_str(if extended {
             " · extended hours"
         } else {
@@ -1290,7 +1431,8 @@ fn render_chart_view(
         });
     }
     if let Some(p) = reference {
-        title.push_str(&format!(" · prev close {}", fmt_price(p)));
+        let label = if is_fx { "day open" } else { "prev close" };
+        title.push_str(&format!(" · {label} {}", fmt_price(p)));
     }
     if delayed {
         title.push_str(" · 15m delayed");
@@ -1323,7 +1465,7 @@ fn render_chart_view(
             view: &d.chart,
             style,
             reference,
-            last_price: snap.and_then(Snapshot::last),
+            last_price,
             delayed,
             overlays: &overlays,
             cloud: cloud.as_ref(),
@@ -1351,6 +1493,7 @@ fn render_bar_table(
     range: HistoryRange,
     bars: &[Bar],
     scroll: usize,
+    fmt_price: fn(f64) -> String,
 ) {
     let header = header_row(
         &["TIME"],
@@ -1879,7 +2022,30 @@ mod tests {
             app.toggle_watchlist(p.to_string());
         }
         let client = super::super::oanda_client().expect("OANDA practice credentials");
-        app.fx_quotes = fx::quotes(&client, &app.fx_symbols(), Utc::now()).await.unwrap();
+        app.set_fx_quotes(fx::quotes(&client, &app.fx_symbols(), Utc::now()).await.unwrap());
+        // One synthetic move each way so the up/down colouring shows: stocks
+        // via a snapshot refresh, pairs via a live tick (bid and ask).
+        let mut snaps = app.snapshots.clone();
+        for (sym, d) in [("SPY", 0.25), ("NVDA", -0.15)] {
+            let s = snaps.get_mut(sym).unwrap();
+            s.latest_trade.as_mut().unwrap().price += d;
+            let q = s.latest_quote.as_mut().unwrap();
+            q.bid += d;
+            q.ask += d;
+        }
+        app.set_snapshots(app.snapshots.clone());
+        app.set_snapshots(snaps);
+        for (sym, d) in [("EUR_USD", "0.00002"), ("USD_JPY", "-0.004"), ("GBP_USD", "-0.00001")] {
+            let q = app.fx_quotes[sym].clone();
+            let d: rust_decimal::Decimal = d.parse().unwrap();
+            app.apply_tick(wickd_core::hub_client::HubQuote {
+                instrument: sym.into(),
+                bid: q.bid + d,
+                ask: q.ask + d,
+                time: q.time + chrono::Duration::seconds(1),
+            });
+        }
+        app.fx_live = true;
         app.flash = None;
         let (w, h) = (158u16, 30u16);
         let shoot = |app: &App, name: &str| {
@@ -1901,6 +2067,50 @@ mod tests {
         }
         app.set_fx_assets(fx::instruments(&client).await.unwrap());
         shoot(&app, "3-search-finds-pairs");
+    }
+
+    /// A pair's chart screen with LIVE OANDA data (1D, 1Y + Ichimoku, USD_JPY).
+    /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_fx_detail -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn snapshot_fx_detail() {
+        let dir = std::env::var("WICKD_TUI_SNAPSHOT_DIR").expect("set WICKD_TUI_SNAPSHOT_DIR");
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = super::super::oanda_client().expect("OANDA practice credentials");
+        let now = Utc::now();
+        let (w, h) = (158u16, 44u16);
+        let shoot = |app: &App, name: &str| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, app)).unwrap();
+            term.draw(|f| render(f, app)).unwrap();
+            std::fs::write(
+                format!("{dir}/{name}.html"),
+                to_html(term.backend().buffer(), name),
+            )
+            .unwrap();
+        };
+        for (sym, n) in [("EUR_USD", "1"), ("USD_JPY", "3")] {
+            let mut app = App::new(vec![sym.to_string()], "IEX");
+            app.set_fx_assets(fx::instruments(&client).await.unwrap());
+            app.fx_quotes = fx::quotes(&client, &[sym.to_string()], now).await.unwrap();
+            app.fx_live = true;
+            press(&mut app, KeyCode::Enter);
+            for r in [HistoryRange::Day1, HistoryRange::Year1] {
+                let (warm, vis) = fx::history(&client, sym, r, now).await.unwrap();
+                app.set_warmup(sym, r, warm);
+                app.set_history(sym, r, Ok(vis));
+            }
+            app.flash = None;
+            let tag = sym.to_lowercase();
+            shoot(&app, &format!("{n}-{tag}-1d"));
+            if sym == "EUR_USD" {
+                press(&mut app, KeyCode::Char('5'));
+                press(&mut app, KeyCode::Char('v'));
+                press(&mut app, KeyCode::Char('i'));
+                app.flash = None;
+                shoot(&app, "2-eur_usd-1y-ichimoku");
+            }
+        }
     }
 
     /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_charts -- --ignored`
