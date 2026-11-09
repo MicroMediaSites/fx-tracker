@@ -611,7 +611,18 @@ fn parse_sec_tickers(
 }
 
 fn non_empty(s: Option<String>) -> Option<String> {
-    s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    s.map(|s| decode_entities(s.trim())).filter(|s| !s.is_empty())
+}
+
+/// SEC returns some fields HTML-escaped (`Semiconductors &amp; Related
+/// Devices`): decode the common entities for display.
+fn decode_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
 }
 
 fn sec_profile_from(cik: u64, s: SecSubmissions) -> SecProfile {
@@ -914,7 +925,7 @@ mod tests {
         assert_eq!(ciks[&sec_ticker("NVDA")], 1045810);
         assert_eq!(ciks[&sec_ticker("BRK.B")], 1067983);
         let s: SecSubmissions = serde_json::from_str(
-            r#"{"cik":"1045810","name":"NVIDIA CORP","sicDescription":"Semiconductors & Related Devices",
+            r#"{"cik":"1045810","name":"NVIDIA CORP","sicDescription":"Semiconductors &amp; Related Devices",
                "stateOfIncorporation":"DE","fiscalYearEnd":"0125",
                "addresses":{"business":{"street1":"2788 San Tomas Expressway","city":"SANTA CLARA","stateOrCountry":"CA"}}}"#,
         )
