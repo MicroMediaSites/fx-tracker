@@ -31,7 +31,16 @@ pub enum DetailView {
     Table,
 }
 
+/// A row on the watchlist screen: a list entry (list index, entry index) or
+/// a watchlist symbol (watchlist index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenRow {
+    List(usize, usize),
+    Watch(usize),
+}
+
 /// Side effects requested by a key press.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Re-fetch quotes (and sparklines) now.
@@ -40,6 +49,13 @@ pub enum Action {
     FetchHistory(String, HistoryRange),
     /// Persist the watchlist.
     SaveWatchlist,
+    /// Remove a symbol from a named list (`~/.wickd/lists.json`).
+    RemoveFromList { list: String, symbol: String },
+    /// Put a removed entry back on a named list (`w u`), note included.
+    RestoreToList {
+        list: String,
+        entry: crate::lists::Entry,
+    },
     /// Rebuild the in-play list.
     FetchInPlay,
     /// Show an article in the reader window (opening it if needed); `label`
@@ -361,6 +377,10 @@ impl TickDirs {
 #[derive(Debug)]
 pub struct App {
     pub watchlist: Vec<String>,
+    /// Named lists (`wickd list`), shown as sections above the watchlist.
+    /// Rows count lists first, then the watchlist: `selected` indexes that
+    /// combined order (see [`App::row`]).
+    pub lists: Vec<(String, Vec<crate::lists::Entry>)>,
     pub selected: usize,
     pub snapshots: HashMap<String, Snapshot>,
     /// Forex pair quotes (OANDA), keyed like `snapshots`.
@@ -395,6 +415,8 @@ pub struct App {
     pub flash: Option<String>,
     /// Last removed watchlist entry, for `u`ndo.
     undo: Option<(usize, String)>,
+    /// Last entry removed from a named list (list, entry), for `w u`.
+    undo_list: Option<(String, crate::lists::Entry)>,
     pub feed_label: &'static str,
     /// Live Alpaca market-data budget (shared with the client).
     pub api_budget: Option<wickd_core::equities::alpaca::RateLimitCell>,
@@ -406,6 +428,7 @@ impl App {
     pub fn new(watchlist: Vec<String>, feed_label: &'static str) -> Self {
         Self {
             watchlist,
+            lists: Vec::new(),
             selected: 0,
             snapshots: HashMap::new(),
             fx_quotes: HashMap::new(),
@@ -429,6 +452,7 @@ impl App {
             last_quotes: None,
             flash: None,
             undo: None,
+            undo_list: None,
             feed_label,
             history_delayed: true,
             api_budget: None,
@@ -506,6 +530,13 @@ impl App {
     /// symbol open in the detail view (which may not be on the list).
     pub fn quote_symbols(&self) -> Vec<String> {
         let mut syms = self.watchlist.clone();
+        for (_, entries) in &self.lists {
+            for e in entries {
+                if !syms.contains(&e.symbol) {
+                    syms.push(e.symbol.clone());
+                }
+            }
+        }
         if let Some(d) = &self.detail {
             if !syms.contains(&d.symbol) {
                 syms.push(d.symbol.clone());
@@ -515,7 +546,77 @@ impl App {
     }
 
     pub fn selected_symbol(&self) -> Option<&str> {
-        self.watchlist.get(self.selected).map(String::as_str)
+        self.row_symbol(self.selected)
+    }
+
+    /// Rows taken by the list sections (they come before the watchlist).
+    pub fn list_rows(&self) -> usize {
+        self.lists.iter().map(|(_, e)| e.len()).sum()
+    }
+
+    /// Every row on the watchlist screen: list entries, then the watchlist.
+    pub fn total_rows(&self) -> usize {
+        self.list_rows() + self.watchlist.len()
+    }
+
+    /// What a row is.
+    pub fn row(&self, r: usize) -> Option<ScreenRow> {
+        let mut base = 0;
+        for (li, (_, entries)) in self.lists.iter().enumerate() {
+            if r < base + entries.len() {
+                return Some(ScreenRow::List(li, r - base));
+            }
+            base += entries.len();
+        }
+        (r - base < self.watchlist.len()).then_some(ScreenRow::Watch(r - base))
+    }
+
+    pub fn row_symbol(&self, r: usize) -> Option<&str> {
+        match self.row(r)? {
+            ScreenRow::List(li, ei) => Some(self.lists[li].1[ei].symbol.as_str()),
+            ScreenRow::Watch(i) => Some(self.watchlist[i].as_str()),
+        }
+    }
+
+    /// The watchlist index under the cursor (None on a list row).
+    fn watch_selected(&self) -> Option<usize> {
+        match self.row(self.selected) {
+            Some(ScreenRow::Watch(i)) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Replace the named lists (a `lists.json` reload), keeping the cursor on
+    /// the same symbol in the same kind of section when it's still there.
+    pub fn set_lists(&mut self, file: crate::lists::ListsFile) {
+        let keep = self.row(self.selected).map(|r| {
+            let sym = self.row_symbol(self.selected).unwrap_or_default().to_string();
+            let list = match r {
+                ScreenRow::List(li, _) => Some(self.lists[li].0.clone()),
+                ScreenRow::Watch(_) => None,
+            };
+            (list, sym)
+        });
+        self.lists = file.lists.into_iter().collect();
+        let found = keep.and_then(|(list, sym)| {
+            (0..self.total_rows()).find(|&r| {
+                self.row_symbol(r) == Some(sym.as_str())
+                    && match (self.row(r), &list) {
+                        (Some(ScreenRow::List(li, _)), Some(name)) => self.lists[li].0 == *name,
+                        (Some(ScreenRow::Watch(_)), None) => true,
+                        _ => false,
+                    }
+            })
+        });
+        self.selected = found.unwrap_or(self.selected).min(self.total_rows().saturating_sub(1));
+    }
+
+    /// A row's list note, if it's a list row.
+    pub fn row_note(&self, r: usize) -> Option<&str> {
+        match self.row(r)? {
+            ScreenRow::List(li, ei) => self.lists[li].1[ei].note.as_deref(),
+            ScreenRow::Watch(_) => None,
+        }
     }
 
     /// Apply a stock snapshot refresh (and note each price's direction).
@@ -679,7 +780,10 @@ impl App {
     }
 
     fn exec_watchlist(&mut self, cmd: Cmd, n: Option<usize>) -> Vec<Action> {
-        let len = self.watchlist.len();
+        let len = self.total_rows();
+        let lr = self.list_rows();
+        // Watchlist edits act on the watchlist index under the cursor.
+        let ws = self.watch_selected();
         match cmd {
             Cmd::Quit => return vec![Action::Quit],
             Cmd::Help => self.show_help = true,
@@ -699,15 +803,23 @@ impl App {
             Cmd::Search => self.open_search(),
             Cmd::Find => self.open_find(),
             Cmd::GoInPlay => return self.open_inplay(),
-            Cmd::GoStocks if len > 0 => {
+            Cmd::GoLists => {
+                if lr > 0 {
+                    self.find = None;
+                    self.selected = 0;
+                } else {
+                    self.flash = Some("no lists yet — `wickd list add <name> SYM…`".into());
+                }
+            }
+            Cmd::GoStocks if self.fx_start() > 0 => {
                 self.find = None;
-                self.selected = 0;
+                self.selected = lr;
             }
             Cmd::GoForex => {
                 let start = self.fx_start();
-                if start < len {
+                if start < self.watchlist.len() {
                     self.find = None;
-                    self.selected = start;
+                    self.selected = lr + start;
                 } else {
                     self.flash = Some("no forex pairs — / to search, tab to add".into());
                 }
@@ -724,40 +836,62 @@ impl App {
             }
             // Moves stay inside a section (stocks above, pairs below).
             Cmd::WatchMoveDown
-                if len > 1
-                    && self.selected + 1 < len
-                    && super::fx::is_fx(&self.watchlist[self.selected])
-                        == super::fx::is_fx(&self.watchlist[self.selected + 1]) =>
+                if ws.is_some_and(|w| {
+                    w + 1 < self.watchlist.len()
+                        && super::fx::is_fx(&self.watchlist[w])
+                            == super::fx::is_fx(&self.watchlist[w + 1])
+                }) =>
             {
-                self.watchlist.swap(self.selected, self.selected + 1);
+                let w = ws.unwrap_or_default();
+                self.watchlist.swap(w, w + 1);
                 self.selected += 1;
                 return vec![Action::SaveWatchlist];
             }
             Cmd::WatchMoveUp
-                if self.selected > 0
-                    && len > 1
-                    && super::fx::is_fx(&self.watchlist[self.selected])
-                        == super::fx::is_fx(&self.watchlist[self.selected - 1]) =>
+                if ws.is_some_and(|w| {
+                    w > 0
+                        && super::fx::is_fx(&self.watchlist[w])
+                            == super::fx::is_fx(&self.watchlist[w - 1])
+                }) =>
             {
-                self.watchlist.swap(self.selected, self.selected - 1);
+                let w = ws.unwrap_or_default();
+                self.watchlist.swap(w, w - 1);
                 self.selected -= 1;
                 return vec![Action::SaveWatchlist];
             }
             Cmd::WatchRemove if len > 0 => {
-                let sym = self.watchlist.remove(self.selected);
-                self.flash = Some(format!("removed {sym} — w u to undo"));
-                self.undo = Some((self.selected, sym));
-                if self.selected >= self.watchlist.len() {
-                    self.selected = self.watchlist.len().saturating_sub(1);
+                if let Some(ScreenRow::List(li, ei)) = self.row(self.selected) {
+                    // Optimistic: drop it here; the file write follows.
+                    let (list, entries) = &mut self.lists[li];
+                    let entry = entries.remove(ei);
+                    let symbol = entry.symbol.clone();
+                    let list = list.clone();
+                    self.flash = Some(format!("removed {symbol} from {list} — w u to undo"));
+                    self.undo_list = Some((list.clone(), entry));
+                    self.undo = None;
+                    self.selected = self.selected.min(self.total_rows().saturating_sub(1));
+                    return vec![Action::RemoveFromList { list, symbol }];
                 }
+                let Some(w) = ws else { return vec![] };
+                let sym = self.watchlist.remove(w);
+                self.flash = Some(format!("removed {sym} — w u to undo"));
+                self.undo = Some((w, sym));
+                self.undo_list = None;
+                self.selected = self.selected.min(self.total_rows().saturating_sub(1));
                 return vec![Action::SaveWatchlist];
+            }
+            Cmd::WatchUndo if self.undo_list.is_some() => {
+                if let Some((list, entry)) = self.undo_list.take() {
+                    self.flash = Some(format!("restored {} to {list}", entry.symbol));
+                    return vec![Action::RestoreToList { list, entry }];
+                }
             }
             Cmd::WatchUndo => {
                 if let Some((idx, sym)) = self.undo.take() {
                     if !self.in_watchlist(&sym) {
                         let idx = self.section_index(&sym, idx);
                         self.watchlist.insert(idx, sym.clone());
-                        self.selected = idx;
+                        self.selected = lr + idx;
                         self.flash = Some(format!("restored {sym}"));
                         return vec![Action::SaveWatchlist, Action::RefreshQuotes];
                     }
@@ -1043,7 +1177,9 @@ impl App {
                 .iter()
                 .map(|r| r.symbol.clone())
                 .collect(),
-            _ => self.watchlist.clone(),
+            _ => (0..self.total_rows())
+                .filter_map(|r| self.row_symbol(r).map(str::to_string))
+                .collect(),
         }
     }
 
@@ -1208,9 +1344,7 @@ impl App {
     pub(super) fn toggle_watchlist(&mut self, sym: String) -> Vec<Action> {
         if let Some(pos) = self.watchlist.iter().position(|s| *s == sym) {
             self.watchlist.remove(pos);
-            if self.selected >= self.watchlist.len() {
-                self.selected = self.watchlist.len().saturating_sub(1);
-            }
+            self.selected = self.selected.min(self.total_rows().saturating_sub(1));
             self.flash = Some(format!("removed {sym} from watchlist"));
             vec![Action::SaveWatchlist]
         } else {
@@ -1695,6 +1829,79 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    fn lists_file(entries: &[(&str, &[&str])]) -> crate::lists::ListsFile {
+        let mut f = crate::lists::ListsFile::default();
+        for (name, syms) in entries {
+            let syms: Vec<String> = syms.iter().map(|s| s.to_string()).collect();
+            crate::lists::add(&mut f, name, &syms, Some("why"), Utc::now());
+        }
+        f
+    }
+
+    #[test]
+    fn list_rows_come_first_and_keys_respect_them() {
+        let mut a = App::new(vec!["SPY".into(), "EUR_USD".into()], "IEX");
+        a.set_lists(lists_file(&[("tomorrow", &["NVDA", "GBP_USD"])]));
+        assert_eq!((a.list_rows(), a.total_rows()), (2, 4));
+        // Lists loading under the cursor don't move it off its symbol.
+        assert_eq!(a.selected_symbol(), Some("SPY"));
+        assert_eq!(a.row_note(0), Some("why"));
+        // List symbols get quotes too (stocks and pairs).
+        assert!(a.quote_symbols().contains(&"NVDA".to_string()));
+        assert!(a.fx_symbols().contains(&"GBP_USD".to_string()));
+        typ(&mut a, "gs");
+        assert_eq!(a.selected_symbol(), Some("SPY"));
+        typ(&mut a, "gx");
+        assert_eq!(a.selected_symbol(), Some("EUR_USD"));
+        typ(&mut a, "gl");
+        assert_eq!(a.selected, 0);
+        // j walks from the list into the watchlist.
+        typ(&mut a, "jj");
+        assert_eq!(a.selected_symbol(), Some("SPY"));
+        // w d on a list row removes it from the list (not the watchlist).
+        typ(&mut a, "gl");
+        let acts = {
+            a.on_key(key(KeyCode::Char('w')));
+            a.on_key(key(KeyCode::Char('d')))
+        };
+        assert_eq!(
+            acts,
+            vec![Action::RemoveFromList {
+                list: "tomorrow".into(),
+                symbol: "NVDA".into()
+            }]
+        );
+        assert_eq!(a.list_rows(), 1);
+        assert_eq!(a.watchlist, ["SPY", "EUR_USD"]);
+        // w u puts it back, note and all.
+        let acts = {
+            a.on_key(key(KeyCode::Char('w')));
+            a.on_key(key(KeyCode::Char('u')))
+        };
+        assert!(matches!(&acts[..], [Action::RestoreToList { list, entry }]
+            if list == "tomorrow" && entry.symbol == "NVDA" && entry.note.as_deref() == Some("why")));
+        // Moving a list row is a no-op; moving a watchlist row still works.
+        typ(&mut a, "wj");
+        assert_eq!(a.selected_symbol(), Some("GBP_USD"));
+    }
+
+    #[test]
+    fn reloading_lists_keeps_the_cursor_on_its_symbol() {
+        let mut a = App::new(vec!["SPY".into(), "QQQ".into()], "IEX");
+        a.set_lists(lists_file(&[("tomorrow", &["NVDA"])]));
+        typ(&mut a, "gs");
+        typ(&mut a, "j");
+        assert_eq!(a.selected_symbol(), Some("QQQ"));
+        // An agent adds two symbols: the cursor stays on QQQ.
+        a.set_lists(lists_file(&[("tomorrow", &["NVDA", "AMD", "TSLA"])]));
+        assert_eq!(a.selected_symbol(), Some("QQQ"));
+        // Find covers list rows too.
+        typ(&mut a, "gf");
+        typ(&mut a, "tsl");
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.selected_symbol(), Some("TSLA"));
     }
 
     #[test]

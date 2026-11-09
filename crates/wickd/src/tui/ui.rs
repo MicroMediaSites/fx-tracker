@@ -375,6 +375,54 @@ fn quote_cells(snap: Option<&Snapshot>) -> (String, String, String, Color) {
 }
 
 fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
+    // Screen rows on show (only matches while `g f` is active) and the
+    // selected one, in the combined order: list entries, then the watchlist.
+    let (shown, sel): (Vec<usize>, Option<usize>) = match &app.find {
+        Some(f) => {
+            let m = app.find_matches();
+            let sel = m.get(f.selected).copied();
+            (m, sel)
+        }
+        None => ((0..app.total_rows()).collect(), Some(app.selected)),
+    };
+    let lr = app.list_rows();
+    // Lists first, each at its natural height (capped so the watchlist keeps
+    // at least ~8 lines), then the stocks/forex sections in what's left.
+    let area = if app.lists.is_empty() {
+        area
+    } else {
+        let mut heights: Vec<u16> = Vec::new();
+        let mut base = 0;
+        let mut sections: Vec<(String, Vec<usize>)> = Vec::new();
+        for (name, entries) in &app.lists {
+            let rows: Vec<usize> = shown
+                .iter()
+                .copied()
+                .filter(|&r| r >= base && r < base + entries.len())
+                .collect();
+            heights.push(rows.len().max(1) as u16 + 3);
+            sections.push((format!(" {name} · {} · list ", entries.len()), rows));
+            base += entries.len();
+        }
+        let budget = area.height.saturating_sub(8).max(4);
+        let total: u16 = heights.iter().sum::<u16>().min(budget);
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(total), Constraint::Min(0)])
+            .split(area);
+        let list_parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(heights.iter().map(|h| Constraint::Length(*h)).collect::<Vec<_>>())
+            .split(parts[0]);
+        for ((title, rows), rect) in sections.iter().zip(list_parts.iter()) {
+            let pos = sel.and_then(|s| rows.iter().position(|&r| r == s));
+            render_list_table(frame, *rect, app, rows, pos, title.clone());
+        }
+        parts[1]
+    };
+    // The rest works in watchlist indices.
+    let shown: Vec<usize> = shown.into_iter().filter(|&r| r >= lr).map(|r| r - lr).collect();
+    let sel = sel.and_then(|s| s.checked_sub(lr));
     if app.watchlist.is_empty() {
         let block = Block::default().borders(Borders::ALL).title(" watchlist · 0 ");
         frame.render_widget(
@@ -385,16 +433,6 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    // Watchlist indices on screen (only matches while `g f` is active), and
-    // the selected one.
-    let (shown, sel): (Vec<usize>, Option<usize>) = match &app.find {
-        Some(f) => {
-            let m = app.find_matches();
-            let sel = m.get(f.selected).copied();
-            (m, sel)
-        }
-        None => ((0..app.watchlist.len()).collect(), Some(app.selected)),
-    };
     let start = app.fx_start();
     let (stocks, pairs): (Vec<usize>, Vec<usize>) = shown.into_iter().partition(|&i| i < start);
     let has_stocks = start > 0;
@@ -445,6 +483,64 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
     let stock_title = format!(" stocks · {} ", start);
     render_stock_table(frame, parts[0], app, &stocks, pos(&stocks), stock_title);
     render_fx_table(frame, parts[1], app, &pairs, pos(&pairs), fx_title);
+}
+
+/// One named list (`wickd list`): symbol, note, price and change for stocks
+/// and pairs alike (pairs at OANDA precision, mid price).
+fn render_list_table(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    rows: &[usize],
+    sel: Option<usize>,
+    title: String,
+) {
+    let header = header_row(&["SYMBOL", "NOTE"], &["LAST", "CHG%"], &[]);
+    let body = rows.iter().filter_map(|&r| {
+        let sym = app.row_symbol(r)?.to_string();
+        let note = app.row_note(r).unwrap_or_default().to_string();
+        let (last, pct, color, key) = if fx::is_fx(&sym) {
+            match app.fx_quotes.get(&sym) {
+                Some(q) => (
+                    fx_price(&sym, q.mid()),
+                    q.change_pct()
+                        .map(|p| format!("{}%", signed_1dp(p, 2)))
+                        .unwrap_or_default(),
+                    change_color(q.change().and_then(|c| c.to_f64())),
+                    format!("{sym}:mid"),
+                ),
+                None => ("…".into(), String::new(), DIM, String::new()),
+            }
+        } else {
+            let (last, _, pct, color) = quote_cells(app.snapshots.get(&sym));
+            (last, pct, color, format!("{sym}:last"))
+        };
+        Some(Row::new(vec![
+            Cell::from(sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from(note).style(Style::default().fg(Color::Gray)),
+            Cell::from(Line::from(last).alignment(Alignment::Right)).style(tick_style(app, &key)),
+            Cell::from(Line::from(pct).alignment(Alignment::Right))
+                .style(Style::default().fg(color)),
+        ]))
+    });
+    let widths = [
+        Constraint::Length(8),
+        Constraint::Min(20),
+        Constraint::Length(10),
+        Constraint::Length(8),
+    ];
+    let table = Table::new(body, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .title(title),
+        )
+        .column_spacing(2)
+        .row_highlight_style(selected_row());
+    let mut state = TableState::default().with_selected(sel);
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn render_stock_table(
@@ -2047,7 +2143,18 @@ mod tests {
         }
         app.fx_live = true;
         app.flash = None;
-        let (w, h) = (158u16, 30u16);
+        // A list an agent built for tomorrow (with notes).
+        let mut lists = crate::lists::ListsFile::default();
+        for (sym, note) in [
+            ("NVDA", "earnings Wed; watch the 185 break"),
+            ("SPY", "open drive above 682 = trend day?"),
+            ("EUR_USD", "ECB speakers; fade rallies into 1.1200"),
+        ] {
+            crate::lists::add(&mut lists, "tomorrow", &[sym.to_string()], Some(note), Utc::now());
+        }
+        app.set_lists(lists);
+        app.selected = 0;
+        let (w, h) = (158u16, 36u16);
         let shoot = |app: &App, name: &str| {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
             term.draw(|f| render(f, app)).unwrap();

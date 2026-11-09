@@ -4,8 +4,8 @@
 //! optional note (why it's there). Lists are separate from the TUI's general
 //! watchlist (`tui.json`), from the in-play screen, and from the forex
 //! streamer's `~/.wickd/watchlist.json`. They are the agent-facing surface:
-//! `wickd list …` writes them; the TUI will show them as watchlist sections
-//! (AGT-2392).
+//! `wickd list …` writes them; the TUI shows them as watchlist sections and
+//! can remove entries.
 //!
 //! ## Writers
 //!
@@ -54,7 +54,7 @@ pub fn no_list(name: &str) -> anyhow::Error {
     invalid(format!("no list '{name}' (see `wickd list ls`)"))
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub symbol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
