@@ -71,6 +71,12 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   Stocks show last, change vs the prior session close, day range, volume and a
   sparkline of today. Moves (`w j`/`w k`) stay inside a section, and a new
   symbol lands at the end of its own section.
+- **Info** (`i`). On any row (lists, stocks, forex, in play) or a symbol
+  screen, `i` opens a card saying what the symbol is: the Wikipedia summary
+  (`o` opens the article in the reader window), the lists it's on with their
+  notes, and facts (exchange, trading flags, SEC industry and headquarters;
+  for pairs, both currencies and OANDA's pip size, margin and minimum trade).
+  Same data as `wickd info` (cached 30 days). `j`/`k` scroll, `esc` closes.
 - **Price colours**. Every price that updates (a stock's last, bid and ask;
   a pair's bid, ask and mid; in every list and on the symbol screen) turns
   green after it ticks up and red after it ticks down, and keeps that colour

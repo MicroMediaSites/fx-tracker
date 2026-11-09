@@ -71,6 +71,7 @@ enum Request {
     News(String),
     FxQuotes(Vec<String>),
     FxAssets,
+    Info(String),
 }
 
 /// Results coming back to the run loop.
@@ -87,6 +88,7 @@ enum Reply {
     FxQuotes(Result<HashMap<String, fx::FxQuote>, String>),
     FxAssets(Result<Vec<Asset>, String>),
     Live(live::LiveEvent),
+    Info(String, Result<crate::info::SymbolInfo, String>),
 }
 
 /// Headline lookback, shared by the list's NEWS column and the side pane so
@@ -209,6 +211,12 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                     }
                     Request::Sparks(syms) if stocks(syms.clone()).is_empty() => {
                         Reply::Sparks(Ok(HashMap::new()))
+                    }
+                    Request::Info(sym) => {
+                        let r = crate::info::fetch(&sym, false)
+                            .await
+                            .map_err(|e| format!("{e:#}"));
+                        Reply::Info(sym, r)
                     }
                     Request::FxQuotes(pairs) => Reply::FxQuotes(match get_oanda() {
                         Ok(c) => fx::quotes(&c, &pairs, Utc::now()).await,
@@ -489,6 +497,7 @@ fn run_loop(
                         Err(e) => app.fx_error = Some(e),
                     }
                 }
+                Reply::Info(sym, r) => app.set_info(&sym, r),
                 Reply::Live(live::LiveEvent::Connected(up)) => app.fx_live = up,
                 Reply::Live(live::LiveEvent::Quote(q)) => app.apply_tick(q),
                 Reply::FxAssets(r) => match r {
@@ -637,6 +646,7 @@ fn run_loop(
                         app.flash = Some(format!("could not save watchlist: {e:#}"));
                     }
                 }
+                Action::FetchInfo(sym) => send(Request::Info(sym)),
                 Action::RemoveFromList { list, symbol } => {
                     // Locked read-modify-write: never clobbers an agent's edits.
                     let r = crate::lists::lists_path().and_then(|p| {

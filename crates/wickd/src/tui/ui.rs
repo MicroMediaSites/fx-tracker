@@ -163,9 +163,145 @@ pub fn render(frame: &mut Frame, app: &App) {
     if let (Some(p), Some(ctx)) = (&app.pending, app.ctx()) {
         render_key_panel(frame, chunks[1], ctx, p);
     }
+    if let Some(card) = &app.info {
+        render_info(frame, frame.area(), card);
+    }
     if app.show_help {
         render_help(frame, frame.area());
     }
+}
+
+/// SEC's `MMDD` fiscal year end as `Jan 31` (unchanged if it isn't MMDD).
+fn month_day(mmdd: &str) -> String {
+    const M: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    match (mmdd.get(..2).and_then(|m| m.parse::<usize>().ok()), mmdd.get(2..4).and_then(|d| d.parse::<u32>().ok())) {
+        (Some(m @ 1..=12), Some(d)) if mmdd.len() == 4 => format!("{} {d}", M[m - 1]),
+        _ => mmdd.to_string(),
+    }
+}
+
+/// The `i` card, centred over the current screen.
+fn render_info(frame: &mut Frame, area: Rect, card: &crate::tui::app::InfoCard) {
+    use crate::tui::app::InfoState;
+    let w = area.width.saturating_sub(8).clamp(40, 110);
+    let max_h = area.height.saturating_sub(4).clamp(10, 40);
+    let dim = Style::default().fg(DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let heading = |t: &str| Line::from(Span::styled(t.to_string(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+    let (title, lines): (String, Vec<Line>) = match &card.state {
+        InfoState::Loading => (
+            format!(" {} ", card.symbol),
+            vec![Line::from(Span::styled("loading…", dim))],
+        ),
+        InfoState::Failed(e) => (
+            format!(" {} ", card.symbol),
+            vec![Line::from(Span::styled(
+                format!("couldn't load info: {e}"),
+                Style::default().fg(Color::Yellow),
+            ))],
+        ),
+        InfoState::Ready(i) => {
+            let kind = match i.kind {
+                crate::info::SymbolKind::Stock => "stock",
+                crate::info::SymbolKind::Forex => "forex pair",
+            };
+            let mut l: Vec<Line> = Vec::new();
+            match &i.summary {
+                Some(sum) => l.push(Line::from(sum.clone())),
+                None => l.push(Line::from(Span::styled("No description found.", dim))),
+            }
+            if let Some(src) = &i.source {
+                l.push(Line::from(vec![
+                    Span::styled("source  ", dim),
+                    Span::raw(format!("Wikipedia — {}  ", src.title)),
+                    Span::styled("(o opens it)", dim),
+                ]));
+            }
+            if !i.lists.is_empty() {
+                l.push(Line::from(""));
+                l.push(heading("On your lists"));
+                for ln in &i.lists {
+                    l.push(Line::from(vec![
+                        Span::styled(format!("  {:<12}", ln.list), bold),
+                        Span::raw(ln.note.clone().unwrap_or_default()),
+                    ]));
+                }
+            }
+            for c in &i.currencies {
+                l.push(Line::from(""));
+                l.push(heading(&format!(
+                    "{} — {}",
+                    c.code,
+                    c.name.clone().unwrap_or_default()
+                )));
+                if let Some(sum) = &c.summary {
+                    l.push(Line::from(sum.clone()));
+                }
+            }
+            let mut facts: Vec<(String, String)> =
+                i.facts.iter().map(|f| (f.label.clone(), f.value.clone())).collect();
+            if let Some(sec) = &i.sec {
+                for (label, v) in [
+                    ("Industry", &sec.industry),
+                    ("Headquarters", &sec.headquarters),
+                    ("Incorporated", &sec.incorporated),
+                ] {
+                    if let Some(v) = v {
+                        facts.push((label.to_string(), v.clone()));
+                    }
+                }
+                if let Some(fy) = &sec.fiscal_year_end {
+                    facts.push(("Fiscal year end".into(), month_day(fy)));
+                }
+            }
+            if !facts.is_empty() {
+                l.push(Line::from(""));
+                l.push(heading("Facts"));
+                for (label, v) in facts {
+                    l.push(Line::from(vec![
+                        Span::styled(format!("  {label:<18}"), dim),
+                        Span::raw(v),
+                    ]));
+                }
+            }
+            if !i.notes.is_empty() {
+                l.push(Line::from(""));
+                for n in &i.notes {
+                    l.push(Line::from(Span::styled(n.clone(), dim)));
+                }
+            }
+            (format!(" {} · {} · {kind} ", i.symbol, i.name), l)
+        }
+    };
+    // Fit the box to the wrapped content (scrolls when it doesn't fit).
+    let inner_w = usize::from(w.saturating_sub(2)).max(1);
+    let wrapped: usize = lines
+        .iter()
+        .map(|l| l.width().max(1).div_ceil(inner_w))
+        .sum();
+    let h = (wrapped as u16 + 2).clamp(6, max_h);
+    let rect = Rect::new(
+        area.x + (area.width.saturating_sub(w)) / 2,
+        area.y + (area.height.saturating_sub(h)) / 3,
+        w.min(area.width),
+        h.min(area.height),
+    );
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((card.scroll, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(Span::styled(title, bold))
+                    .title_bottom(Span::styled(" esc close · j/k scroll · o open source ", dim)),
+            ),
+        rect,
+    );
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -2220,6 +2356,40 @@ mod tests {
         }
     }
 
+    /// Info cards with LIVE data (`wickd info` sources): QQQ, NVDA (on a
+    /// list), EUR_USD.
+    /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_info_cards -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn snapshot_info_cards() {
+        let dir = std::env::var("WICKD_TUI_SNAPSHOT_DIR").expect("set WICKD_TUI_SNAPSHOT_DIR");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = sample_app();
+        let (w, h) = (158u16, 44u16);
+        for (n, sym) in [("1", "QQQ"), ("2", "NVDA"), ("3", "EUR_USD")] {
+            let mut info = crate::info::fetch(sym, false).await.unwrap();
+            if sym == "NVDA" {
+                info.lists = vec![crate::info::ListNote {
+                    list: "tomorrow".into(),
+                    note: Some("earnings Wed; watch the 185 break".into()),
+                }];
+            }
+            app.info = Some(crate::tui::app::InfoCard {
+                symbol: sym.into(),
+                state: crate::tui::app::InfoState::Ready(Box::new(info)),
+                scroll: 0,
+            });
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, &app)).unwrap();
+            let name = format!("{n}-info-{}", sym.to_lowercase());
+            std::fs::write(
+                format!("{dir}/{name}.html"),
+                to_html(term.backend().buffer(), &name),
+            )
+            .unwrap();
+        }
+    }
+
     /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_charts -- --ignored`
     /// writes HTML renders of the chart views for visual review.
     #[test]
@@ -2500,6 +2670,13 @@ mod tests {
         assert_eq!(fmt_volume(12_345.0), "12.3K");
         assert_eq!(fmt_volume(45_600_000.0), "45.6M");
         assert_eq!(fmt_volume(1_230_000_000.0), "1.23B");
+    }
+
+    #[test]
+    fn fiscal_year_end_reads_as_a_date() {
+        assert_eq!(month_day("0131"), "Jan 31");
+        assert_eq!(month_day("1231"), "Dec 31");
+        assert_eq!(month_day("13x"), "13x");
     }
 
     #[test]
