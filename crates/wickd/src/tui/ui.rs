@@ -1108,7 +1108,7 @@ fn render_chart_view(
     // cloud spans the whole chart on every range.
     let (cloud, future) = match (d.chart.ichimoku, d.bars()) {
         (true, Some(bars)) => {
-            let (vis, ext) = chart::session_bars(bars, range, d.chart.extended);
+            let (vis, ext) = chart::session_bars(bars, range, d.show_extended());
             let warm: Vec<Bar> = warm
                 .iter()
                 .filter(|b| ext || !range.intraday() || chart::is_regular_session(b.time))

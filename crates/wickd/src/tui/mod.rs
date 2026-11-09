@@ -6,6 +6,7 @@
 //! - [`ui`]     — rendering
 //! - [`search`] — local symbol ranking over the cached asset list
 //! - [`inplay`] — the "in play today" list (movers, actives, rvol, news)
+//! - [`fx`]     — forex pairs: OANDA history and trading-day rules
 //! - [`store`]  — watchlist + asset cache under `~/.wickd`
 //! - this file  — terminal lifecycle, the polling schedule, and the async
 //!   fetch worker
@@ -26,6 +27,7 @@
 
 pub mod app;
 pub mod chart;
+pub mod fx;
 pub mod inplay;
 pub mod keymap;
 pub mod reader;
@@ -51,6 +53,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use wickd_core::equities::alpaca::{AlpacaClient, AlpacaError, NewsItem};
 use wickd_core::equities::{Asset, Bar, HistoryRange, MarketClock, Snapshot};
+use wickd_core::oanda::OandaClient;
 
 use app::{Action, App, Mode};
 
@@ -132,6 +135,17 @@ async fn build_inplay(
     ))
 }
 
+/// The OANDA practice client for forex data (wickd-forex D-4: read-only
+/// prices; the default practice account's stored credentials).
+fn oanda_client() -> Result<OandaClient, String> {
+    let (_, client) = crate::commands::client::resolve(
+        "practice",
+        crate::vault_store::DEFAULT_ACCOUNT,
+    )
+    .map_err(|e| format!("forex needs OANDA practice credentials (`wickd login`): {e:#}"))?;
+    Ok(client)
+}
+
 pub struct Options {
     pub refresh: Duration,
 }
@@ -151,17 +165,59 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
     // The in-play list asks for up to ~60 symbols' headlines at once; cap how
     // many run concurrently so a burst doesn't trip Alpaca's rate limits.
     let news_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(NEWS_CONCURRENCY));
+    // OANDA (forex pairs) is set up on first use, so a stocks-only session
+    // never touches the OANDA credentials. Only a working client is kept: a
+    // failed lookup is retried next time (e.g. after `wickd login`).
+    let oanda: std::sync::Arc<std::sync::Mutex<Option<OandaClient>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
             let client = client.clone();
             let replies = replies.clone();
             let news_slots = news_slots.clone();
+            let oanda = oanda.clone();
             tokio::spawn(async move {
+                // Alpaca only knows stocks: forex pairs never reach it.
+                let stocks = |syms: Vec<String>| -> Vec<String> {
+                    syms.into_iter().filter(|s| !fx::is_fx(s)).collect()
+                };
                 let reply = match req {
                     Request::Snapshots(syms) => {
-                        Reply::Snapshots(client.snapshots(&syms).await.map_err(err_string))
+                        let syms = stocks(syms);
+                        if syms.is_empty() {
+                            Reply::Snapshots(Ok(HashMap::new()))
+                        } else {
+                            Reply::Snapshots(client.snapshots(&syms).await.map_err(err_string))
+                        }
                     }
+                    Request::Sparks(syms) if stocks(syms.clone()).is_empty() => {
+                        Reply::Sparks(Ok(HashMap::new()))
+                    }
+                    Request::History(sym, range) if fx::is_fx(&sym) => {
+                        let cached = oanda.lock().ok().and_then(|g| g.clone());
+                        let client = match cached {
+                            Some(c) => Ok(c),
+                            None => oanda_client().inspect(|c| {
+                                if let Ok(mut g) = oanda.lock() {
+                                    *g = Some(c.clone());
+                                }
+                            }),
+                        };
+                        let r = match client {
+                            Ok(c) => fx::history(&c, &sym, range, Utc::now()).await,
+                            Err(e) => Err(e),
+                        };
+                        match r {
+                            Ok((warm, vis)) => {
+                                let _ = replies.send(Reply::Warmup(sym.clone(), range, warm));
+                                Reply::History(sym, range, Ok(vis))
+                            }
+                            Err(e) => Reply::History(sym, range, Err(e)),
+                        }
+                    }
+                    Request::News(sym) if fx::is_fx(&sym) => Reply::News(sym, Ok(Vec::new())),
                     Request::Sparks(syms) => {
+                        let syms = stocks(syms);
                         let now = Utc::now();
                         let r = client
                             .bars(
@@ -228,7 +284,7 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                     }
                     Request::Clock => Reply::Clock(client.clock().await.map_err(err_string)),
                     Request::InPlay(watchlist) => {
-                        Reply::InPlay(build_inplay(&client, &watchlist).await)
+                        Reply::InPlay(build_inplay(&client, &stocks(watchlist)).await)
                     }
                     Request::News(sym) => {
                         // Held for the request; the semaphore is never closed.

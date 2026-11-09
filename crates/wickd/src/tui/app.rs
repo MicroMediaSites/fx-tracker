@@ -302,6 +302,12 @@ impl DetailState {
         }
     }
 
+    /// Whether the chart shows all bars rather than US regular hours: the
+    /// `v e` toggle for stocks; always for forex pairs (they trade 24/5).
+    pub fn show_extended(&self) -> bool {
+        self.chart.extended || super::fx::is_fx(&self.symbol)
+    }
+
     pub fn bars(&self) -> Option<&Vec<Bar>> {
         self.history.get(&self.range)
     }
@@ -310,7 +316,7 @@ impl DetailState {
     /// setting, plus whether extended hours are included.
     pub fn candles(&self) -> Option<(Vec<Candle>, bool)> {
         let bars = self.bars()?;
-        let (bars, extended) = chart::session_bars(bars, self.range, self.chart.extended);
+        let (bars, extended) = chart::session_bars(bars, self.range, self.show_extended());
         Some((
             chart::build(&bars, self.chart.merge_for(bars.len())),
             extended,
@@ -1075,7 +1081,7 @@ impl App {
         };
         let before = d.candles().map(|(c, _)| c).unwrap_or_default();
         let n_bars = d.bars().map_or(0, |b| {
-            chart::session_bars(b, d.range, d.chart.extended).0.len()
+            chart::session_bars(b, d.range, d.show_extended()).0.len()
         });
         match cmd {
             Cmd::ZoomIn => d.chart.zoom_in(n_bars),
@@ -1481,6 +1487,21 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn forex_pairs_chart_every_bar_not_just_us_hours() {
+        let mut a = App::new(vec!["EUR_USD".into()], "IEX");
+        a.on_key(key(KeyCode::Enter));
+        // Overnight bars (02:00Z) that a stock chart would hide.
+        let mut bars = session_bars(10);
+        for b in &mut bars {
+            b.time -= chrono::Duration::hours(12);
+        }
+        a.set_history("EUR_USD", HistoryRange::Day1, Ok(bars));
+        let d = a.detail.as_ref().unwrap();
+        assert!(d.show_extended() && !d.chart.extended);
+        assert_eq!(d.candles().unwrap().0.len(), 10);
     }
 
     #[test]
