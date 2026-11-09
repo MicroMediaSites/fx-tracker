@@ -12,6 +12,7 @@ pub mod client;
 pub mod dashboard;
 pub mod feed;
 pub mod instruments;
+pub mod list;
 pub mod login;
 pub mod pending;
 pub mod queue;
