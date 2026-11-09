@@ -69,6 +69,10 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   Stocks show last, change vs the prior session close, day range, volume and a
   sparkline of today. Moves (`w j`/`w k`) stay inside a section, and a new
   symbol lands at the end of its own section.
+- **Price colours**. Every price that updates (a stock's last, bid and ask;
+  a pair's bid, ask and mid; in every list and on the symbol screen) turns
+  green after it ticks up and red after it ticks down, and keeps that colour
+  until it moves again. Change columns stay coloured by the day's change.
 - **Forex**. Pairs use OANDA names (`EUR_USD`; anything with `_` is a pair) and
   read the OANDA **practice** account (read-only: prices only). Rows show bid,
   ask, spread in pips, change in pips and % since the trading day's open

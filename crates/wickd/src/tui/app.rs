@@ -328,6 +328,36 @@ impl DetailState {
     }
 }
 
+/// Which way each displayed price last moved, so it can show green after an
+/// uptick and red after a downtick (and keep that colour until it changes
+/// again). Keyed `"<symbol>:<field>"`, e.g. `SPY:last`, `EUR_USD:bid`.
+#[derive(Debug, Default)]
+pub struct TickDirs(HashMap<String, (f64, i8)>);
+
+impl TickDirs {
+    /// Record a price; a change from the previous value sets the direction.
+    pub fn observe(&mut self, key: String, price: f64) {
+        match self.0.get_mut(&key) {
+            Some((prev, dir)) => {
+                if price > *prev {
+                    *dir = 1;
+                } else if price < *prev {
+                    *dir = -1;
+                }
+                *prev = price;
+            }
+            None => {
+                self.0.insert(key, (price, 0));
+            }
+        }
+    }
+
+    /// +1 after an uptick, -1 after a downtick, 0 before the first change.
+    pub fn dir(&self, key: &str) -> i8 {
+        self.0.get(key).map_or(0, |(_, d)| *d)
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     pub watchlist: Vec<String>,
@@ -335,6 +365,8 @@ pub struct App {
     pub snapshots: HashMap<String, Snapshot>,
     /// Forex pair quotes (OANDA), keyed like `snapshots`.
     pub fx_quotes: HashMap<String, super::fx::FxQuote>,
+    /// Up/down colouring for every price that updates.
+    pub ticks: TickDirs,
     /// Today's closes per symbol, for the watchlist sparkline.
     pub sparks: HashMap<String, Vec<f64>>,
     pub assets: Vec<Asset>,
@@ -377,6 +409,7 @@ impl App {
             selected: 0,
             snapshots: HashMap::new(),
             fx_quotes: HashMap::new(),
+            ticks: TickDirs::default(),
             sparks: HashMap::new(),
             assets: Vec::new(),
             asset_index: HashMap::new(),
@@ -485,6 +518,33 @@ impl App {
         self.watchlist.get(self.selected).map(String::as_str)
     }
 
+    /// Apply a stock snapshot refresh (and note each price's direction).
+    pub fn set_snapshots(&mut self, map: HashMap<String, Snapshot>) {
+        for (sym, s) in &map {
+            if let Some(p) = s.last() {
+                self.ticks.observe(format!("{sym}:last"), p);
+            }
+            if let Some(q) = s.latest_quote.as_ref().filter(|q| q.bid > 0.0 && q.ask > 0.0) {
+                self.ticks.observe(format!("{sym}:bid"), q.bid);
+                self.ticks.observe(format!("{sym}:ask"), q.ask);
+            }
+        }
+        self.snapshots.extend(map);
+    }
+
+    /// Note a pair's displayed prices (bid, ask, mid) for up/down colouring.
+    fn observe_fx(&mut self, sym: &str) {
+        use rust_decimal::prelude::ToPrimitive;
+        if let Some(q) = self.fx_quotes.get(sym) {
+            let vals = [("bid", q.bid), ("ask", q.ask), ("mid", q.mid())];
+            for (field, v) in vals {
+                if let Some(v) = v.to_f64() {
+                    self.ticks.observe(format!("{sym}:{field}"), v);
+                }
+            }
+        }
+    }
+
     /// Merge a REST quote refresh: the day stats always update, but bid/ask
     /// only when newer than what live ticks already showed.
     pub fn set_fx_quotes(&mut self, quotes: HashMap<String, super::fx::FxQuote>) {
@@ -495,9 +555,10 @@ impl App {
                     *cur = super::fx::FxQuote { bid, ask, time, ..q };
                 }
                 _ => {
-                    self.fx_quotes.insert(sym, q);
+                    self.fx_quotes.insert(sym.clone(), q);
                 }
             }
+            self.observe_fx(&sym);
         }
     }
 
@@ -530,6 +591,7 @@ impl App {
                 );
             }
         }
+        self.observe_fx(&q.instrument);
         let Some(price) = mid.to_f64() else {
             return; // unrepresentable: skip rather than plot a bogus bar
         };
@@ -757,10 +819,15 @@ impl App {
 
     /// A rebuilt in-play list arrived.
     pub fn set_inplay(&mut self, result: Result<(Vec<Row>, Vec<String>), String>) -> Vec<Action> {
-        let ip = &mut self.inplay;
-        ip.loading = false;
+        self.inplay.loading = false;
         match result {
             Ok((mut rows, notes)) => {
+                for r in &rows {
+                    if let Some(p) = r.last {
+                        self.ticks.observe(format!("{}:last", r.symbol), p);
+                    }
+                }
+                let ip = &mut self.inplay;
                 // Keep the cursor on the same symbol across refreshes.
                 let keep = ip.selected_symbol();
                 inplay::sort_rows(&mut rows, ip.sort);
@@ -774,7 +841,7 @@ impl App {
                     .unwrap_or(0)
                     .min(vis.len().saturating_sub(1));
             }
-            Err(e) => ip.error = Some(e),
+            Err(e) => self.inplay.error = Some(e),
         }
         self.apply_news_cache();
         self.request_news(Utc::now())
@@ -1689,6 +1756,21 @@ mod tests {
         a.set_fx_quotes(HashMap::from([("EUR_USD".to_string(), stale)]));
         let q = &a.fx_quotes["EUR_USD"];
         assert_eq!((q.bid, q.open), (dec!(1.2000), Some(dec!(1.15))));
+    }
+
+    #[test]
+    fn prices_remember_their_last_move() {
+        let mut t = TickDirs::default();
+        t.observe("SPY:last".into(), 100.0);
+        assert_eq!(t.dir("SPY:last"), 0);
+        t.observe("SPY:last".into(), 100.5);
+        assert_eq!(t.dir("SPY:last"), 1);
+        // Unchanged keeps the last direction; a drop flips it.
+        t.observe("SPY:last".into(), 100.5);
+        assert_eq!(t.dir("SPY:last"), 1);
+        t.observe("SPY:last".into(), 99.0);
+        assert_eq!(t.dir("SPY:last"), -1);
+        assert_eq!(t.dir("QQQ:last"), 0);
     }
 
     #[test]

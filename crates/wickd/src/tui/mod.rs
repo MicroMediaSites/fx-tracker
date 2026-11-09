@@ -461,7 +461,7 @@ fn run_loop(
                     quotes_in_flight = false;
                     match r {
                         Ok(map) => {
-                            app.snapshots.extend(map);
+                            app.set_snapshots(map);
                             app.quotes_error = None;
                             app.last_quotes = Some(Local::now());
                         }

@@ -94,6 +94,16 @@ pub fn sparkline(values: &[f64], width: usize) -> String {
         .collect()
 }
 
+/// Style for a price by its last move: green after an uptick, red after a
+/// downtick, default before the first change.
+fn tick_style(app: &App, key: &str) -> Style {
+    match app.ticks.dir(key) {
+        1 => Style::default().fg(UP),
+        -1 => Style::default().fg(DOWN),
+        _ => Style::default(),
+    }
+}
+
 fn change_color(c: Option<f64>) -> Color {
     match c {
         Some(c) if c > 0.0 => UP,
@@ -475,7 +485,8 @@ fn render_stock_table(
         Row::new(vec![
             Cell::from(sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
             Cell::from(name),
-            Cell::from(Line::from(last).alignment(Alignment::Right)),
+            Cell::from(Line::from(last).alignment(Alignment::Right))
+                .style(tick_style(app, &format!("{sym}:last"))),
             Cell::from(Line::from(chg).alignment(Alignment::Right))
                 .style(Style::default().fg(color)),
             Cell::from(Line::from(pct).alignment(Alignment::Right))
@@ -578,8 +589,8 @@ fn render_fx_table(
         let spark = q.map(|q| sparkline(&q.closes, spark_w)).unwrap_or_default();
         Row::new(vec![
             Cell::from(sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
-            cell(bid),
-            cell(ask),
+            cell(bid).style(tick_style(app, &format!("{sym}:bid"))),
+            cell(ask).style(tick_style(app, &format!("{sym}:ask"))),
             cell(spread).style(Style::default().fg(DIM)),
             cell(pips).style(Style::default().fg(color)),
             cell(pct).style(Style::default().fg(color)),
@@ -739,7 +750,8 @@ fn render_inplay(frame: &mut Frame, area: Rect, app: &App) {
             Row::new(vec![
                 Cell::from(r.symbol.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
                 Cell::from(name),
-                right(r.last.map(fmt_price).unwrap_or_else(|| "—".into())),
+                right(r.last.map(fmt_price).unwrap_or_else(|| "—".into()))
+                    .style(tick_style(app, &format!("{}:last", r.symbol))),
                 right(chg).style(Style::default().fg(chg_c)),
                 right(fo).style(Style::default().fg(fo_c)),
                 right(r.volume.map(fmt_volume).unwrap_or_else(|| "—".into())),
@@ -998,9 +1010,9 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, d: &DetailState) {
     }
     let fxq = app.fx_quotes.get(&d.symbol);
     let (price_line, stats_line) = if fx::is_fx(&d.symbol) {
-        fx_header_lines(&d.symbol, fxq, app.fx_live)
+        fx_header_lines(app, &d.symbol, fxq)
     } else {
-        stock_header_lines(snap)
+        stock_header_lines(app, &d.symbol, snap)
     };
     frame.render_widget(
         Paragraph::new(vec![Line::from(title), price_line, stats_line]).block(
@@ -1013,12 +1025,16 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, d: &DetailState) {
     render_detail_body(frame, chunks[1], chunks[2], app, d, snap);
 }
 
-fn stock_header_lines(snap: Option<&Snapshot>) -> (Line<'static>, Line<'static>) {
+fn stock_header_lines(
+    app: &App,
+    sym: &str,
+    snap: Option<&Snapshot>,
+) -> (Line<'static>, Line<'static>) {
     let (last, chg, pct, color) = quote_cells(snap);
     let price_line = Line::from(vec![
         Span::styled(
             format!(" {last} "),
-            Style::default().add_modifier(Modifier::BOLD),
+            tick_style(app, &format!("{sym}:last")).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("{chg} ({pct})"), Style::default().fg(color)),
         Span::styled(
@@ -1033,16 +1049,17 @@ fn stock_header_lines(snap: Option<&Snapshot>) -> (Line<'static>, Line<'static>)
             Style::default().fg(DIM),
         ),
     ]);
-    (price_line, Line::from(stat_spans(snap)))
+    (price_line, Line::from(stat_spans(app, sym, snap)))
 }
 
 /// Forex header: mid price, change in pips and % since the trading day's
 /// open (17:00 New York), then open/high/low, bid × ask and spread.
 fn fx_header_lines(
+    app: &App,
     sym: &str,
     q: Option<&fx::FxQuote>,
-    live: bool,
 ) -> (Line<'static>, Line<'static>) {
+    let live = app.fx_live;
     let Some(q) = q else {
         return (
             Line::from(Span::styled(" loading quote…", Style::default().fg(DIM))),
@@ -1065,7 +1082,7 @@ fn fx_header_lines(
     let price_line = Line::from(vec![
         Span::styled(
             format!(" {} ", fx_price(sym, q.mid())),
-            Style::default().add_modifier(Modifier::BOLD),
+            tick_style(app, &format!("{sym}:mid")).add_modifier(Modifier::BOLD),
         ),
         Span::styled(change, Style::default().fg(color)),
         Span::styled(when, Style::default().fg(DIM)),
@@ -1080,10 +1097,16 @@ fn fx_header_lines(
             push(label, fx_price(sym, v));
         }
     }
-    push(
-        "bid/ask",
-        format!("{} × {}", fx_price(sym, q.bid), fx_price(sym, q.ask)),
-    );
+    stats.extend(bid_ask_spans(
+        app,
+        sym,
+        fx_price(sym, q.bid),
+        fx_price(sym, q.ask),
+    ));
+    let mut push = |label: &str, value: String| {
+        stats.push(Span::styled(format!(" {label} "), Style::default().fg(DIM)));
+        stats.push(Span::raw(format!("{value} ")));
+    };
     push(
         "spread",
         format!("{:.1} pips", fx::pips(sym, q.ask - q.bid).round_dp(1)),
@@ -1167,7 +1190,18 @@ fn render_detail_body(
     }
 }
 
-fn stat_spans(snap: Option<&Snapshot>) -> Vec<Span<'static>> {
+/// ` bid/ask 1.2 × 1.3 ` with each side coloured by its last move.
+fn bid_ask_spans(app: &App, sym: &str, bid: String, ask: String) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(" bid/ask ", Style::default().fg(DIM)),
+        Span::styled(bid, tick_style(app, &format!("{sym}:bid"))),
+        Span::raw(" × "),
+        Span::styled(ask, tick_style(app, &format!("{sym}:ask"))),
+        Span::raw(" "),
+    ]
+}
+
+fn stat_spans(app: &App, sym: &str, snap: Option<&Snapshot>) -> Vec<Span<'static>> {
     let Some(s) = snap else {
         return vec![Span::styled(" loading quote…", Style::default().fg(DIM))];
     };
@@ -1190,10 +1224,7 @@ fn stat_spans(snap: Option<&Snapshot>) -> Vec<Span<'static>> {
     }
     if let Some(q) = &s.latest_quote {
         if q.bid > 0.0 && q.ask > 0.0 {
-            push(
-                "bid/ask",
-                format!("{} × {}", fmt_price(q.bid), fmt_price(q.ask)),
-            );
+            out.extend(bid_ask_spans(app, sym, fmt_price(q.bid), fmt_price(q.ask)));
         }
     }
     out
@@ -1991,7 +2022,30 @@ mod tests {
             app.toggle_watchlist(p.to_string());
         }
         let client = super::super::oanda_client().expect("OANDA practice credentials");
-        app.fx_quotes = fx::quotes(&client, &app.fx_symbols(), Utc::now()).await.unwrap();
+        app.set_fx_quotes(fx::quotes(&client, &app.fx_symbols(), Utc::now()).await.unwrap());
+        // One synthetic move each way so the up/down colouring shows: stocks
+        // via a snapshot refresh, pairs via a live tick (bid and ask).
+        let mut snaps = app.snapshots.clone();
+        for (sym, d) in [("SPY", 0.25), ("NVDA", -0.15)] {
+            let s = snaps.get_mut(sym).unwrap();
+            s.latest_trade.as_mut().unwrap().price += d;
+            let q = s.latest_quote.as_mut().unwrap();
+            q.bid += d;
+            q.ask += d;
+        }
+        app.set_snapshots(app.snapshots.clone());
+        app.set_snapshots(snaps);
+        for (sym, d) in [("EUR_USD", "0.00002"), ("USD_JPY", "-0.004"), ("GBP_USD", "-0.00001")] {
+            let q = app.fx_quotes[sym].clone();
+            let d: rust_decimal::Decimal = d.parse().unwrap();
+            app.apply_tick(wickd_core::hub_client::HubQuote {
+                instrument: sym.into(),
+                bid: q.bid + d,
+                ask: q.ask + d,
+                time: q.time + chrono::Duration::seconds(1),
+            });
+        }
+        app.fx_live = true;
         app.flash = None;
         let (w, h) = (158u16, 30u16);
         let shoot = |app: &App, name: &str| {
