@@ -1,24 +1,28 @@
-//! `wickd list` — named symbol lists, the agent-facing way to build a "watch
-//! tomorrow" list (wickd-lists AGT-2391). See [`crate::lists`] for the store.
+//! `wickd list` — named symbol lists, the agent-facing way to build a day's
+//! plan (wickd-lists AGT-2391; four plan fields per symbol, AGT-2404). See
+//! [`crate::lists`] for the store.
 //!
 //!   wickd list ls
-//!   wickd list show tomorrow
-//!   wickd list add tomorrow NVDA AMD --note "earnings beat; watch 185"
-//!   wickd list rm tomorrow AMD
-//!   wickd list clear tomorrow
-//!   wickd list delete tomorrow
+//!   wickd list show mon-11-9
+//!   wickd list add mon-11-9 NET --why "earnings +39%" --constraints "stop below Fri low" \
+//!       --signal "holds Fri close after 8:00 on volume"
+//!   wickd list set mon-11-9 NET --call "continues"
+//!   wickd list rm mon-11-9 NET
+//!   wickd list clear mon-11-9
+//!   wickd list delete mon-11-9
 //!
 //! One JSON object per call (see `crate::output`). Symbols are upper-cased
 //! (`eur/usd` → `EUR_USD`) and checked against the cached Alpaca and OANDA
 //! symbol lists (`wickd tui` fills those caches); with no cache yet they're
-//! accepted and reported as `unverified`.
+//! accepted and reported as `unverified`. `add`/`set`/`rm` answer with what
+//! changed, not the whole list (`show` is for that).
 
 use anyhow::Result;
 use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde_json::json;
 
-use crate::lists;
+use crate::lists::{self, Plan};
 use crate::output::{exit, Out};
 
 #[derive(Args, Debug)]
@@ -27,21 +31,56 @@ pub struct ListArgs {
     cmd: ListCmd,
 }
 
+/// The four plan fields (all optional; an empty value clears a field).
+#[derive(Args, Debug, Default)]
+struct PlanArgs {
+    /// Why it's on the list. (`--note` is the old name.)
+    #[arg(long, alias = "note")]
+    why: Option<String>,
+    /// Your call: what you expect it to do.
+    #[arg(long)]
+    call: Option<String>,
+    /// Constraints: stop, size, "watch only"…
+    #[arg(long)]
+    constraints: Option<String>,
+    /// The signal: act when …
+    #[arg(long)]
+    signal: Option<String>,
+}
+
+impl From<PlanArgs> for Plan {
+    fn from(a: PlanArgs) -> Self {
+        Plan {
+            why: a.why,
+            call: a.call,
+            constraints: a.constraints,
+            signal: a.signal,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum ListCmd {
     /// Every list with its symbol count.
     Ls,
-    /// One list's symbols and notes.
+    /// One list's symbols with all their fields.
     Show { name: String },
     /// Add symbols (stocks or OANDA pairs) to a list, creating it if needed.
-    /// Re-adding a symbol keeps its place; --note replaces its note.
+    /// Re-adding a symbol keeps its place; given fields replace its fields.
     Add {
         name: String,
         #[arg(required = true)]
         symbols: Vec<String>,
-        /// Why these are on the list (applies to every symbol given).
-        #[arg(long)]
-        note: Option<String>,
+        #[command(flatten)]
+        plan: PlanArgs,
+    },
+    /// Set fields on a symbol already on the list (e.g. your call before
+    /// the open). Fields not given are kept; an empty value clears one.
+    Set {
+        name: String,
+        symbol: String,
+        #[command(flatten)]
+        plan: PlanArgs,
     },
     /// Remove symbols from a list.
     Rm {
@@ -95,29 +134,50 @@ fn exec(cmd: ListCmd) -> Result<serde_json::Value> {
         ListCmd::Add {
             name,
             symbols,
-            note,
+            plan,
         } => {
             let name = lists::validate_name(&name)?;
             let symbols = normalized(&symbols);
             let known = crate::tui::store::known_symbols();
             lists::check_known(&symbols, known.as_ref())?;
-            let added = lists::update_at(&path, |f| {
-                Ok(lists::add(f, &name, &symbols, note.as_deref(), Utc::now()))
+            let plan = Plan::from(plan);
+            let (r, count, changed) = lists::update_at(&path, |f| {
+                let r = lists::add(f, &name, &symbols, &plan, Utc::now());
+                let entries = &f.lists[&name];
+                let changed: Vec<lists::Entry> = entries
+                    .iter()
+                    .filter(|e| r.added.contains(&e.symbol) || r.updated.contains(&e.symbol))
+                    .cloned()
+                    .collect();
+                Ok((r, entries.len(), changed))
             })?;
-            let mut v = show(&path, &name)?;
-            v["added"] = json!(added);
+            let mut v = json!({
+                "name": name,
+                "count": count,
+                "added": r.added,
+                "updated": r.updated,
+                "entries": changed,
+            });
             if known.is_none() {
                 v["unverified"] = json!(symbols);
             }
             Ok(v)
         }
+        ListCmd::Set { name, symbol, plan } => {
+            let name = lists::validate_name(&name)?;
+            let symbol = lists::normalize_symbol(&symbol);
+            let plan = Plan::from(plan);
+            let entry = lists::update_at(&path, |f| lists::set(f, &name, &symbol, &plan))?;
+            Ok(json!({ "name": name, "entry": entry }))
+        }
         ListCmd::Rm { name, symbols } => {
             let name = lists::validate_name(&name)?;
             let symbols = normalized(&symbols);
-            let removed = lists::update_at(&path, |f| lists::remove(f, &name, &symbols))?;
-            let mut v = show(&path, &name)?;
-            v["removed"] = json!(removed);
-            Ok(v)
+            let (removed, count) = lists::update_at(&path, |f| {
+                let removed = lists::remove(f, &name, &symbols)?;
+                Ok((removed, f.lists[&name].len()))
+            })?;
+            Ok(json!({ "name": name, "count": count, "removed": removed }))
         }
         ListCmd::Clear { name } => {
             let name = lists::validate_name(&name)?;
@@ -150,10 +210,4 @@ fn normalized(symbols: &[String]) -> Vec<String> {
         .map(lists::normalize_symbol)
         .filter(|s| !s.is_empty() && seen.insert(s.clone()))
         .collect()
-}
-
-fn show(path: &std::path::Path, name: &str) -> Result<serde_json::Value> {
-    let f = lists::load_at(path)?;
-    let entries = f.lists.get(name).cloned().unwrap_or_default();
-    Ok(json!({ "name": name, "count": entries.len(), "entries": entries }))
 }

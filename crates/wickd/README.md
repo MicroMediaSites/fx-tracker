@@ -181,31 +181,45 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 
 ## `wickd list` — named symbol lists
 
-Lists of stocks and/or forex pairs, each symbol with an optional note, kept in
-`~/.wickd/lists.json`. They're separate from the TUI watchlist and the in-play
-screen, and they're the way an agent builds a list for you (say, what to watch
-tomorrow) with these commands, and `wickd tui` shows each list as a section
-at the top of the watchlist screen (symbol, note, price, change). The TUI
-picks up changes within ~2 seconds while it's open; `g l` jumps to the lists,
-and `w d` on a list row removes it from that list.
+Lists of stocks and/or forex pairs, kept in `~/.wickd/lists.json` (name them
+anything: `a-z`, `0-9`, `-`, `_`; have as many as you like — a dated list per
+trading day works well, e.g. `mon-11-9`). Each symbol carries a plan, four
+optional fields: **why** it's listed, your **call**, the **constraints**
+(stop, size, "watch only"), and the **signal** to act on. Lists are separate
+from the TUI watchlist and the in-play screen, and they're how an agent builds
+a plan for you. `wickd tui` shows each list as a section at the top of the
+watchlist screen (symbol, why, price, change); selecting a row shows its full
+plan underneath. The TUI picks up changes within ~2 seconds while it's open;
+`g l` jumps to the lists, and `w d` on a list row removes it (`w u` undoes).
 
 ```sh
-wickd list add tomorrow NVDA AMD --note "earnings beat; watch 185"
-wickd list add tomorrow EUR_USD            # pairs too (eur/usd works)
-wickd list show tomorrow                   # symbols + notes (JSON)
-wickd list ls                              # every list + count
-wickd list rm tomorrow AMD
-wickd list clear tomorrow                  # empty it (keeps the name)
-wickd list delete tomorrow
+wickd list add mon-11-9 NET --why "earnings: sales +39%, +10% Fri" \
+    --constraints "stop below Fri low; small size" \
+    --signal "holds Fri close after 8:00 on heavy volume"
+wickd list set mon-11-9 NET --call "continues"   # one field, before the open
+wickd list add mon-11-9 EUR_USD                 # pairs too (eur/usd works)
+wickd list show mon-11-9                        # every entry, all fields (JSON)
+wickd list ls                                   # every list + count
+wickd list rm mon-11-9 NET
+wickd list clear mon-11-9                       # empty it (keeps the name)
+wickd list delete mon-11-9
 ```
 
-- Re-adding a symbol keeps its place; `--note` replaces its note (no `--note`
-  keeps the old one). Commas work too: `add tomorrow NVDA,AMD`.
+- `add` creates the list if needed; re-adding a symbol keeps its place and
+  writes only the fields given. `set` changes fields on a symbol already on
+  the list (an empty value, `--call ""`, clears that field). The old `--note`
+  flag still works and means `--why`; lists saved with `note` read it as
+  `why`. Commas work too: `add mon-11-9 NVDA,AMD`.
+- `add`, `set` and `rm` answer with what changed (`added`, `updated`, the
+  changed entries / `removed`) and the list's `count`, not the whole list.
+  **Changed in AGT-2404:** `added` used to be a count and `add`/`rm` used to
+  echo every entry; JSON (here and in `wickd info`'s `lists`) now says `why`
+  where it said `note`. Read the whole list with `show`.
 - Symbols are checked against the cached Alpaca and OANDA symbol lists (`wickd
   tui` fills them); an unknown symbol is an error (exit 4) and nothing is
   written. Before any cache exists, symbols are accepted and listed under
   `unverified`.
-- Names: `a-z`, `0-9`, `-`, `_`.
+- Names: `a-z`, `0-9`, `-`, `_` (max 32).
 - Safe to run while the TUI is open or from several agents at once: every write
   re-reads the file under a lock and replaces it atomically.
 

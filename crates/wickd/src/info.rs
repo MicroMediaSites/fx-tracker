@@ -121,8 +121,14 @@ pub struct SymbolInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ListNote {
     pub list: String,
+    #[serde(default, alias = "note", skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
+    pub call: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
 }
 
 /// Which lists hold `symbol` (and why), from `~/.wickd/lists.json`.
@@ -139,7 +145,10 @@ fn list_notes_in(file: &crate::lists::ListsFile, symbol: &str) -> Vec<ListNote> 
         .filter_map(|(name, entries)| {
             entries.iter().find(|e| e.symbol == symbol).map(|e| ListNote {
                 list: name.clone(),
-                note: e.note.clone(),
+                why: e.why.clone(),
+                call: e.call.clone(),
+                constraints: e.constraints.clone(),
+                signal: e.signal.clone(),
             })
         })
         .collect()
@@ -970,14 +979,13 @@ mod tests {
     fn list_notes_name_every_list_holding_the_symbol() {
         let mut f = crate::lists::ListsFile::default();
         let now = Utc::now();
-        crate::lists::add(&mut f, "tomorrow", &["NVDA".into()], Some("watch 185"), now);
-        crate::lists::add(&mut f, "swing", &["NVDA".into(), "AMD".into()], None, now);
+        crate::lists::add(&mut f, "tomorrow", &["NVDA".into()], &crate::lists::Plan::why("watch 185"), now);
+        crate::lists::add(&mut f, "swing", &["NVDA".into(), "AMD".into()], &crate::lists::Plan::default(), now);
         let notes = list_notes_in(&f, "NVDA");
         assert_eq!(notes.len(), 2);
-        assert!(notes.contains(&ListNote {
-            list: "tomorrow".into(),
-            note: Some("watch 185".into())
-        }));
+        assert!(notes
+            .iter()
+            .any(|n| n.list == "tomorrow" && n.why.as_deref() == Some("watch 185")));
         assert!(list_notes_in(&f, "TSLA").is_empty());
     }
 
