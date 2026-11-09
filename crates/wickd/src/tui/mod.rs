@@ -166,9 +166,10 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
     // many run concurrently so a burst doesn't trip Alpaca's rate limits.
     let news_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(NEWS_CONCURRENCY));
     // OANDA (forex pairs) is set up on first use, so a stocks-only session
-    // never touches the OANDA credentials.
-    let oanda: std::sync::Arc<std::sync::OnceLock<Result<OandaClient, String>>> =
-        std::sync::Arc::new(std::sync::OnceLock::new());
+    // never touches the OANDA credentials. Only a working client is kept: a
+    // failed lookup is retried next time (e.g. after `wickd login`).
+    let oanda: std::sync::Arc<std::sync::Mutex<Option<OandaClient>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
             let client = client.clone();
@@ -193,9 +194,18 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                         Reply::Sparks(Ok(HashMap::new()))
                     }
                     Request::History(sym, range) if fx::is_fx(&sym) => {
-                        let r = match oanda.get_or_init(oanda_client) {
-                            Ok(c) => fx::history(c, &sym, range, Utc::now()).await,
-                            Err(e) => Err(e.clone()),
+                        let cached = oanda.lock().ok().and_then(|g| g.clone());
+                        let client = match cached {
+                            Some(c) => Ok(c),
+                            None => oanda_client().inspect(|c| {
+                                if let Ok(mut g) = oanda.lock() {
+                                    *g = Some(c.clone());
+                                }
+                            }),
+                        };
+                        let r = match client {
+                            Ok(c) => fx::history(&c, &sym, range, Utc::now()).await,
+                            Err(e) => Err(e),
                         };
                         match r {
                             Ok((warm, vis)) => {
