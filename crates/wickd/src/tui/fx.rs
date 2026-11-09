@@ -150,6 +150,53 @@ pub async fn quotes(
         .collect())
 }
 
+/// Bar length for ranges whose newest bar ticks forward live (1D/5D/1M);
+/// `None` for daily and longer bars, which only update in place.
+pub fn bar_seconds(range: HistoryRange) -> Option<i64> {
+    match range {
+        HistoryRange::Day1 => Some(5 * 60),
+        HistoryRange::Day5 => Some(15 * 60),
+        HistoryRange::Month1 => Some(60 * 60),
+        _ => None,
+    }
+}
+
+/// Fold a live mid price at `t` into a chart's bars: update the newest bar,
+/// or start a new one when `t` crosses into the next bar (intraday ranges;
+/// OANDA's M5/M15/H1 bars start on whole multiples of their length in UTC).
+/// Ticks older than the newest bar are ignored. Volume counts ticks, like
+/// OANDA's.
+pub fn apply_tick(bars: &mut Vec<Bar>, price: f64, t: DateTime<Utc>, secs: Option<i64>) {
+    let Some(last) = bars.last_mut() else {
+        return;
+    };
+    if t < last.time {
+        return;
+    }
+    if let Some(s) = secs {
+        let bucket = Utc
+            .timestamp_opt(t.timestamp().div_euclid(s) * s, 0)
+            .single()
+            .unwrap_or(t);
+        if bucket > last.time {
+            bars.push(Bar {
+                time: bucket,
+                open: price,
+                high: price,
+                low: price,
+                close: price,
+                volume: 1.0,
+                vwap: None,
+            });
+            return;
+        }
+    }
+    last.close = price;
+    last.high = last.high.max(price);
+    last.low = last.low.min(price);
+    last.volume += 1.0;
+}
+
 /// OANDA's instrument list as search entries (`EUR_USD`, "EUR/USD").
 pub async fn instruments(client: &OandaClient) -> Result<Vec<Asset>, String> {
     let list = endpoints::get_instruments(client)
@@ -302,6 +349,24 @@ mod tests {
             closes: vec![],
         };
         assert_eq!(pips("EUR_USD", q.change().unwrap()), dec!(10));
+    }
+
+    #[test]
+    fn live_ticks_update_the_newest_bar_or_start_the_next() {
+        let mut bars = vec![bar("2026-11-09T03:00:00Z")];
+        let five = bar_seconds(HistoryRange::Day1);
+        apply_tick(&mut bars, 1.5, t("2026-11-09T03:02:10Z"), five);
+        assert_eq!((bars.len(), bars[0].close, bars[0].high), (1, 1.5, 1.5));
+        apply_tick(&mut bars, 0.5, t("2026-11-09T03:05:01Z"), five);
+        assert_eq!(bars.len(), 2);
+        assert_eq!((bars[1].time, bars[1].open), (t("2026-11-09T03:05:00Z"), 0.5));
+        // Late tick for an older bar: ignored.
+        apply_tick(&mut bars, 9.0, t("2026-11-09T03:01:00Z"), five);
+        assert_eq!((bars.len(), bars[0].high), (2, 1.5));
+        // Daily bars only update in place.
+        let mut daily = vec![bar("2026-11-09T02:00:00Z")];
+        apply_tick(&mut daily, 2.0, t("2026-11-10T05:00:00Z"), None);
+        assert_eq!((daily.len(), daily[0].close), (1, 2.0));
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! - [`search`] — local symbol ranking over the cached asset list
 //! - [`inplay`] — the "in play today" list (movers, actives, rvol, news)
 //! - [`fx`]     — forex pairs: OANDA history and trading-day rules
+//! - [`live`]   — live forex ticks from the stream daemon (client only)
 //! - [`store`]  — watchlist + asset cache under `~/.wickd`
 //! - this file  — terminal lifecycle, the polling schedule, and the async
 //!   fetch worker
@@ -30,6 +31,7 @@ pub mod chart;
 pub mod fx;
 pub mod inplay;
 pub mod keymap;
+pub mod live;
 pub mod reader;
 pub mod search;
 pub mod store;
@@ -84,6 +86,7 @@ enum Reply {
     Warmup(String, HistoryRange, Vec<Bar>),
     FxQuotes(Result<HashMap<String, fx::FxQuote>, String>),
     FxAssets(Result<Vec<Asset>, String>),
+    Live(live::LiveEvent),
 }
 
 /// Headline lookback, shared by the list's NEWS column and the side pane so
@@ -400,12 +403,21 @@ pub async fn run(client: AlpacaClient, watchlist: Vec<String>, opts: Options) ->
             root,
         ));
     }
+    // Live forex ticks from the stream daemon (client only; reconnects).
+    let wanted: live::Wanted = Default::default();
+    {
+        let tx = reply_tx.clone();
+        tokio::spawn(live::run(wanted.clone(), move |ev| {
+            let _ = tx.send(Reply::Live(ev));
+        }));
+    }
     let budget = client.rate_limit_cell();
     let requests = spawn_worker(client, reply_tx);
     let mut app = App::new(watchlist, feed_label);
     app.history_delayed = history_delayed;
     app.api_budget = Some(budget);
-    tokio::task::spawn_blocking(move || run_loop(app, requests, reader_tx, reply_rx, opts))
+    app.refresh_secs = opts.refresh.as_secs();
+    tokio::task::spawn_blocking(move || run_loop(app, requests, reader_tx, reply_rx, wanted, opts))
         .await
         .context("tui task panicked")?
 }
@@ -415,6 +427,7 @@ fn run_loop(
     requests: UnboundedSender<Request>,
     reader_tx: UnboundedSender<reader::ReaderCmd>,
     replies: mpsc::Receiver<Reply>,
+    wanted: live::Wanted,
     opts: Options,
 ) -> Result<()> {
     install_panic_hook();
@@ -435,6 +448,7 @@ fn run_loop(
     let mut intraday = Every::new(Duration::from_secs(60));
     let mut quotes_in_flight = false;
     let mut fx_in_flight = false;
+    let mut pairs_wanted: Vec<String> = Vec::new();
     // Rebuild the in-play list every minute while it's on screen.
     let mut inplay_timer = Every::new(Duration::from_secs(60));
 
@@ -465,12 +479,14 @@ fn run_loop(
                     fx_in_flight = false;
                     match r {
                         Ok(map) => {
-                            app.fx_quotes.extend(map);
+                            app.set_fx_quotes(map);
                             app.fx_error = None;
                         }
                         Err(e) => app.fx_error = Some(e),
                     }
                 }
+                Reply::Live(live::LiveEvent::Connected(up)) => app.fx_live = up,
+                Reply::Live(live::LiveEvent::Quote(q)) => app.apply_tick(q),
                 Reply::FxAssets(r) => match r {
                     Ok(a) => app.set_fx_assets(a),
                     Err(e) => app.fx_error = Some(e),
@@ -488,6 +504,15 @@ fn run_loop(
                 Reply::News(sym, r) => app.set_news(sym, r),
                 Reply::Reader(ev) => actions.extend(app.set_reader(ev)),
             }
+        }
+
+        // Keep the live feed's filter in step with the pairs on screen.
+        let pairs_now = app.fx_symbols();
+        if pairs_now != pairs_wanted {
+            if let Ok(mut w) = wanted.lock() {
+                *w = pairs_now.iter().cloned().collect();
+            }
+            pairs_wanted = pairs_now;
         }
 
         // 2. Scheduled polls.

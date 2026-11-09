@@ -397,7 +397,15 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
         render_stock_table(frame, area, app, &stocks, pos(&stocks), title);
         return;
     }
-    let mut fx_title = format!(" forex · {} · OANDA practice ", app.watchlist.len() - start);
+    let feed = if app.fx_live {
+        "live (stream)".to_string()
+    } else {
+        format!("refresh {}s", app.refresh_secs)
+    };
+    let mut fx_title = format!(
+        " forex · {} · OANDA practice · {feed} ",
+        app.watchlist.len() - start
+    );
     if let Some(e) = &app.fx_error {
         let e: String = e.chars().take(60).collect();
         fx_title = format!("{fx_title}· {e} ");

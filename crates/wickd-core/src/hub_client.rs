@@ -126,6 +126,45 @@ pub struct HubTick {
     pub time: DateTime<Utc>,
 }
 
+/// A parsed `price-update` line with both sides (the TUI shows bid, ask and
+/// spread). [`Decimal`], never f64.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubQuote {
+    pub instrument: String,
+    pub bid: Decimal,
+    pub ask: Decimal,
+    pub time: DateTime<Utc>,
+}
+
+/// Parse one hub NDJSON line into a [`HubQuote`]; `None` for anything that
+/// isn't a well-formed `price-update` (same filtering as
+/// [`parse_price_update_line`]).
+pub fn parse_quote_line(line: &str) -> Option<HubQuote> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("event").and_then(|e| e.as_str()) != Some("price-update") {
+        return None;
+    }
+    let instrument = value.get("instrument")?.as_str()?.to_string();
+    let bid = Decimal::from_str(value.get("bid")?.as_str()?).ok()?;
+    let ask = Decimal::from_str(value.get("ask")?.as_str()?).ok()?;
+    if bid.is_zero() || ask.is_zero() {
+        return None;
+    }
+    let time = DateTime::parse_from_rfc3339(value.get("time")?.as_str()?)
+        .ok()?
+        .with_timezone(&Utc);
+    Some(HubQuote {
+        instrument,
+        bid,
+        ask,
+        time,
+    })
+}
+
 /// Parse one hub NDJSON line into a [`HubTick`].
 ///
 /// Returns `None` for anything that isn't a well-formed `price-update` line: a
@@ -133,34 +172,11 @@ pub struct HubTick {
 /// line, a missing/zero bid or ask, or an unparseable timestamp. Filtering here
 /// keeps junk on the wire from ever reaching the candle aggregator.
 pub fn parse_price_update_line(line: &str) -> Option<HubTick> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
-    }
-
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-
-    // Only price-update events carry quotes; ignore every other event type.
-    if value.get("event").and_then(|e| e.as_str()) != Some("price-update") {
-        return None;
-    }
-
-    let instrument = value.get("instrument")?.as_str()?.to_string();
-    let bid = Decimal::from_str(value.get("bid")?.as_str()?).ok()?;
-    let ask = Decimal::from_str(value.get("ask")?.as_str()?).ok()?;
-    if bid.is_zero() || ask.is_zero() {
-        return None;
-    }
-    let mid = (bid + ask) / Decimal::from(2);
-
-    let time = DateTime::parse_from_rfc3339(value.get("time")?.as_str()?)
-        .ok()?
-        .with_timezone(&Utc);
-
+    let q = parse_quote_line(line)?;
     Some(HubTick {
-        instrument,
-        mid,
-        time,
+        instrument: q.instrument,
+        mid: (q.bid + q.ask) / Decimal::from(2),
+        time: q.time,
     })
 }
 

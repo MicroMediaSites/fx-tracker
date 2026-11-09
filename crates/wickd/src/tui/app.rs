@@ -354,6 +354,10 @@ pub struct App {
     pub quotes_error: Option<String>,
     /// Last OANDA (forex) failure, shown on the forex section.
     pub fx_error: Option<String>,
+    /// Attached to the stream daemon: forex rows tick live.
+    pub fx_live: bool,
+    /// Quote refresh interval (`--refresh`), shown when not streaming.
+    pub refresh_secs: u64,
     pub last_quotes: Option<DateTime<Local>>,
     /// Transient one-line message for the footer.
     pub flash: Option<String>,
@@ -387,6 +391,8 @@ impl App {
             inplay: InPlayState::default(),
             quotes_error: None,
             fx_error: None,
+            fx_live: false,
+            refresh_secs: 15,
             last_quotes: None,
             flash: None,
             undo: None,
@@ -477,6 +483,61 @@ impl App {
 
     pub fn selected_symbol(&self) -> Option<&str> {
         self.watchlist.get(self.selected).map(String::as_str)
+    }
+
+    /// Merge a REST quote refresh: the day stats always update, but bid/ask
+    /// only when newer than what live ticks already showed.
+    pub fn set_fx_quotes(&mut self, quotes: HashMap<String, super::fx::FxQuote>) {
+        for (sym, q) in quotes {
+            match self.fx_quotes.get_mut(&sym) {
+                Some(cur) if cur.time > q.time => {
+                    let (bid, ask, time) = (cur.bid, cur.ask, cur.time);
+                    *cur = super::fx::FxQuote { bid, ask, time, ..q };
+                }
+                _ => {
+                    self.fx_quotes.insert(sym, q);
+                }
+            }
+        }
+    }
+
+    /// A live tick from the stream daemon: update the pair's row and, if its
+    /// chart is open, the newest bar of every loaded range.
+    pub fn apply_tick(&mut self, q: wickd_core::hub_client::HubQuote) {
+        use rust_decimal::prelude::ToPrimitive;
+        let mid = (q.bid + q.ask) / rust_decimal::Decimal::TWO;
+        match self.fx_quotes.get_mut(&q.instrument) {
+            Some(cur) if q.time < cur.time => return,
+            Some(cur) => {
+                cur.bid = q.bid;
+                cur.ask = q.ask;
+                cur.time = q.time;
+                cur.high = cur.high.map(|h| h.max(mid));
+                cur.low = cur.low.map(|l| l.min(mid));
+            }
+            None => {
+                self.fx_quotes.insert(
+                    q.instrument.clone(),
+                    super::fx::FxQuote {
+                        bid: q.bid,
+                        ask: q.ask,
+                        time: q.time,
+                        open: None,
+                        high: None,
+                        low: None,
+                        closes: Vec::new(),
+                    },
+                );
+            }
+        }
+        let Some(price) = mid.to_f64() else {
+            return; // unrepresentable: skip rather than plot a bogus bar
+        };
+        if let Some(d) = self.detail.as_mut().filter(|d| d.symbol == q.instrument) {
+            for (range, bars) in d.history.iter_mut() {
+                super::fx::apply_tick(bars, price, q.time, super::fx::bar_seconds(*range));
+            }
+        }
     }
 
     /// Index of the first forex pair (the watchlist is stocks, then pairs);
@@ -1587,6 +1648,43 @@ mod tests {
             ["SPY", "QQQ", "AAPL", "EUR_USD", "USD_JPY", "GBP_USD"]
         );
         assert_eq!(a.fx_symbols(), ["EUR_USD", "USD_JPY", "GBP_USD"]);
+    }
+
+    #[test]
+    fn live_ticks_update_rows_and_the_open_chart_and_rest_never_rolls_back() {
+        use rust_decimal_macros::dec;
+        let mut a = App::new(vec!["EUR_USD".into()], "IEX");
+        a.on_key(key(KeyCode::Enter));
+        let mut bars = session_bars(3);
+        let last_time = bars.last().unwrap().time;
+        for b in &mut bars {
+            b.close = 1.1;
+        }
+        a.set_history("EUR_USD", HistoryRange::Day1, Ok(bars));
+        let tick = |bid, ask, secs| wickd_core::hub_client::HubQuote {
+            instrument: "EUR_USD".into(),
+            bid,
+            ask,
+            time: last_time + chrono::Duration::seconds(secs),
+        };
+        a.apply_tick(tick(dec!(1.2000), dec!(1.2002), 30));
+        let q = &a.fx_quotes["EUR_USD"];
+        assert_eq!((q.bid, q.ask), (dec!(1.2000), dec!(1.2002)));
+        let d = a.detail.as_ref().unwrap();
+        assert!((d.bars().unwrap().last().unwrap().close - 1.2001).abs() < 1e-9);
+        // An older REST quote keeps the live bid/ask but brings the day stats.
+        let stale = super::super::fx::FxQuote {
+            bid: dec!(1.1),
+            ask: dec!(1.1),
+            time: last_time,
+            open: Some(dec!(1.15)),
+            high: Some(dec!(1.21)),
+            low: Some(dec!(1.1)),
+            closes: vec![1.1],
+        };
+        a.set_fx_quotes(HashMap::from([("EUR_USD".to_string(), stale)]));
+        let q = &a.fx_quotes["EUR_USD"];
+        assert_eq!((q.bid, q.open), (dec!(1.2000), Some(dec!(1.15))));
     }
 
     #[test]
