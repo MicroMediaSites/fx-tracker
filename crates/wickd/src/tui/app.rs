@@ -683,12 +683,17 @@ impl App {
         self.selected = found.unwrap_or(self.selected).min(self.total_rows().saturating_sub(1));
     }
 
-    /// A row's list note, if it's a list row.
-    pub fn row_note(&self, r: usize) -> Option<&str> {
+    /// A row's list entry (its plan fields), if it's a list row.
+    pub fn row_entry(&self, r: usize) -> Option<&crate::lists::Entry> {
         match self.row(r)? {
-            ScreenRow::List(li, ei) => self.lists[li].1[ei].note.as_deref(),
+            ScreenRow::List(li, ei) => Some(&self.lists[li].1[ei]),
             ScreenRow::Watch(_) => None,
         }
+    }
+
+    /// A list row's `why` (the WHY column).
+    pub fn row_note(&self, r: usize) -> Option<&str> {
+        self.row_entry(r)?.why.as_deref()
     }
 
     /// Apply a stock snapshot refresh (and note each price's direction).
@@ -1919,7 +1924,7 @@ mod tests {
         let mut f = crate::lists::ListsFile::default();
         for (name, syms) in entries {
             let syms: Vec<String> = syms.iter().map(|s| s.to_string()).collect();
-            crate::lists::add(&mut f, name, &syms, Some("why"), Utc::now());
+            crate::lists::add(&mut f, name, &syms, &crate::lists::Plan::why("why"), Utc::now());
         }
         f
     }
@@ -1988,7 +1993,7 @@ mod tests {
             a.on_key(key(KeyCode::Char('u')))
         };
         assert!(matches!(&acts[..], [Action::RestoreToList { list, entry }]
-            if list == "tomorrow" && entry.symbol == "NVDA" && entry.note.as_deref() == Some("why")));
+            if list == "tomorrow" && entry.symbol == "NVDA" && entry.why.as_deref() == Some("why")));
         // Moving a list row is a no-op; moving a watchlist row still works.
         typ(&mut a, "wj");
         assert_eq!(a.selected_symbol(), Some("GBP_USD"));

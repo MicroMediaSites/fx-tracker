@@ -223,10 +223,20 @@ fn render_info(frame: &mut Frame, area: Rect, card: &crate::tui::app::InfoCard) 
                 l.push(Line::from(""));
                 l.push(heading("On your lists"));
                 for ln in &i.lists {
-                    l.push(Line::from(vec![
-                        Span::styled(format!("  {:<12}", ln.list), bold),
-                        Span::raw(ln.note.clone().unwrap_or_default()),
-                    ]));
+                    l.push(Line::from(Span::styled(format!("  {}", ln.list), bold)));
+                    for (label, v) in [
+                        ("why", &ln.why),
+                        ("call", &ln.call),
+                        ("constraints", &ln.constraints),
+                        ("signal", &ln.signal),
+                    ] {
+                        if let Some(v) = v {
+                            l.push(Line::from(vec![
+                                Span::styled(format!("    {label:<12}"), dim),
+                                Span::raw(v.clone()),
+                            ]));
+                        }
+                    }
                 }
             }
             for c in &i.currencies {
@@ -540,12 +550,23 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
             sections.push((format!(" {name} · {} · list ", entries.len()), rows));
             base += entries.len();
         }
-        let budget = area.height.saturating_sub(8).max(4);
+        // The selected list row's full plan (why/call/constraints/signal)
+        // sits under the list sections.
+        let plan = sel.and_then(|s| app.row_entry(s));
+        let plan_h: u16 = if plan.is_some() { 6 } else { 0 };
+        let budget = area.height.saturating_sub(8 + plan_h).max(4);
         let total: u16 = heights.iter().sum::<u16>().min(budget);
         let parts = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(total), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(total),
+                Constraint::Length(plan_h),
+                Constraint::Min(0),
+            ])
             .split(area);
+        if let Some(e) = plan {
+            render_plan(frame, parts[1], e);
+        }
         let list_parts = Layout::default()
             .direction(Direction::Vertical)
             .constraints(heights.iter().map(|h| Constraint::Length(*h)).collect::<Vec<_>>())
@@ -554,7 +575,7 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
             let pos = sel.and_then(|s| rows.iter().position(|&r| r == s));
             render_list_table(frame, *rect, app, rows, pos, title.clone());
         }
-        parts[1]
+        parts[2]
     };
     // The rest works in watchlist indices.
     let shown: Vec<usize> = shown.into_iter().filter(|&r| r >= lr).map(|r| r - lr).collect();
@@ -621,6 +642,41 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
     render_fx_table(frame, parts[1], app, &pairs, pos(&pairs), fx_title);
 }
 
+/// The selected list entry's plan: why, call, constraints, signal (empty
+/// fields say so, so a missing call before the open stands out).
+fn render_plan(frame: &mut Frame, area: Rect, e: &crate::lists::Entry) {
+    let dim = Style::default().fg(DIM);
+    let line = |label: &str, v: &Option<String>| {
+        Line::from(vec![
+            Span::styled(format!(" {label:<12}"), Style::default().fg(ACCENT)),
+            match v {
+                Some(v) => Span::raw(v.clone()),
+                None => Span::styled("—", dim),
+            },
+        ])
+    };
+    let lines = vec![
+        line("why", &e.why),
+        line("call", &e.call),
+        line("constraints", &e.constraints),
+        line("signal", &e.signal),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(Span::styled(
+                        format!(" {} · plan ", e.symbol),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+            ),
+        area,
+    );
+}
+
 /// One named list (`wickd list`): symbol, note, price and change for stocks
 /// and pairs alike (pairs at OANDA precision, mid price).
 fn render_list_table(
@@ -631,7 +687,7 @@ fn render_list_table(
     sel: Option<usize>,
     title: String,
 ) {
-    let header = header_row(&["SYMBOL", "NOTE"], &["LAST", "CHG%"], &[]);
+    let header = header_row(&["SYMBOL", "WHY"], &["LAST", "CHG%"], &[]);
     let body = rows.iter().filter_map(|&r| {
         let sym = app.row_symbol(r)?.to_string();
         let note = app.row_note(r).unwrap_or_default().to_string();
@@ -2281,12 +2337,25 @@ mod tests {
         app.flash = None;
         // A list an agent built for tomorrow (with notes).
         let mut lists = crate::lists::ListsFile::default();
-        for (sym, note) in [
-            ("NVDA", "earnings Wed; watch the 185 break"),
-            ("SPY", "open drive above 682 = trend day?"),
-            ("EUR_USD", "ECB speakers; fade rallies into 1.1200"),
+        for (sym, why, call, constraints, signal) in [
+            (
+                "NVDA",
+                "Earnings Wed. Chips crashed last week; first test of the 185 shelf",
+                "Holds 185 into earnings",
+                "1% risk; stop below Fri low; half size (VIX ~24)",
+                "Act if it reclaims 185 after 8:00 on above-average volume",
+            ),
+            ("SPY", "Open drive above 682 = trend day?", "", "Watch only before CPI", ""),
+            ("EUR_USD", "ECB speakers all week", "Fades rallies into 1.1200", "", "Short a rejection at 1.1200"),
         ] {
-            crate::lists::add(&mut lists, "tomorrow", &[sym.to_string()], Some(note), Utc::now());
+            let opt = |s: &str| (!s.is_empty()).then(|| s.to_string());
+            let plan = crate::lists::Plan {
+                why: opt(why),
+                call: opt(call),
+                constraints: opt(constraints),
+                signal: opt(signal),
+            };
+            crate::lists::add(&mut lists, "mon-11-9", &[sym.to_string()], &plan, Utc::now());
         }
         app.set_lists(lists);
         app.selected = 0;
@@ -2371,7 +2440,10 @@ mod tests {
             if sym == "NVDA" {
                 info.lists = vec![crate::info::ListNote {
                     list: "tomorrow".into(),
-                    note: Some("earnings Wed; watch the 185 break".into()),
+                    why: Some("earnings Wed; watch the 185 break".into()),
+                    call: Some("pullback first, then higher".into()),
+                    constraints: Some("1% risk; stop below 180".into()),
+                    signal: Some("buy a reclaim of 185 after 8:00".into()),
                 }];
             }
             app.info = Some(crate::tui::app::InfoCard {
