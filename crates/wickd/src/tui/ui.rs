@@ -1103,18 +1103,18 @@ fn render_chart_view(
         (true, Some(vis)) => chart::moving_averages(warm, vis, &candles),
         _ => Vec::new(),
     };
-    // Ichimoku on the same bars the candles were built from (session-filtered
-    // on intraday ranges; daily ranges get the warm-up history so the cloud
-    // spans the whole chart).
+    // Ichimoku on the same bars the candles were built from, with the
+    // warm-up history before them (filtered to the same session hours) so the
+    // cloud spans the whole chart on every range.
     let (cloud, future) = match (d.chart.ichimoku, d.bars()) {
         (true, Some(bars)) => {
-            let (vis, _) = chart::session_bars(bars, range, d.chart.extended);
-            let warm = if chart::ma_range(range) {
-                warm
-            } else {
-                &[][..]
-            };
-            let (ov, cloud, fut) = chart::ichimoku_overlays(warm, &vis, &candles);
+            let (vis, ext) = chart::session_bars(bars, range, d.chart.extended);
+            let warm: Vec<Bar> = warm
+                .iter()
+                .filter(|b| ext || !range.intraday() || chart::is_regular_session(b.time))
+                .cloned()
+                .collect();
+            let (ov, cloud, fut) = chart::ichimoku_overlays(&warm, &vis, &candles);
             overlays.extend(ov);
             (Some(cloud), fut)
         }
@@ -1155,6 +1155,9 @@ fn render_chart_view(
     if d.chart.ichimoku {
         title.push_str(" · Ichimoku 9/26/52");
     }
+    if d.chart.levels {
+        title.push_str(" · S/R");
+    }
     if d.chart.ma {
         title.push_str(if chart::ma_range(range) {
             " · MA 50/200"
@@ -1182,6 +1185,7 @@ fn render_chart_view(
             overlays: &overlays,
             cloud: cloud.as_ref(),
             future,
+            levels: d.chart.levels,
             fmt_price,
             fmt_volume,
             time_label: &time_label,
@@ -1789,6 +1793,15 @@ mod tests {
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('i'));
         shoot(&app, "4c-1y-ichimoku");
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('s'));
+        shoot(&app, "4d-1y-support-resistance");
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('i'));
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('i'));
         press(&mut app, KeyCode::Char('v'));

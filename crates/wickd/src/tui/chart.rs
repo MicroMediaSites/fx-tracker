@@ -208,6 +208,37 @@ pub fn ma_range(range: HistoryRange) -> bool {
 /// so a 200-day average spans the whole chart (~200 trading days).
 pub const MA_WARMUP_DAYS: i64 = 300;
 
+/// Calendar days of extra history fetched before a range's window: ~200
+/// trading days for the daily MAs, and on intraday ranges enough sessions of
+/// the same timeframe for Ichimoku (78 bars: 52 for span B + 26 shift) to
+/// span the whole chart, with slack for weekends and holidays.
+pub fn warmup_days(range: HistoryRange) -> i64 {
+    match range {
+        HistoryRange::Day1 => 6,    // 5Min: 78 bars/session
+        HistoryRange::Day5 => 8,    // 15Min: 26 bars/session
+        HistoryRange::Month1 => 21, // 1Hour: ~7 bars/session
+        r if ma_range(r) => MA_WARMUP_DAYS,
+        _ => 0,
+    }
+}
+
+/// Split a warm-up fetch into (warm-up, visible): the visible part is what
+/// the range shows (bars from `start`, then [`HistoryRange::trim`]);
+/// everything older than its first bar is warm-up.
+pub fn split_warmup(
+    range: HistoryRange,
+    start: DateTime<Utc>,
+    all: Vec<Bar>,
+) -> (Vec<Bar>, Vec<Bar>) {
+    let vis = range.trim(all.iter().filter(|b| b.time >= start).cloned().collect());
+    let first = vis.first().map(|b| b.time);
+    let warm = all
+        .into_iter()
+        .filter(|b| first.is_some_and(|f| b.time < f))
+        .collect();
+    (warm, vis)
+}
+
 pub const MA50_COLOR: Color = Color::Rgb(59, 130, 246);
 pub const MA200_COLOR: Color = Color::Rgb(245, 158, 11);
 
@@ -241,8 +272,6 @@ pub const ICHI_SHIFT: usize = 26;
 // Same palette as the wickd desktop app (INDICATOR_COLORS).
 pub const TENKAN_COLOR: Color = Color::Rgb(212, 164, 57);
 pub const KIJUN_COLOR: Color = Color::Rgb(74, 144, 194);
-pub const SPAN_A_COLOR: Color = Color::Rgb(118, 168, 126);
-pub const SPAN_B_COLOR: Color = Color::Rgb(194, 120, 120);
 pub const CHIKOU_COLOR: Color = Color::Rgb(220, 220, 220);
 /// Faint cloud tints (span A above B / below B).
 pub const CLOUD_UP: Color = Color::Rgb(22, 52, 44);
@@ -331,6 +360,7 @@ pub fn ichimoku_overlays(
             .chain((1..=future).map(|j| v.get(off + last.end + j * k).copied().flatten()))
             .collect()
     };
+    // Span A/B are not drawn as lines: the cloud tint already shows both edges.
     let overlays = vec![
         Overlay {
             label: "Tenkan",
@@ -343,16 +373,6 @@ pub fn ichimoku_overlays(
             values: sample(&s.kijun),
         },
         Overlay {
-            label: "SpanA",
-            color: SPAN_A_COLOR,
-            values: sample(&s.span_a),
-        },
-        Overlay {
-            label: "SpanB",
-            color: SPAN_B_COLOR,
-            values: sample(&s.span_b),
-        },
-        Overlay {
             label: "Chikou",
             color: CHIKOU_COLOR,
             values: sample(&s.chikou),
@@ -363,6 +383,96 @@ pub fn ichimoku_overlays(
         b: sample(&s.span_b),
     };
     (overlays, cloud, future)
+}
+
+// ── support / resistance ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelKind {
+    Support,
+    Resistance,
+}
+
+/// A horizontal level built from clustered swing highs/lows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Level {
+    pub price: f64,
+    /// Swing points that formed it (more = stronger).
+    pub touches: usize,
+    pub kind: LevelKind,
+}
+
+pub const SUPPORT_COLOR: Color = Color::Rgb(110, 160, 190);
+pub const RESISTANCE_COLOR: Color = Color::Rgb(200, 140, 100);
+/// Background behind level tags so they stay legible over candles.
+const GRID_BG: Color = Color::Rgb(21, 26, 34);
+
+/// Support/resistance from the swing highs and lows in `candles`.
+///
+/// - A swing high is a candle whose high is the highest of the `L` candles
+///   either side (swing low: lowest low), with `L` scaled to the window
+///   (2..=8).
+/// - Swing points within half an average candle range of each other merge
+///   into one level (its price is their mean; `touches` counts them).
+/// - Levels above the last close are resistance, below are support; the
+///   `per_side` strongest of each are kept (ties: nearest to price).
+pub fn swing_levels(candles: &[Candle], per_side: usize) -> Vec<Level> {
+    let n = candles.len();
+    if n < 7 || per_side == 0 {
+        return Vec::new();
+    }
+    let l = (n / 30).clamp(2, 8);
+    let mut pivots: Vec<f64> = Vec::new();
+    for i in l..n.saturating_sub(l) {
+        let w = &candles[i - l..=i + l];
+        let c = &candles[i];
+        if w.iter().all(|x| x.high <= c.high) {
+            pivots.push(c.high);
+        }
+        if w.iter().all(|x| x.low >= c.low) {
+            pivots.push(c.low);
+        }
+    }
+    let avg_range = candles.iter().map(|c| c.high - c.low).sum::<f64>() / n as f64;
+    let tol = (avg_range * 0.5).max(f64::EPSILON);
+    pivots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Greedy clusters over the sorted prices.
+    let mut clusters: Vec<Vec<f64>> = Vec::new();
+    for p in pivots {
+        match clusters.last_mut() {
+            Some(c) if p - c.iter().sum::<f64>() / c.len() as f64 <= tol => c.push(p),
+            _ => clusters.push(vec![p]),
+        }
+    }
+    let last = candles[n - 1].close;
+    let mut levels: Vec<Level> = clusters
+        .into_iter()
+        .map(|c| {
+            let price = c.iter().sum::<f64>() / c.len() as f64;
+            Level {
+                price,
+                touches: c.len(),
+                kind: if price >= last {
+                    LevelKind::Resistance
+                } else {
+                    LevelKind::Support
+                },
+            }
+        })
+        .collect();
+    levels.sort_by(|a, b| {
+        b.touches.cmp(&a.touches).then(
+            (a.price - last)
+                .abs()
+                .partial_cmp(&(b.price - last).abs())
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    let mut out: Vec<Level> = Vec::new();
+    for kind in [LevelKind::Resistance, LevelKind::Support] {
+        out.extend(levels.iter().filter(|l| l.kind == kind).take(per_side));
+    }
+    out
 }
 
 /// Simple moving average: element `i` averages `values[i+1-n..=i]`; `None`
@@ -415,6 +525,8 @@ pub struct ChartView {
     pub ma: bool,
     /// Show the Ichimoku cloud.
     pub ichimoku: bool,
+    /// Show support/resistance levels.
+    pub levels: bool,
     /// Candles that fit, as last measured by the renderer.
     pub visible: Cell<usize>,
     /// Fit mode (the default): the whole range spread across the width,
@@ -433,6 +545,7 @@ impl Default for ChartView {
             extended: false,
             ma: false,
             ichimoku: false,
+            levels: false,
             visible: Cell::new(60),
             fit: true,
             plot_cols: Cell::new(120),
@@ -811,6 +924,8 @@ pub struct ChartWidget<'a> {
     /// Empty slots reserved right of the newest candle (Ichimoku projection)
     /// while the window is pinned to the latest candle.
     pub future: usize,
+    /// Draw support/resistance levels found in the visible window.
+    pub levels: bool,
     pub fmt_price: fn(f64) -> String,
     pub fmt_volume: fn(f64) -> String,
     /// Full timestamp label for the readout.
@@ -989,6 +1104,36 @@ impl Widget for ChartWidget<'_> {
             }
         }
 
+        // Support / resistance (from the visible candles): lines behind the
+        // candles now; their tags are drawn on top after the candles.
+        let mut level_tags: Vec<(u16, String, Color)> = Vec::new();
+        if self.levels {
+            for lv in swing_levels(win, 3) {
+                if lv.price < lo || lv.price > hi {
+                    continue;
+                }
+                let color = match lv.kind {
+                    LevelKind::Support => SUPPORT_COLOR,
+                    LevelKind::Resistance => RESISTANCE_COLOR,
+                };
+                let row = y0 + row_of(lv.price);
+                for x in x0..x_axis {
+                    buf.set_string(x, row, "╌", Style::default().fg(color));
+                }
+                let tag = format!(
+                    " {} {} ×{} ",
+                    if lv.kind == LevelKind::Support {
+                        "S"
+                    } else {
+                        "R"
+                    },
+                    (self.fmt_price)(lv.price),
+                    lv.touches
+                );
+                level_tags.push((row, tag, color));
+            }
+        }
+
         // Overlay lines (behind the candles; broken where undefined).
         if !self.overlays.is_empty() {
             let segs: Vec<(f64, f64, f64, f64, Color)> = self
@@ -1122,6 +1267,19 @@ impl Widget for ChartWidget<'_> {
                         }
                     });
                 canvas.render(Rect::new(x0, y0, plot_w, price_rows), buf);
+            }
+        }
+
+        // Level tags on top of the candles, at the right edge of the plot.
+        for (row, tag, color) in &level_tags {
+            let w = tag.chars().count() as u16;
+            if w + 2 < plot_w {
+                buf.set_string(
+                    x_axis - w - 1,
+                    *row,
+                    tag,
+                    Style::default().fg(*color).bg(GRID_BG),
+                );
             }
         }
 
@@ -1436,6 +1594,7 @@ mod tests {
             overlays: &ov,
             cloud: None,
             future: 0,
+            levels: false,
             fmt_price: |p| format!("{p:.2}"),
             fmt_volume: |v| format!("{v:.0}"),
             time_label: &label,
@@ -1495,6 +1654,35 @@ mod tests {
                 && !ma_range(HistoryRange::Day1)
                 && !ma_range(HistoryRange::Year5)
         );
+    }
+
+    #[test]
+    fn intraday_ranges_fetch_enough_warmup_for_the_cloud() {
+        use HistoryRange::*;
+        // Every range the cloud draws on gets warm-up; long ranges don't need it.
+        for r in [Day1, Day5, Month1, Month6, Year1] {
+            assert!(warmup_days(r) > 0, "{r:?}");
+        }
+        assert_eq!(warmup_days(Year5), 0);
+        // 1D: bars over three sessions; the window starts mid-way, trim keeps
+        // the last session; everything before it is warm-up.
+        let bars: Vec<Bar> = [
+            "2026-11-04T15:00:00Z",
+            "2026-11-05T15:00:00Z",
+            "2026-11-05T16:00:00Z",
+            "2026-11-06T15:00:00Z",
+            "2026-11-06T16:00:00Z",
+        ]
+        .iter()
+        .map(|t| bar(t, 1.0, 1.0, 1.0, 1.0, 1.0))
+        .collect();
+        let start = "2026-11-05T00:00:00Z".parse().unwrap();
+        let (warm, vis) = split_warmup(Day1, start, bars.clone());
+        assert_eq!((warm.len(), vis.len()), (3, 2));
+        assert!(warm.iter().all(|w| w.time < vis[0].time));
+        // Month1 doesn't trim: the window is everything from `start`.
+        let (warm, vis) = split_warmup(Month1, start, bars);
+        assert_eq!((warm.len(), vis.len()), (1, 4));
     }
 
     fn ichi_bars(n: usize) -> Vec<Bar> {
@@ -1574,7 +1762,7 @@ mod tests {
         let fine = build(&vis, 1);
         let (ov, cloud, fut) = ichimoku_overlays(&warm, &vis, &fine);
         assert_eq!(fut, 26);
-        assert_eq!(ov.len(), 5);
+        assert_eq!(ov.len(), 3);
         assert_eq!(cloud.a.len(), 60 + 26);
         // With warm-up, the cloud and kijun exist from the first candle.
         assert!(cloud.a[0].is_some() && cloud.b[0].is_some() && ov[1].values[0].is_some());
@@ -1606,6 +1794,7 @@ mod tests {
             overlays: &ov,
             cloud: Some(&cloud),
             future: fut,
+            levels: false,
             fmt_price: |p| format!("{p:.2}"),
             fmt_volume: |v| format!("{v:.0}"),
             time_label: &label,
@@ -1637,6 +1826,73 @@ mod tests {
         let tint_right = (last_body + 3..105u16)
             .any(|x| (1..20u16).any(|y| matches!(buf[(x, y)].bg, CLOUD_UP | CLOUD_DOWN)));
         assert!(tint_right, "projected cloud drawn right of the last candle");
+    }
+
+    #[test]
+    fn swing_levels_find_a_double_top_and_double_bottom() {
+        // Oscillates between ~100 and ~110 twice, ending mid-range at 105.
+        let path = [
+            103.0, 105.0, 107.0, 109.0, 110.0, 108.0, 106.0, 104.0, 102.0, 100.0, 102.0, 104.0,
+            106.0, 108.0, 110.2, 108.0, 106.0, 104.0, 102.0, 100.2, 102.0, 104.0, 105.0, 105.0,
+        ];
+        let bars: Vec<Bar> = path
+            .iter()
+            .map(|&c| bar("2026-01-01T05:00:00Z", c, c + 0.3, c - 0.3, c, 1.0))
+            .collect();
+        let lv = swing_levels(&build(&bars, 1), 3);
+        let r = lv
+            .iter()
+            .find(|l| l.kind == LevelKind::Resistance)
+            .expect("resistance");
+        let s = lv
+            .iter()
+            .find(|l| l.kind == LevelKind::Support)
+            .expect("support");
+        assert!((r.price - 110.4).abs() < 0.3 && r.touches == 2, "{r:?}");
+        assert!((s.price - 99.8).abs() < 0.3 && s.touches == 2, "{s:?}");
+        // At most 3 per side; tiny inputs give nothing.
+        assert!(lv.iter().filter(|l| l.kind == LevelKind::Support).count() <= 3);
+        assert!(swing_levels(&build(&bars[..5], 1), 3).is_empty());
+    }
+
+    #[test]
+    fn levels_draw_as_lines_with_tags() {
+        let candles = build(&walk(120), 1);
+        let v = ChartView::default();
+        let area = Rect::new(0, 0, 120, 26);
+        let mut buf = Buffer::empty(area);
+        let label = |t: DateTime<Utc>| t.format("%H:%M").to_string();
+        let boundary = |_p: Option<DateTime<Utc>>, _t: DateTime<Utc>| None;
+        ChartWidget {
+            candles: &candles,
+            view: &v,
+            style: Style2::Candles,
+            reference: None,
+            last_price: None,
+            delayed: false,
+            overlays: &[],
+            cloud: None,
+            future: 0,
+            levels: true,
+            fmt_price: |p| format!("{p:.2}"),
+            fmt_volume: |v| format!("{v:.0}"),
+            time_label: &label,
+            boundary: &boundary,
+            palette: Palette {
+                up: Color::Green,
+                down: Color::Red,
+                dim: Color::DarkGray,
+                grid: Color::Gray,
+                text: Color::White,
+            },
+        }
+        .render(area, &mut buf);
+        let t = text(&buf);
+        assert!(t.contains(" R ") || t.contains(" S "), "{t}");
+        let colored = (0..26u16).any(|y| {
+            (0..120u16).any(|x| matches!(buf[(x, y)].fg, SUPPORT_COLOR | RESISTANCE_COLOR))
+        });
+        assert!(colored, "{t}");
     }
 
     #[test]
@@ -1692,6 +1948,7 @@ mod tests {
             overlays: &[],
             cloud: None,
             future: 0,
+            levels: false,
             fmt_price: |p| format!("{p:.2}"),
             fmt_volume: |v| format!("{v:.0}"),
             time_label: &label,
@@ -1796,6 +2053,7 @@ mod tests {
                 overlays: &[],
                 cloud: None,
                 future: 0,
+                levels: false,
                 fmt_price: |p| format!("{p:.2}"),
                 fmt_volume: |v| format!("{v:.0}"),
                 time_label: &label,
