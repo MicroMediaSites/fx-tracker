@@ -121,6 +121,11 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 
   `v l` switches to a close-price line with the same zoom and cursor, and
   `tab` flips between the last chart style and a newest-first OHLCV table.
+  `v m` toggles the 50-day (blue) and 200-day (amber) moving averages. They
+  are computed from daily bars, so they show on the 6M and 1Y charts; about
+  200 extra trading days are fetched behind the window (in the same request)
+  so the 200-day line spans the whole chart. Their values at the cursor show
+  in the readout.
 - **Data**. Quotes poll every 15s (`--refresh`). On the free plan, live quotes
   are IEX-only (about 3% of volume). `--feed delayed-sip` trades that for
   all-exchange quotes 15 minutes behind. History is always consolidated and
