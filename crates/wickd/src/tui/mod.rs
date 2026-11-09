@@ -185,12 +185,13 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                             .map_err(err_string);
                         Reply::Sparks(r)
                     }
-                    Request::History(sym, range) if chart::ma_range(range) => {
-                        // Daily ranges: one fetch that also covers ~200
-                        // trading days before the window (MA warm-up).
+                    Request::History(sym, range) if chart::warmup_days(range) > 0 => {
+                        // One fetch that also covers history before the
+                        // window (MA warm-up on daily ranges, Ichimoku
+                        // warm-up on intraday ones).
                         let now = Utc::now();
                         let start = range.start(now);
-                        let from = start - chrono::Duration::days(chart::MA_WARMUP_DAYS);
+                        let from = start - chrono::Duration::days(chart::warmup_days(range));
                         let r = client
                             .bars(std::slice::from_ref(&sym), range.timeframe(), from)
                             .await
@@ -198,10 +199,9 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                             .map_err(err_string);
                         match r {
                             Ok(all) => {
-                                let (warm, vis): (Vec<Bar>, Vec<Bar>) =
-                                    all.into_iter().partition(|b| b.time < start);
+                                let (warm, vis) = chart::split_warmup(range, start, all);
                                 let _ = replies.send(Reply::Warmup(sym.clone(), range, warm));
-                                Reply::History(sym, range, Ok(range.trim(vis)))
+                                Reply::History(sym, range, Ok(vis))
                             }
                             Err(e) => Reply::History(sym, range, Err(e)),
                         }

@@ -208,6 +208,37 @@ pub fn ma_range(range: HistoryRange) -> bool {
 /// so a 200-day average spans the whole chart (~200 trading days).
 pub const MA_WARMUP_DAYS: i64 = 300;
 
+/// Calendar days of extra history fetched before a range's window: ~200
+/// trading days for the daily MAs, and on intraday ranges enough sessions of
+/// the same timeframe for Ichimoku (78 bars: 52 for span B + 26 shift) to
+/// span the whole chart, with slack for weekends and holidays.
+pub fn warmup_days(range: HistoryRange) -> i64 {
+    match range {
+        HistoryRange::Day1 => 6,    // 5Min: 78 bars/session
+        HistoryRange::Day5 => 8,    // 15Min: 26 bars/session
+        HistoryRange::Month1 => 21, // 1Hour: ~7 bars/session
+        r if ma_range(r) => MA_WARMUP_DAYS,
+        _ => 0,
+    }
+}
+
+/// Split a warm-up fetch into (warm-up, visible): the visible part is what
+/// the range shows (bars from `start`, then [`HistoryRange::trim`]);
+/// everything older than its first bar is warm-up.
+pub fn split_warmup(
+    range: HistoryRange,
+    start: DateTime<Utc>,
+    all: Vec<Bar>,
+) -> (Vec<Bar>, Vec<Bar>) {
+    let vis = range.trim(all.iter().filter(|b| b.time >= start).cloned().collect());
+    let first = vis.first().map(|b| b.time);
+    let warm = all
+        .into_iter()
+        .filter(|b| first.is_some_and(|f| b.time < f))
+        .collect();
+    (warm, vis)
+}
+
 pub const MA50_COLOR: Color = Color::Rgb(59, 130, 246);
 pub const MA200_COLOR: Color = Color::Rgb(245, 158, 11);
 
@@ -241,8 +272,6 @@ pub const ICHI_SHIFT: usize = 26;
 // Same palette as the wickd desktop app (INDICATOR_COLORS).
 pub const TENKAN_COLOR: Color = Color::Rgb(212, 164, 57);
 pub const KIJUN_COLOR: Color = Color::Rgb(74, 144, 194);
-pub const SPAN_A_COLOR: Color = Color::Rgb(118, 168, 126);
-pub const SPAN_B_COLOR: Color = Color::Rgb(194, 120, 120);
 pub const CHIKOU_COLOR: Color = Color::Rgb(220, 220, 220);
 /// Faint cloud tints (span A above B / below B).
 pub const CLOUD_UP: Color = Color::Rgb(22, 52, 44);
@@ -331,6 +360,7 @@ pub fn ichimoku_overlays(
             .chain((1..=future).map(|j| v.get(off + last.end + j * k).copied().flatten()))
             .collect()
     };
+    // Span A/B are not drawn as lines: the cloud tint already shows both edges.
     let overlays = vec![
         Overlay {
             label: "Tenkan",
@@ -341,16 +371,6 @@ pub fn ichimoku_overlays(
             label: "Kijun",
             color: KIJUN_COLOR,
             values: sample(&s.kijun),
-        },
-        Overlay {
-            label: "SpanA",
-            color: SPAN_A_COLOR,
-            values: sample(&s.span_a),
-        },
-        Overlay {
-            label: "SpanB",
-            color: SPAN_B_COLOR,
-            values: sample(&s.span_b),
         },
         Overlay {
             label: "Chikou",
@@ -1636,6 +1656,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn intraday_ranges_fetch_enough_warmup_for_the_cloud() {
+        use HistoryRange::*;
+        // Every range the cloud draws on gets warm-up; long ranges don't need it.
+        for r in [Day1, Day5, Month1, Month6, Year1] {
+            assert!(warmup_days(r) > 0, "{r:?}");
+        }
+        assert_eq!(warmup_days(Year5), 0);
+        // 1D: bars over three sessions; the window starts mid-way, trim keeps
+        // the last session; everything before it is warm-up.
+        let bars: Vec<Bar> = [
+            "2026-11-04T15:00:00Z",
+            "2026-11-05T15:00:00Z",
+            "2026-11-05T16:00:00Z",
+            "2026-11-06T15:00:00Z",
+            "2026-11-06T16:00:00Z",
+        ]
+        .iter()
+        .map(|t| bar(t, 1.0, 1.0, 1.0, 1.0, 1.0))
+        .collect();
+        let start = "2026-11-05T00:00:00Z".parse().unwrap();
+        let (warm, vis) = split_warmup(Day1, start, bars.clone());
+        assert_eq!((warm.len(), vis.len()), (3, 2));
+        assert!(warm.iter().all(|w| w.time < vis[0].time));
+        // Month1 doesn't trim: the window is everything from `start`.
+        let (warm, vis) = split_warmup(Month1, start, bars);
+        assert_eq!((warm.len(), vis.len()), (1, 4));
+    }
+
     fn ichi_bars(n: usize) -> Vec<Bar> {
         // Exact quarter values so Decimal and f64 agree bit for bit.
         (0..n)
@@ -1713,7 +1762,7 @@ mod tests {
         let fine = build(&vis, 1);
         let (ov, cloud, fut) = ichimoku_overlays(&warm, &vis, &fine);
         assert_eq!(fut, 26);
-        assert_eq!(ov.len(), 5);
+        assert_eq!(ov.len(), 3);
         assert_eq!(cloud.a.len(), 60 + 26);
         // With warm-up, the cloud and kijun exist from the first candle.
         assert!(cloud.a[0].is_some() && cloud.b[0].is_some() && ov[1].values[0].is_some());

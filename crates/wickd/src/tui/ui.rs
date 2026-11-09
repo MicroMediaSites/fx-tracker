@@ -1103,18 +1103,18 @@ fn render_chart_view(
         (true, Some(vis)) => chart::moving_averages(warm, vis, &candles),
         _ => Vec::new(),
     };
-    // Ichimoku on the same bars the candles were built from (session-filtered
-    // on intraday ranges; daily ranges get the warm-up history so the cloud
-    // spans the whole chart).
+    // Ichimoku on the same bars the candles were built from, with the
+    // warm-up history before them (filtered to the same session hours) so the
+    // cloud spans the whole chart on every range.
     let (cloud, future) = match (d.chart.ichimoku, d.bars()) {
         (true, Some(bars)) => {
-            let (vis, _) = chart::session_bars(bars, range, d.chart.extended);
-            let warm = if chart::ma_range(range) {
-                warm
-            } else {
-                &[][..]
-            };
-            let (ov, cloud, fut) = chart::ichimoku_overlays(warm, &vis, &candles);
+            let (vis, ext) = chart::session_bars(bars, range, d.chart.extended);
+            let warm: Vec<Bar> = warm
+                .iter()
+                .filter(|b| ext || !range.intraday() || chart::is_regular_session(b.time))
+                .cloned()
+                .collect();
+            let (ov, cloud, fut) = chart::ichimoku_overlays(&warm, &vis, &candles);
             overlays.extend(ov);
             (Some(cloud), fut)
         }

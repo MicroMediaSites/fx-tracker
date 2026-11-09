@@ -273,8 +273,8 @@ pub struct DetailState {
     pub chart: ChartView,
     /// Loaded history per range (kept so flipping back is instant).
     pub history: HashMap<HistoryRange, Vec<Bar>>,
-    /// Daily bars *before* the visible window (moving-average warm-up),
-    /// per range; never drawn as candles.
+    /// Bars *before* the visible window, same timeframe (MA warm-up on daily
+    /// ranges, Ichimoku warm-up on all), per range; never drawn as candles.
     pub warmup: HashMap<HistoryRange, Vec<Bar>>,
     /// Ranges with a request in flight.
     pub loading: Vec<HistoryRange>,
