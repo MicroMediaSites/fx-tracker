@@ -11,7 +11,7 @@ use ratatui::Frame;
 use wickd_core::equities::{Bar, HistoryRange, Snapshot};
 
 use super::app::{App, DetailState, DetailView, Mode};
-use super::chart::{ChartWidget, Palette, Style2, Zoom};
+use super::chart::{self, ChartWidget, Palette, Style2, Zoom};
 use super::inplay::{self, Tag};
 use super::keymap::{self, Ctx, Entry};
 
@@ -1095,6 +1095,17 @@ fn render_chart_view(
     let Some((candles, extended)) = d.candles() else {
         return;
     };
+    // 50/200-day averages (daily ranges; warm-up bars make the 200-day span
+    // the whole chart). Daily ranges are never session-filtered, so candle
+    // bar indices line up with the visible bars.
+    let overlays = match (d.chart.ma && chart::ma_range(range), d.bars()) {
+        (true, Some(vis)) => chart::moving_averages(
+            d.warmup.get(&range).map_or(&[][..], Vec::as_slice),
+            vis,
+            &candles,
+        ),
+        _ => Vec::new(),
+    };
     let zoom = d.chart.zoom_level();
     let mut title = format!(
         " {} · {}",
@@ -1127,6 +1138,13 @@ fn render_chart_view(
     if delayed {
         title.push_str(" · 15m delayed");
     }
+    if d.chart.ma {
+        title.push_str(if chart::ma_range(range) {
+            " · MA 50/200"
+        } else {
+            " · MA: 6M/1Y only"
+        });
+    }
     title.push_str(" · −/+ zoom  h/l cursor  H/L pan ");
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1144,6 +1162,7 @@ fn render_chart_view(
             reference,
             last_price: snap.and_then(Snapshot::last),
             delayed,
+            overlays: &overlays,
             fmt_price,
             fmt_volume,
             time_label: &time_label,
@@ -1732,6 +1751,29 @@ mod tests {
         press(&mut app, KeyCode::Char('5'));
         app.set_history("SPY", HistoryRange::Year1, Ok(daily_walk(252, 560.0, 3)));
         shoot(&app, "4-1y-daily");
+
+        // 50/200-day averages with ~210 sessions of warm-up before the window.
+        let all = daily_walk(462, 470.0, 3);
+        let (warm, vis) = all.split_at(210);
+        app.set_history("SPY", HistoryRange::Year1, Ok(vis.to_vec()));
+        app.set_warmup("SPY", HistoryRange::Year1, warm.to_vec());
+        let last = vis.last().unwrap().close;
+        let spy = app.snapshots.get_mut("SPY").unwrap();
+        spy.latest_trade.as_mut().unwrap().price = last;
+        let saved_prev = spy.prev_daily_bar.as_ref().unwrap().close;
+        spy.prev_daily_bar.as_mut().unwrap().close = vis[vis.len() - 2].close;
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('m'));
+        shoot(&app, "4b-1y-moving-averages");
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('m'));
+        app.snapshots
+            .get_mut("SPY")
+            .unwrap()
+            .prev_daily_bar
+            .as_mut()
+            .unwrap()
+            .close = saved_prev;
 
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('l'));

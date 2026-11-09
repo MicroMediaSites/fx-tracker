@@ -76,6 +76,7 @@ enum Reply {
     InPlay(Result<(Vec<inplay::Row>, Vec<String>), String>),
     News(String, Result<Vec<NewsItem>, String>),
     Reader(reader::ReaderEvent),
+    Warmup(String, HistoryRange, Vec<Bar>),
 }
 
 /// Headline lookback, shared by the list's NEWS column and the side pane so
@@ -183,6 +184,27 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                             })
                             .map_err(err_string);
                         Reply::Sparks(r)
+                    }
+                    Request::History(sym, range) if chart::ma_range(range) => {
+                        // Daily ranges: one fetch that also covers ~200
+                        // trading days before the window (MA warm-up).
+                        let now = Utc::now();
+                        let start = range.start(now);
+                        let from = start - chrono::Duration::days(chart::MA_WARMUP_DAYS);
+                        let r = client
+                            .bars(std::slice::from_ref(&sym), range.timeframe(), from)
+                            .await
+                            .map(|mut m| m.remove(&sym).unwrap_or_default())
+                            .map_err(err_string);
+                        match r {
+                            Ok(all) => {
+                                let (warm, vis): (Vec<Bar>, Vec<Bar>) =
+                                    all.into_iter().partition(|b| b.time < start);
+                                let _ = replies.send(Reply::Warmup(sym.clone(), range, warm));
+                                Reply::History(sym, range, Ok(range.trim(vis)))
+                            }
+                            Err(e) => Reply::History(sym, range, Err(e)),
+                        }
                     }
                     Request::History(sym, range) => {
                         let r = client
@@ -358,6 +380,7 @@ fn run_loop(
                     }
                 }
                 Reply::History(sym, range, r) => app.set_history(&sym, range, r),
+                Reply::Warmup(sym, range, bars) => app.set_warmup(&sym, range, bars),
                 Reply::Assets(r) => match r {
                     Ok(a) => app.set_assets(a),
                     Err(e) => app.assets_error = Some(e),

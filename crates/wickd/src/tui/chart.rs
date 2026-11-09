@@ -102,6 +102,9 @@ pub struct Candle {
     pub prev_close: Option<f64>,
     /// Number of source bars merged into this candle.
     pub bars: usize,
+    /// Index (into the bars it was built from) of its last source bar, so
+    /// per-bar series (moving averages, …) line up with merged candles.
+    pub end: usize,
 }
 
 impl Candle {
@@ -176,11 +179,82 @@ pub fn build(bars: &[Bar], k: usize) -> Vec<Candle> {
             volume: g.iter().map(|b| b.volume).sum(),
             prev_close,
             bars: g.len(),
+            end: start + len - 1,
         });
         start += len;
         len = k;
     }
     out
+}
+
+// ── overlays ────────────────────────────────────────────────────────────────
+
+/// A line drawn over the candles (moving average, …): one value per candle,
+/// `None` where it isn't defined (not enough history yet).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Overlay {
+    pub label: &'static str,
+    pub color: Color,
+    pub values: Vec<Option<f64>>,
+}
+
+/// 50/200-day averages are computed from daily bars, so they only show on
+/// the daily-bar ranges (6M, 1Y) — never a "50-day" from weekly candles.
+pub fn ma_range(range: HistoryRange) -> bool {
+    matches!(range, HistoryRange::Month6 | HistoryRange::Year1)
+}
+
+/// Calendar days of extra daily history fetched before the visible window
+/// so a 200-day average spans the whole chart (~200 trading days).
+pub const MA_WARMUP_DAYS: i64 = 300;
+
+pub const MA50_COLOR: Color = Color::Rgb(59, 130, 246);
+pub const MA200_COLOR: Color = Color::Rgb(245, 158, 11);
+
+/// The 50/200-day overlays for `candles` built from `visible` daily bars,
+/// with `warmup` bars before them.
+pub fn moving_averages(warmup: &[Bar], visible: &[Bar], candles: &[Candle]) -> Vec<Overlay> {
+    let closes: Vec<f64> = warmup.iter().chain(visible).map(|b| b.close).collect();
+    let off = warmup.len();
+    vec![
+        Overlay {
+            label: "MA50",
+            color: MA50_COLOR,
+            values: per_candle(&sma(&closes, 50), candles, off),
+        },
+        Overlay {
+            label: "MA200",
+            color: MA200_COLOR,
+            values: per_candle(&sma(&closes, 200), candles, off),
+        },
+    ]
+}
+
+/// Simple moving average: element `i` averages `values[i+1-n..=i]`; `None`
+/// until `n` values exist (no fake early values).
+pub fn sma(values: &[f64], n: usize) -> Vec<Option<f64>> {
+    let mut out = Vec::with_capacity(values.len());
+    if n == 0 {
+        return vec![None; values.len()];
+    }
+    let mut sum = 0.0;
+    for (i, v) in values.iter().enumerate() {
+        sum += v;
+        if i >= n {
+            sum -= values[i - n];
+        }
+        out.push((i + 1 >= n).then(|| sum / n as f64));
+    }
+    out
+}
+
+/// Sample a per-bar series at each candle's last bar. `offset` is how many
+/// warm-up bars precede the candles' first bar in `series`.
+pub fn per_candle(series: &[Option<f64>], candles: &[Candle], offset: usize) -> Vec<Option<f64>> {
+    candles
+        .iter()
+        .map(|c| series.get(offset + c.end).copied().flatten())
+        .collect()
 }
 
 // ── view state ──────────────────────────────────────────────────────────────
@@ -202,6 +276,8 @@ pub struct ChartView {
     pub right: Option<usize>,
     /// Include pre/post-market bars on intraday ranges.
     pub extended: bool,
+    /// Show the 50/200-day moving averages (daily ranges).
+    pub ma: bool,
     /// Candles that fit, as last measured by the renderer.
     pub visible: Cell<usize>,
     /// Fit mode (the default): the whole range spread across the width,
@@ -218,6 +294,7 @@ impl Default for ChartView {
             cursor: None,
             right: None,
             extended: false,
+            ma: false,
             visible: Cell::new(60),
             fit: true,
             plot_cols: Cell::new(120),
@@ -588,6 +665,8 @@ pub struct ChartWidget<'a> {
     /// Candles lag the live price (free plan): draw a faint marker from the
     /// newest candle to the live price so the gap reads as "moved since".
     pub delayed: bool,
+    /// Lines drawn over the candles (behind them), included in the scale.
+    pub overlays: &'a [Overlay],
     pub fmt_price: fn(f64) -> String,
     pub fmt_volume: fn(f64) -> String,
     /// Full timestamp label for the readout.
@@ -687,6 +766,13 @@ impl Widget for ChartWidget<'_> {
             lo = lo.min(p);
             hi = hi.max(p);
         }
+        // Overlays in the visible window stay on scale too.
+        for o in self.overlays {
+            for v in o.values.get(start..end).unwrap_or(&[]).iter().flatten() {
+                lo = lo.min(*v);
+                hi = hi.max(*v);
+            }
+        }
         let pad = ((hi - lo) * 0.04).max(hi.abs() * 0.0005);
         let (lo, hi) = (lo - pad, hi + pad);
         let row_of = |p: f64| (half_row(p, lo, hi, price_rows) / 2) as u16;
@@ -741,6 +827,46 @@ impl Widget for ChartWidget<'_> {
             for x in x0..x_axis {
                 buf.set_string(x, y0 + row, "╌", Style::default().fg(pal.dim));
             }
+        }
+
+        // Overlay lines (behind the candles; broken where undefined).
+        if !self.overlays.is_empty() {
+            let segs: Vec<(f64, f64, f64, f64, Color)> = self
+                .overlays
+                .iter()
+                .flat_map(|o| {
+                    let pts: Vec<Option<(f64, f64)>> = (start..end)
+                        .map(|i| {
+                            o.values.get(i).copied().flatten().map(|v| {
+                                let x = f64::from(x_of(i - start) - x0) + bw as f64 / 2.0;
+                                (x, v)
+                            })
+                        })
+                        .collect();
+                    pts.windows(2)
+                        .filter_map(|w| match (w[0], w[1]) {
+                            (Some(a), Some(b)) => Some((a.0, a.1, b.0, b.1, o.color)),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            Canvas::default()
+                .marker(Marker::Braille)
+                .x_bounds([0.0, f64::from(plot_w)])
+                .y_bounds([lo, hi])
+                .paint(move |ctx| {
+                    for &(x1, y1, x2, y2, color) in &segs {
+                        ctx.draw(&CanvasLine {
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            color,
+                        });
+                    }
+                })
+                .render(Rect::new(x0, y0, plot_w, price_rows), buf);
         }
 
         // Cursor column (behind the candles).
@@ -898,6 +1024,12 @@ impl Widget for ChartWidget<'_> {
         }
         put("  vol ".into(), dim);
         put((self.fmt_volume)(c.volume), Style::default().fg(pal.text));
+        for o in self.overlays {
+            if let Some(v) = o.values.get(cursor).copied().flatten() {
+                put(format!("  {} ", o.label), dim);
+                put((self.fmt_price)(v), Style::default().fg(o.color));
+            }
+        }
         if self.view.cursor.is_some() {
             put("   g e latest".into(), dim);
         }
@@ -1064,6 +1196,123 @@ mod tests {
     }
 
     #[test]
+    fn sma_matches_hand_computed_values() {
+        let v = [1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(
+            sma(&v, 3),
+            vec![None, None, Some(2.0), Some(3.0), Some(4.0)]
+        );
+        assert_eq!(sma(&v, 1), v.iter().map(|x| Some(*x)).collect::<Vec<_>>());
+        assert_eq!(sma(&v, 6), vec![None; 5]);
+        assert!(sma(&[], 50).is_empty());
+    }
+
+    #[test]
+    fn per_candle_samples_the_last_bar_of_each_merged_candle() {
+        let bars: Vec<Bar> = (0..6)
+            .map(|i| {
+                let f = f64::from(i);
+                bar("2026-11-06T15:00:00Z", f, f, f, f, 1.0)
+            })
+            .collect();
+        // 2 warm-up values precede the 6 visible bars.
+        let series: Vec<Option<f64>> = (0..8).map(|i| Some(f64::from(i) * 10.0)).collect();
+        let fine = build(&bars, 1);
+        assert_eq!(per_candle(&series, &fine, 2)[0], Some(20.0));
+        let merged = build(&bars, 3); // candles end at bars 2 and 5
+        assert_eq!(
+            per_candle(&series, &merged, 2),
+            vec![Some(40.0), Some(70.0)]
+        );
+        // Missing values stay None.
+        assert_eq!(per_candle(&[None; 8], &fine, 2), vec![None; 6]);
+    }
+
+    #[test]
+    fn overlays_draw_behind_candles_extend_the_scale_and_show_in_the_readout() {
+        let candles = build(&walk(40), 1);
+        // A line far above the candles: the scale must stretch to include it.
+        let high = candles.iter().map(|c| c.high).fold(f64::MIN, f64::max) + 50.0;
+        let ov = vec![Overlay {
+            label: "MA50",
+            color: Color::Blue,
+            values: (0..40).map(|i| (i >= 10).then_some(high)).collect(),
+        }];
+        let v = ChartView::default();
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buf = Buffer::empty(area);
+        let label = |t: DateTime<Utc>| t.format("%H:%M").to_string();
+        let boundary = |_p: Option<DateTime<Utc>>, _t: DateTime<Utc>| None;
+        ChartWidget {
+            candles: &candles,
+            view: &v,
+            style: Style2::Candles,
+            reference: None,
+            last_price: None,
+            delayed: false,
+            overlays: &ov,
+            fmt_price: |p| format!("{p:.2}"),
+            fmt_volume: |v| format!("{v:.0}"),
+            time_label: &label,
+            boundary: &boundary,
+            palette: Palette {
+                up: Color::Green,
+                down: Color::Red,
+                dim: Color::DarkGray,
+                grid: Color::Gray,
+                text: Color::White,
+            },
+        }
+        .render(area, &mut buf);
+        let t = text(&buf);
+        // Blue braille cells exist (the line), and the axis reaches its level.
+        let blue = (0..24u16).any(|y| {
+            (0..100u16).any(|x| {
+                let c = &buf[(x, y)];
+                c.fg == Color::Blue
+                    && ('\u{2801}'..='\u{28FF}').contains(&c.symbol().chars().next().unwrap_or(' '))
+            })
+        });
+        assert!(blue, "{t}");
+        assert!(
+            t.lines()
+                .next()
+                .unwrap()
+                .contains(&format!("MA50 {high:.2}")),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn moving_averages_use_warmup_so_the_200_day_spans_the_window() {
+        let mk = |n: usize, base: f64| -> Vec<Bar> {
+            (0..n)
+                .map(|i| {
+                    let c = base + i as f64;
+                    bar("2026-01-01T05:00:00Z", c, c, c, c, 1.0)
+                })
+                .collect()
+        };
+        let warm = mk(210, 0.0); // closes 0..209
+        let vis = mk(5, 210.0); // closes 210..214
+        let candles = build(&vis, 1);
+        let ov = moving_averages(&warm, &vis, &candles);
+        assert_eq!(ov[0].label, "MA50");
+        // First visible candle (close 210): MA50 = mean(161..=210) = 185.5.
+        assert_eq!(ov[0].values[0], Some(185.5));
+        // MA200 = mean(11..=210) = 110.5 — defined from the first candle.
+        assert_eq!(ov[1].values[0], Some(110.5));
+        // Without warm-up the 200-day isn't defined yet (no fake values).
+        let cold = moving_averages(&[], &vis, &candles);
+        assert!(cold[1].values.iter().all(Option::is_none));
+        assert!(
+            ma_range(HistoryRange::Year1)
+                && !ma_range(HistoryRange::Day1)
+                && !ma_range(HistoryRange::Year5)
+        );
+    }
+
+    #[test]
     fn ticks_and_volume_cap() {
         assert_eq!(nice_step(10.0, 5), 2.0);
         assert_eq!(nice_step(0.9, 4), 0.25);
@@ -1113,6 +1362,7 @@ mod tests {
             reference: Some(candles[0].open),
             last_price: None,
             delayed: false,
+            overlays: &[],
             fmt_price: |p| format!("{p:.2}"),
             fmt_volume: |v| format!("{v:.0}"),
             time_label: &label,
@@ -1214,6 +1464,7 @@ mod tests {
                 reference: None,
                 last_price: Some(candles[29].close + 2.0),
                 delayed,
+                overlays: &[],
                 fmt_price: |p| format!("{p:.2}"),
                 fmt_volume: |v| format!("{v:.0}"),
                 time_label: &label,

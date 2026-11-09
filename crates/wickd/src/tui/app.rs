@@ -273,6 +273,9 @@ pub struct DetailState {
     pub chart: ChartView,
     /// Loaded history per range (kept so flipping back is instant).
     pub history: HashMap<HistoryRange, Vec<Bar>>,
+    /// Daily bars *before* the visible window (moving-average warm-up),
+    /// per range; never drawn as candles.
+    pub warmup: HashMap<HistoryRange, Vec<Bar>>,
     /// Ranges with a request in flight.
     pub loading: Vec<HistoryRange>,
     pub error: Option<String>,
@@ -291,6 +294,7 @@ impl DetailState {
             last_chart: DetailView::Candles,
             chart: ChartView::default(),
             history: HashMap::new(),
+            warmup: HashMap::new(),
             loading: Vec::new(),
             error: None,
             scroll: 0,
@@ -397,6 +401,13 @@ impl App {
 
     pub fn asset(&self, symbol: &str) -> Option<&Asset> {
         self.asset_index.get(symbol).map(|&i| &self.assets[i])
+    }
+
+    /// Warm-up bars for a range arrived (with its history).
+    pub fn set_warmup(&mut self, symbol: &str, range: HistoryRange, bars: Vec<Bar>) {
+        if let Some(d) = self.detail.as_mut().filter(|d| d.symbol == symbol) {
+            d.warmup.insert(range, bars);
+        }
     }
 
     pub fn set_history(
@@ -1176,6 +1187,15 @@ impl App {
                     d.chart.pan(n_candles, delta);
                 }
             }
+            Cmd::ToggleMa => {
+                if let Some(d) = self.detail.as_mut() {
+                    d.chart.ma = !d.chart.ma;
+                    if d.chart.ma && !super::chart::ma_range(d.range) {
+                        self.flash =
+                            Some("50/200-day averages show on the 6M and 1Y charts".into());
+                    }
+                }
+            }
             Cmd::ZoomIn | Cmd::ZoomOut | Cmd::ZoomReset | Cmd::ToggleExtended => {
                 self.reshape_chart(cmd);
             }
@@ -1502,6 +1522,33 @@ mod tests {
         assert!(a.detail.as_ref().unwrap().chart.extended);
         typ(&mut a, "5ve");
         assert!(a.flash.as_deref().unwrap_or("").contains("extended hours"));
+    }
+
+    #[test]
+    fn v_m_toggles_moving_averages_and_warmup_is_kept_per_range() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Enter)); // SPY, 1D
+        assert!(!a.detail.as_ref().unwrap().chart.ma);
+        // On 1D the toggle works but explains where the lines show.
+        typ(&mut a, "vm");
+        assert!(a.detail.as_ref().unwrap().chart.ma);
+        assert!(a.flash.as_deref().unwrap_or("").contains("6M and 1Y"));
+        // On 1Y: no note; warm-up for that range is stored for the symbol only.
+        typ(&mut a, "5");
+        typ(&mut a, "vm");
+        typ(&mut a, "vm");
+        assert!(a.flash.is_none());
+        a.set_warmup("SPY", HistoryRange::Year1, session_bars(3));
+        a.set_warmup("QQQ", HistoryRange::Year1, session_bars(9)); // stale symbol: ignored
+        assert_eq!(
+            a.detail
+                .as_ref()
+                .unwrap()
+                .warmup
+                .get(&HistoryRange::Year1)
+                .map(Vec::len),
+            Some(3)
+        );
     }
 
     #[test]

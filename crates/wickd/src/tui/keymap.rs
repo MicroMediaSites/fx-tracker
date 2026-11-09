@@ -57,6 +57,7 @@ pub enum Cmd {
     ZoomOut,
     ZoomReset,
     ToggleExtended,
+    ToggleMa,
     Range(HistoryRange),
     GoTop,
     GoEnd,
@@ -318,6 +319,13 @@ pub static BINDINGS: &[Binding] = &[
         &[K::Char('e')],
         Cmd::ToggleExtended,
         "extended hours",
+        D,
+    ),
+    pre(
+        'v',
+        &[K::Char('m')],
+        Cmd::ToggleMa,
+        "50/200-day averages",
         D,
     ),
     pre(
