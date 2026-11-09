@@ -224,17 +224,12 @@ fn render_info(frame: &mut Frame, area: Rect, card: &crate::tui::app::InfoCard) 
                 l.push(heading("On your lists"));
                 for ln in &i.lists {
                     l.push(Line::from(Span::styled(format!("  {}", ln.list), bold)));
-                    for (label, v) in [
-                        ("why", &ln.why),
-                        ("call", &ln.call),
-                        ("constraints", &ln.constraints),
-                        ("signal", &ln.signal),
-                    ] {
-                        if let Some(v) = v {
-                            l.push(Line::from(vec![
-                                Span::styled(format!("    {label:<12}"), dim),
-                                Span::raw(v.clone()),
-                            ]));
+                    if let Some(n) = &ln.note {
+                        l.push(Line::from(format!("    {n}")));
+                    }
+                    if let Some(p) = &ln.plan {
+                        for line in p.lines() {
+                            l.push(Line::from(Span::styled(format!("    {line}"), dim)));
                         }
                     }
                 }
@@ -539,8 +534,12 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
         area
     } else {
         let rows: Vec<usize> = shown.iter().copied().filter(|&r| r < lr).collect();
-        let plan = sel.and_then(|s| app.row_entry(s)).filter(|e| plan_lines(e) > 0);
-        let plan_h: u16 = plan.map_or(0, |e| plan_lines(e) + 2);
+        let plan = sel
+            .and_then(|s| app.row_entry(s))
+            .filter(|e| plan_lines(e, area.width) > 0);
+        // The plan box grows with the plan, up to a third of the screen.
+        let plan_h: u16 =
+            plan.map_or(0, |e| (plan_lines(e, area.width) + 2).min((area.height / 3).max(4)));
         let collapsed = app.lists.len() as u16 - 1;
         let start = app.fx_start();
         let watch_natural = (start.min(1) * (start + 3)
@@ -648,34 +647,41 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
     render_fx_table(frame, parts[1], app, &pairs, pos(&pairs), fx_title);
 }
 
-/// Lines the plan panel needs for an entry: its call and signal (the why is
-/// already in the row). 0 = no panel.
-fn plan_lines(e: &crate::lists::Entry) -> u16 {
-    u16::from(e.call.is_some()) + u16::from(e.signal.is_some())
+/// Lines the plan box needs for an entry's free-form plan at `width`
+/// (wrapped, line breaks kept). 0 = no plan, no box.
+fn plan_lines(e: &crate::lists::Entry, width: u16) -> u16 {
+    let inner = usize::from(width.saturating_sub(4)).max(1);
+    e.plan.as_deref().map_or(0, |p| {
+        p.lines()
+            .map(|l| l.chars().count().max(1).div_ceil(inner))
+            .sum::<usize>() as u16
+    })
 }
 
-/// The selected list entry's plan, in Matt's words: "<why>. Expect: <call>.
-/// Go: <signal>." — the why is the row, so the panel shows expect and go,
-/// only the ones that are filled in.
+/// The selected list entry's plan, shown exactly as written (free form).
 fn render_plan(frame: &mut Frame, area: Rect, e: &crate::lists::Entry) {
-    let mut lines = Vec::new();
-    for (label, v) in [("expect", &e.call), ("go", &e.signal)] {
-        if let Some(v) = v {
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {label:<7}"), Style::default().fg(ACCENT)),
-                Span::raw(v.clone()),
-            ]));
-        }
-    }
+    let lines: Vec<Line> = e
+        .plan
+        .as_deref()
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            if l.trim().is_empty() {
+                Line::default() // a blank line stays one row
+            } else {
+                Line::from(format!(" {l}"))
+            }
+        })
+        .collect();
     frame.render_widget(
         Paragraph::new(lines)
-            .wrap(ratatui::widgets::Wrap { trim: true })
+            .wrap(ratatui::widgets::Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(ACCENT))
                     .title(Span::styled(
-                        format!(" {} ", e.symbol),
+                        format!(" {} · plan ", e.symbol),
                         Style::default().add_modifier(Modifier::BOLD),
                     )),
             ),
@@ -683,8 +689,8 @@ fn render_plan(frame: &mut Frame, area: Rect, e: &crate::lists::Entry) {
     );
 }
 
-/// One named list (`wickd list`): symbol, note, price and change for stocks
-/// and pairs alike (pairs at OANDA precision, mid price).
+/// One named list (`wickd list`): symbol, name, note, price and change for
+/// stocks and pairs alike (pairs at OANDA precision, mid price).
 fn render_list_table(
     frame: &mut Frame,
     area: Rect,
@@ -693,10 +699,14 @@ fn render_list_table(
     sel: Option<usize>,
     title: String,
 ) {
-    let header = header_row(&["SYMBOL", "WHY"], &["LAST", "CHG%"], &[]);
+    let header = header_row(&["SYMBOL", "NAME", "NOTE"], &["LAST", "CHG%"], &[]);
     let body = rows.iter().filter_map(|&r| {
         let sym = app.row_symbol(r)?.to_string();
         let note = app.row_note(r).unwrap_or_default().to_string();
+        let name = app
+            .asset(&sym)
+            .map(|a| short_name(&a.name))
+            .unwrap_or_default();
         let (last, pct, color, key) = if fx::is_fx(&sym) {
             match app.fx_quotes.get(&sym) {
                 Some(q) => (
@@ -715,6 +725,7 @@ fn render_list_table(
         };
         Some(Row::new(vec![
             Cell::from(sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from(name),
             Cell::from(note).style(Style::default().fg(Color::Gray)),
             Cell::from(Line::from(last).alignment(Alignment::Right)).style(tick_style(app, &key)),
             Cell::from(Line::from(pct).alignment(Alignment::Right))
@@ -723,6 +734,7 @@ fn render_list_table(
     });
     let widths = [
         Constraint::Length(8),
+        Constraint::Length(28),
         Constraint::Min(20),
         Constraint::Length(10),
         Constraint::Length(8),
@@ -2354,12 +2366,14 @@ mod tests {
             ("SPY", "Open drive above 682 = trend day?", "", "Watch only before CPI", ""),
             ("EUR_USD", "ECB speakers all week", "Fades rallies into 1.1200", "", "Short a rejection at 1.1200"),
         ] {
-            let opt = |s: &str| (!s.is_empty()).then(|| s.to_string());
-            let plan = crate::lists::Plan {
-                why: opt(why),
-                call: opt(call),
-                constraints: opt(constraints),
-                signal: opt(signal),
+            let text: Vec<String> = [("Expect", call), ("Go", signal), ("Limits", constraints)]
+                .iter()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(l, v)| format!("{l}: {v}"))
+                .collect();
+            let plan = crate::lists::Fields {
+                note: Some(why.to_string()),
+                plan: (!text.is_empty()).then(|| text.join("\n")),
             };
             crate::lists::add(&mut lists, "mon-11-9", &[sym.to_string()], &plan, Utc::now());
         }
@@ -2446,10 +2460,8 @@ mod tests {
             if sym == "NVDA" {
                 info.lists = vec![crate::info::ListNote {
                     list: "tomorrow".into(),
-                    why: Some("earnings Wed; watch the 185 break".into()),
-                    call: Some("pullback first, then higher".into()),
-                    constraints: Some("1% risk; stop below 180".into()),
-                    signal: Some("buy a reclaim of 185 after 8:00".into()),
+                    note: Some("earnings Wed; watch the 185 break".into()),
+                    plan: Some("Pullback first, then higher.\nBuy a reclaim of 185 after 8:00; stop below 180.".into()),
                 }];
             }
             app.info = Some(crate::tui::app::InfoCard {
@@ -2477,6 +2489,20 @@ mod tests {
         let dir = std::env::var("WICKD_TUI_SNAPSHOT_DIR").expect("set WICKD_TUI_SNAPSHOT_DIR");
         std::fs::create_dir_all(&dir).unwrap();
         let mut app = sample_app();
+        // Real company names from the local symbol cache, when there is one.
+        #[derive(serde::Deserialize)]
+        struct Cache {
+            assets: Vec<Asset>,
+        }
+        let path = wickd_core::paths::wickd_data_home()
+            .unwrap()
+            .join("cache/alpaca-assets.json");
+        if let Some(c) = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Cache>(&b).ok())
+        {
+            app.set_assets(c.assets);
+        }
         for s in ["AAPL", "MSFT", "AMZN", "META", "GOOGL", "WDAY"] {
             app.toggle_watchlist(s.to_string());
         }
@@ -2491,12 +2517,12 @@ mod tests {
         let mut f = crate::lists::ListsFile::default();
         for day in ["fri-11-13", "mon-11-9", "thu-11-12", "tue-11-10", "wed-11-11"] {
             for (i, s) in syms.iter().enumerate() {
-                let plan = crate::lists::Plan {
-                    why: Some(format!("{s}: earnings reaction, {}% Fri", 5 + i)),
-                    call: (i % 3 != 2).then(|| "Holds Friday's close and drifts higher".into()),
-                    constraints: Some("stop below Fri low".into()),
-                    signal: (i % 3 == 0)
-                        .then(|| "Above Fri close after 8:00 on heavy volume".into()),
+                let plan = crate::lists::Fields {
+                    note: Some(format!("earnings reaction, {}% Fri", 5 + i)),
+                    plan: (i % 3 != 2).then(|| {
+                        "Strong report, but the market is jumpy (VIX ~24).\n\nExpect it to hold Friday's close and drift higher.\nGo: above Friday's close after 8:00 on heavy volume. Stop below Friday's low, half size."
+                            .into()
+                    }),
                 };
                 crate::lists::add(&mut f, day, &[s.to_string()], &plan, made);
             }
@@ -2516,12 +2542,12 @@ mod tests {
         // Open mon-11-9 (Matt's "today"), cursor on its first row.
         app.expanded = 0;
         app.selected = 0;
-        shoot(&app, "1-mon-open-expect-go");
+        shoot(&app, "1-mon-open-plan");
         press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Char('l'));
         app.flash = None;
         shoot(&app, "2-g-l-opens-tue");
-        // A row with neither call nor signal: no plan panel.
+        // A row with no plan: no plan box.
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('j'));
         shoot(&app, "3-row-without-plan");

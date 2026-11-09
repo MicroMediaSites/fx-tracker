@@ -1,12 +1,12 @@
 //! `wickd list` — named symbol lists, the agent-facing way to build a day's
-//! plan (wickd-lists AGT-2391; four plan fields per symbol, AGT-2404). See
-//! [`crate::lists`] for the store.
+//! plan (wickd-lists AGT-2391; a note + free-form plan per symbol, AGT-2406).
+//! See [`crate::lists`] for the store.
 //!
 //!   wickd list ls
 //!   wickd list show mon-11-9
-//!   wickd list add mon-11-9 NET --why "earnings +39%" --constraints "stop below Fri low" \
-//!       --signal "holds Fri close after 8:00 on volume"
-//!   wickd list set mon-11-9 NET --call "continues"
+//!   wickd list add mon-11-9 NET --note "earnings +39%, +10% Fri"
+//!   wickd list set mon-11-9 NET --plan "Expect: continues"
+//!   wickd list set mon-11-9 NET --plan-file plan.txt     # or - for stdin
 //!   wickd list rm mon-11-9 NET
 //!   wickd list clear mon-11-9
 //!   wickd list delete mon-11-9
@@ -22,7 +22,7 @@ use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde_json::json;
 
-use crate::lists::{self, Plan};
+use crate::lists::{self, Fields};
 use crate::output::{exit, Out};
 
 #[derive(Args, Debug)]
@@ -31,31 +31,38 @@ pub struct ListArgs {
     cmd: ListCmd,
 }
 
-/// The four plan fields (all optional; an empty value clears a field).
+/// The note and plan (both optional; an empty value clears a field).
 #[derive(Args, Debug, Default)]
 struct PlanArgs {
-    /// Why it's on the list. (`--note` is the old name.)
-    #[arg(long, alias = "note")]
-    why: Option<String>,
-    /// Your call: what you expect it to do.
-    #[arg(long)]
-    call: Option<String>,
-    /// Constraints: stop, size, "watch only"…
-    #[arg(long)]
-    constraints: Option<String>,
-    /// The signal: act when …
-    #[arg(long)]
-    signal: Option<String>,
+    /// A short note: the list's NOTE column (one line).
+    #[arg(long, alias = "why")]
+    note: Option<String>,
+    /// The plan: free text, shown as written in the TUI's plan box.
+    #[arg(long, conflicts_with = "plan_file")]
+    plan: Option<String>,
+    /// Read the plan from a file (`-` = stdin), for multi-line plans.
+    #[arg(long, value_name = "PATH|-")]
+    plan_file: Option<String>,
 }
 
-impl From<PlanArgs> for Plan {
-    fn from(a: PlanArgs) -> Self {
-        Plan {
-            why: a.why,
-            call: a.call,
-            constraints: a.constraints,
-            signal: a.signal,
-        }
+impl PlanArgs {
+    fn into_fields(self) -> Result<Fields> {
+        let plan = match self.plan_file.as_deref() {
+            Some("-") => {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+                Some(s)
+            }
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| lists::ValidationError(format!("--plan-file {path}: {e}")))?,
+            ),
+            None => self.plan,
+        };
+        Ok(Fields {
+            note: self.note,
+            plan,
+        })
     }
 }
 
@@ -63,10 +70,10 @@ impl From<PlanArgs> for Plan {
 enum ListCmd {
     /// Every list with its symbol count.
     Ls,
-    /// One list's symbols with all their fields.
+    /// One list's symbols with their notes and plans.
     Show { name: String },
     /// Add symbols (stocks or OANDA pairs) to a list, creating it if needed.
-    /// Re-adding a symbol keeps its place; given fields replace its fields.
+    /// Re-adding a symbol keeps its place; a given note / plan replaces it.
     Add {
         name: String,
         #[arg(required = true)]
@@ -74,8 +81,8 @@ enum ListCmd {
         #[command(flatten)]
         plan: PlanArgs,
     },
-    /// Set fields on a symbol already on the list (e.g. your call before
-    /// the open). Fields not given are kept; an empty value clears one.
+    /// Set the note and/or plan of a symbol already on the list. What isn't
+    /// given is kept; an empty value clears it.
     Set {
         name: String,
         symbol: String,
@@ -140,7 +147,7 @@ fn exec(cmd: ListCmd) -> Result<serde_json::Value> {
             let symbols = normalized(&symbols);
             let known = crate::tui::store::known_symbols();
             lists::check_known(&symbols, known.as_ref())?;
-            let plan = Plan::from(plan);
+            let plan = plan.into_fields()?;
             let (r, count, changed) = lists::update_at(&path, |f| {
                 let r = lists::add(f, &name, &symbols, &plan, Utc::now());
                 let entries = &f.lists[&name];
@@ -166,7 +173,7 @@ fn exec(cmd: ListCmd) -> Result<serde_json::Value> {
         ListCmd::Set { name, symbol, plan } => {
             let name = lists::validate_name(&name)?;
             let symbol = lists::normalize_symbol(&symbol);
-            let plan = Plan::from(plan);
+            let plan = plan.into_fields()?;
             let entry = lists::update_at(&path, |f| lists::set(f, &name, &symbol, &plan))?;
             Ok(json!({ "name": name, "entry": entry }))
         }

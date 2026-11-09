@@ -718,9 +718,9 @@ impl App {
         }
     }
 
-    /// A list row's `why` (the WHY column).
+    /// A list row's note (the NOTE column).
     pub fn row_note(&self, r: usize) -> Option<&str> {
-        self.row_entry(r)?.why.as_deref()
+        self.row_entry(r)?.note.as_deref()
     }
 
     /// Apply a stock snapshot refresh (and note each price's direction).
@@ -1960,7 +1960,7 @@ mod tests {
         let mut f = crate::lists::ListsFile::default();
         for (name, syms) in entries {
             let syms: Vec<String> = syms.iter().map(|s| s.to_string()).collect();
-            crate::lists::add(&mut f, name, &syms, &crate::lists::Plan::why("why"), Utc::now());
+            crate::lists::add(&mut f, name, &syms, &crate::lists::Fields::note("why"), Utc::now());
         }
         f
     }
@@ -2029,7 +2029,7 @@ mod tests {
             a.on_key(key(KeyCode::Char('u')))
         };
         assert!(matches!(&acts[..], [Action::RestoreToList { list, entry }]
-            if list == "tomorrow" && entry.symbol == "NVDA" && entry.why.as_deref() == Some("why")));
+            if list == "tomorrow" && entry.symbol == "NVDA" && entry.note.as_deref() == Some("why")));
         // Moving a list row is a no-op; moving a watchlist row still works.
         typ(&mut a, "wj");
         assert_eq!(a.selected_symbol(), Some("GBP_USD"));
