@@ -4,7 +4,8 @@
 //! optional note (why it's there). Lists are separate from the TUI's general
 //! watchlist (`tui.json`), from the in-play screen, and from the forex
 //! streamer's `~/.wickd/watchlist.json`. They are the agent-facing surface:
-//! `wickd list …` writes them, the TUI shows them as watchlist sections.
+//! `wickd list …` writes them; the TUI will show them as watchlist sections
+//! (AGT-2392).
 //!
 //! ## Writers
 //!
@@ -30,6 +31,28 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// A problem with the caller's input (bad name, unknown symbol, no such
+/// list) — exit code 4 — as opposed to a broken store or I/O failure.
+#[derive(Debug)]
+pub struct ValidationError(pub String);
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+fn invalid(msg: String) -> anyhow::Error {
+    ValidationError(msg).into()
+}
+
+/// The error for a list that doesn't exist (with the next step).
+pub fn no_list(name: &str) -> anyhow::Error {
+    invalid(format!("no list '{name}' (see `wickd list ls`)"))
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
@@ -126,7 +149,9 @@ pub fn validate_name(name: &str) -> Result<String> {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     {
-        bail!("invalid list name '{name}': use a-z, 0-9, - or _ (max 32)");
+        return Err(invalid(format!(
+            "invalid list name '{name}': use a-z, 0-9, - or _ (max 32)"
+        )));
     }
     Ok(n)
 }
@@ -148,10 +173,10 @@ pub fn check_known(symbols: &[String], known: Option<&HashSet<String>>) -> Resul
         .map(String::as_str)
         .collect();
     if !unknown.is_empty() {
-        bail!(
+        return Err(invalid(format!(
             "unknown symbol(s): {} (stocks use their ticker, pairs OANDA names like EUR_USD)",
             unknown.join(", ")
-        );
+        )));
     }
     Ok(())
 }
@@ -188,7 +213,7 @@ pub fn remove(file: &mut ListsFile, list: &str, symbols: &[String]) -> Result<Ve
     let entries = file
         .lists
         .get_mut(list)
-        .ok_or_else(|| anyhow!("no list '{list}'"))?;
+        .ok_or_else(|| no_list(list))?;
     let before: Vec<String> = entries.iter().map(|e| e.symbol.clone()).collect();
     entries.retain(|e| !symbols.contains(&e.symbol));
     Ok(before.into_iter().filter(|s| symbols.contains(s)).collect())
@@ -233,6 +258,12 @@ mod tests {
         assert!(check_known(&["NVDA".into(), "EUR_USD".into()], Some(&known)).is_ok());
         let e = check_known(&["NVDA".into(), "NVDAA".into()], Some(&known)).unwrap_err();
         assert!(e.to_string().contains("NVDAA"));
+        assert!(e.downcast_ref::<ValidationError>().is_some());
+        // A broken store is not a validation error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lists.json");
+        std::fs::write(&path, "{ invalid json").unwrap();
+        assert!(load_at(&path).unwrap_err().downcast_ref::<ValidationError>().is_none());
         assert!(check_known(&["ANY".into()], None).is_ok());
     }
 

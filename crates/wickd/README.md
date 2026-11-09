@@ -177,8 +177,8 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 Lists of stocks and/or forex pairs, each symbol with an optional note, kept in
 `~/.wickd/lists.json`. They're separate from the TUI watchlist and the in-play
 screen, and they're the way an agent builds a list for you (say, what to watch
-tomorrow): the agent writes with these commands, and `wickd tui` shows each
-list as a section on the watchlist screen.
+tomorrow) with these commands. (The TUI's list sections arrive with the next
+change, AGT-2392.)
 
 ```sh
 wickd list add tomorrow NVDA AMD --note "earnings beat; watch 185"

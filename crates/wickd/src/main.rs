@@ -78,8 +78,8 @@ use commands::queue::QueueArgs;
 use commands::strategy::StrategyArgs;
 use commands::stream::StreamArgs;
 use commands::trade::TradeArgs;
-use commands::tui::TuiArgs;
 use commands::list::ListArgs;
+use commands::tui::TuiArgs;
 use commands::view::ViewArgs;
 use commands::watch::WatchArgs;
 use output::Out;
@@ -119,8 +119,8 @@ enum Command {
     Tui(TuiArgs),
     /// Alpaca market-data keys for `wickd tui`: login | status | logout.
     Alpaca(AlpacaArgs),
-    /// Named symbol lists (agent-writable; shown as TUI watchlist sections):
-    /// ls | show | add | rm | clear | delete.
+    /// Named symbol lists with notes (agent-writable): ls | show | add | rm |
+    /// clear | delete.
     List(ListArgs),
     /// List built-in strategies, or run one over candles → JSON signals.
     Strategy(StrategyArgs),

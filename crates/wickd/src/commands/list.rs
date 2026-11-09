@@ -13,12 +13,12 @@
 //! symbol lists (`wickd tui` fills those caches); with no cache yet they're
 //! accepted and reported as `unverified`.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde_json::json;
 
-use crate::lists::{self, ListsFile};
+use crate::lists;
 use crate::output::{exit, Out};
 
 #[derive(Args, Debug)]
@@ -62,14 +62,12 @@ pub async fn run(args: ListArgs, out: Out) -> ! {
             std::process::exit(exit::OK);
         }
         Err(e) => {
-            let msg = format!("{e:#}");
-            let code = if msg.contains("invalid") || msg.contains("unknown") || msg.contains("no list")
-            {
+            let code = if e.downcast_ref::<lists::ValidationError>().is_some() {
                 exit::VALIDATION
             } else {
                 exit::GENERIC
             };
-            out.fail(code, "list_failed", msg);
+            out.fail(code, "list_failed", format!("{e:#}"));
         }
     }
 }
@@ -90,7 +88,7 @@ fn exec(cmd: ListCmd) -> Result<serde_json::Value> {
             let name = lists::validate_name(&name)?;
             let f = lists::load_at(&path)?;
             let Some(entries) = f.lists.get(&name) else {
-                bail!("no list '{name}' (see `wickd list ls`)");
+                return Err(lists::no_list(&name));
             };
             Ok(json!({ "name": name, "count": entries.len(), "entries": entries }))
         }
@@ -123,11 +121,8 @@ fn exec(cmd: ListCmd) -> Result<serde_json::Value> {
         }
         ListCmd::Clear { name } => {
             let name = lists::validate_name(&name)?;
-            let n = lists::update_at(&path, |f: &mut ListsFile| {
-                let entries = f
-                    .lists
-                    .get_mut(&name)
-                    .ok_or_else(|| anyhow::anyhow!("no list '{name}'"))?;
+            let n = lists::update_at(&path, |f| {
+                let entries = f.lists.get_mut(&name).ok_or_else(|| lists::no_list(&name))?;
                 let n = entries.len();
                 entries.clear();
                 Ok(n)
@@ -140,7 +135,7 @@ fn exec(cmd: ListCmd) -> Result<serde_json::Value> {
                 f.lists
                     .remove(&name)
                     .map(|_| ())
-                    .ok_or_else(|| anyhow::anyhow!("no list '{name}'"))
+                    .ok_or_else(|| lists::no_list(&name))
             })?;
             Ok(json!({ "name": name, "deleted": true }))
         }

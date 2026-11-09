@@ -71,10 +71,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
 }
 
-/// Normalise a user-entered symbol (upper-case, trimmed). `BRK.B` style
-/// share classes keep their dot.
+/// Normalise a user-entered symbol — the one normaliser shared with
+/// `wickd list` (upper-case, trimmed, `EUR/USD` → `EUR_USD`; `BRK.B` keeps
+/// its dot).
 pub fn normalize_symbol(s: &str) -> String {
-    s.trim().to_ascii_uppercase()
+    crate::lists::normalize_symbol(s)
 }
 
 pub fn load_watchlist_in(home: &Path) -> Result<Vec<String>> {
@@ -144,6 +145,8 @@ pub fn known_symbols() -> Option<std::collections::HashSet<String>> {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
+        // An unreadable cache is skipped (both unreadable = None: symbols
+        // are then accepted as unverified rather than all rejected).
         if let Ok(cache) = serde_json::from_slice::<AssetCache>(&bytes) {
             any = true;
             out.extend(cache.assets.into_iter().map(|a| a.symbol));
