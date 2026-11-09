@@ -134,6 +134,24 @@ pub fn save_assets_in(home: &Path, assets: &[Asset], now: DateTime<Utc>) -> Resu
     write_atomic(&assets_path(home), &serde_json::to_vec(&cache)?)
 }
 
+/// Every symbol in the stock and forex search caches, ignoring their age
+/// (for validating typed symbols); `None` when neither cache exists yet.
+pub fn known_symbols() -> Option<std::collections::HashSet<String>> {
+    let home = home().ok()?;
+    let mut out = std::collections::HashSet::new();
+    let mut any = false;
+    for path in [assets_path(&home), fx_assets_path(&home)] {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        if let Ok(cache) = serde_json::from_slice::<AssetCache>(&bytes) {
+            any = true;
+            out.extend(cache.assets.into_iter().map(|a| a.symbol));
+        }
+    }
+    any.then_some(out)
+}
+
 /// The cached OANDA instrument list if it's younger than the TTL.
 pub fn cached_fx_assets(now: DateTime<Utc>) -> Option<Vec<Asset>> {
     let bytes = std::fs::read(fx_assets_path(&home().ok()?)).ok()?;

@@ -26,6 +26,7 @@ feature — meant to be followed together by you and an agent.
 | `audit` | Read the append-only audit log of execution decisions |
 | `trade report` / `trade baseline` | Account P&L since a recorded per-account baseline |
 | `tui` | Stock ticker TUI: watchlist, symbol search, price-history drill-down (US equities) |
+| `list` | Named symbol lists (agent-writable; TUI watchlist sections) |
 | `alpaca login` / `status` / `logout` | Store / inspect / remove the Alpaca market-data keys `tui` uses |
 
 ## `wickd tui` — stock and forex ticker
@@ -170,6 +171,34 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   Times are shown in the local zone.
 - **Keys**. Agents can export `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY`
   instead of using the keychain item (service `wickd`, account `alpaca`).
+
+## `wickd list` — named symbol lists
+
+Lists of stocks and/or forex pairs, each symbol with an optional note, kept in
+`~/.wickd/lists.json`. They're separate from the TUI watchlist and the in-play
+screen, and they're the way an agent builds a list for you (say, what to watch
+tomorrow): the agent writes with these commands, and `wickd tui` shows each
+list as a section on the watchlist screen.
+
+```sh
+wickd list add tomorrow NVDA AMD --note "earnings beat; watch 185"
+wickd list add tomorrow EUR_USD            # pairs too (eur/usd works)
+wickd list show tomorrow                   # symbols + notes (JSON)
+wickd list ls                              # every list + count
+wickd list rm tomorrow AMD
+wickd list clear tomorrow                  # empty it (keeps the name)
+wickd list delete tomorrow
+```
+
+- Re-adding a symbol keeps its place; `--note` replaces its note (no `--note`
+  keeps the old one). Commas work too: `add tomorrow NVDA,AMD`.
+- Symbols are checked against the cached Alpaca and OANDA symbol lists (`wickd
+  tui` fills them); an unknown symbol is an error (exit 4) and nothing is
+  written. Before any cache exists, symbols are accepted and listed under
+  `unverified`.
+- Names: `a-z`, `0-9`, `-`, `_`.
+- Safe to run while the TUI is open or from several agents at once: every write
+  re-reads the file under a lock and replaces it atomically.
 
 ## Stream daemon (`com.openthink.wickd-stream`)
 
