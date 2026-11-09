@@ -69,6 +69,7 @@ pub enum Cmd {
     GoInPlay,
     GoStocks,
     GoLists,
+    Info,
     GoForex,
     Find,
     FocusNews,
@@ -244,6 +245,7 @@ pub static BINDINGS: &[Binding] = &[
     bare(&[K::Char('r')], Cmd::Refresh, "refresh", WDI),
     bare(&[K::Esc, K::Char('q'), K::Backspace], Cmd::Back, "back", DI),
     bare(&[K::Char('?')], Cmd::Help, "help", WDI),
+    bare(&[K::Char('i')], Cmd::Info, "info: what is this?", WDI),
     bare(&[K::Char('q')], Cmd::Quit, "quit", W),
     // ── g: go to ──
     pre('g', &[K::Char('g')], Cmd::GoTop, "top", WDI),

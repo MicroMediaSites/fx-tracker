@@ -71,6 +71,12 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   Stocks show last, change vs the prior session close, day range, volume and a
   sparkline of today. Moves (`w j`/`w k`) stay inside a section, and a new
   symbol lands at the end of its own section.
+- **Info** (`i`). On any row (lists, stocks, forex, in play) or a symbol
+  screen, `i` opens a card saying what the symbol is: the Wikipedia summary
+  (`o` opens the article in the reader window), the lists it's on with their
+  notes, and facts (exchange, trading flags, SEC industry and headquarters;
+  for pairs, both currencies and OANDA's pip size, margin and minimum trade).
+  Same data as `wickd info` (cached 30 days). `j`/`k` scroll, `esc` closes.
 - **Price colours**. Every price that updates (a stock's last, bid and ask;
   a pair's bid, ask and mid; in every list and on the symbol screen) turns
   green after it ticks up and red after it ticks down, and keeps that colour
@@ -229,8 +235,10 @@ OANDA doesn't offer) exits 4 with error kind `not_found`. `kind` is always
   `facts` has OANDA's pip size, price decimals, margin rate and leverage,
   and minimum trade (practice account, read-only).
 - `notes` lists any source that couldn't be reached, or was skipped (no
-  Alpaca keys). A card where a source failed is returned but not cached;
-  missing keys don't stop caching.
+  Alpaca keys). A card where a source failed or keys were missing is
+  returned but not cached, so it fills in after `wickd alpaca login` /
+  `wickd login`. With no Alpaca keys and no cached stock list, a stock
+  can't be identified at all: exit 2, `no_alpaca_keys`.
 - `lists` names every `wickd list` the symbol is on, with its note (read
   fresh each call, never cached).
 

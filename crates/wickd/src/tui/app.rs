@@ -49,6 +49,8 @@ pub enum Action {
     FetchHistory(String, HistoryRange),
     /// Persist the watchlist.
     SaveWatchlist,
+    /// Load the info card for a symbol (`wickd info`).
+    FetchInfo(String),
     /// Remove a symbol from a named list (`~/.wickd/lists.json`).
     RemoveFromList { list: String, symbol: String },
     /// Put a removed entry back on a named list (`w u`), note included.
@@ -344,6 +346,21 @@ impl DetailState {
     }
 }
 
+/// The `i` card: what a symbol is (see `crate::info`).
+#[derive(Debug, Clone)]
+pub struct InfoCard {
+    pub symbol: String,
+    pub state: InfoState,
+    pub scroll: u16,
+}
+
+#[derive(Debug, Clone)]
+pub enum InfoState {
+    Loading,
+    Ready(Box<crate::info::SymbolInfo>),
+    Failed(String),
+}
+
 /// Which way each displayed price last moved, so it can show green after an
 /// uptick and red after a downtick (and keep that colour until it changes
 /// again). Keyed `"<symbol>:<field>"`, e.g. `SPY:last`, `EUR_USD:bid`.
@@ -387,6 +404,8 @@ pub struct App {
     pub fx_quotes: HashMap<String, super::fx::FxQuote>,
     /// Up/down colouring for every price that updates.
     pub ticks: TickDirs,
+    /// The open symbol info card (`i`), drawn over the current screen.
+    pub info: Option<InfoCard>,
     /// Today's closes per symbol, for the watchlist sparkline.
     pub sparks: HashMap<String, Vec<f64>>,
     pub assets: Vec<Asset>,
@@ -433,6 +452,7 @@ impl App {
             snapshots: HashMap::new(),
             fx_quotes: HashMap::new(),
             ticks: TickDirs::default(),
+            info: None,
             sparks: HashMap::new(),
             assets: Vec::new(),
             asset_index: HashMap::new(),
@@ -547,6 +567,58 @@ impl App {
 
     pub fn selected_symbol(&self) -> Option<&str> {
         self.row_symbol(self.selected)
+    }
+
+    /// Open the info card for `symbol` (loads in the background).
+    fn open_info(&mut self, symbol: Option<String>) -> Vec<Action> {
+        let Some(symbol) = symbol else {
+            return vec![];
+        };
+        self.info = Some(InfoCard {
+            symbol: symbol.clone(),
+            state: InfoState::Loading,
+            scroll: 0,
+        });
+        vec![Action::FetchInfo(symbol)]
+    }
+
+    /// The card's data arrived (ignored if the card moved on or closed).
+    pub fn set_info(&mut self, symbol: &str, result: Result<crate::info::SymbolInfo, String>) {
+        if let Some(card) = self.info.as_mut().filter(|c| c.symbol == symbol) {
+            card.state = match result {
+                Ok(i) => InfoState::Ready(Box::new(i)),
+                Err(e) => InfoState::Failed(e),
+            };
+        }
+    }
+
+    /// Keys while the card is open: scroll, open the source, close.
+    fn on_info_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        let Some(card) = self.info.as_mut() else {
+            return vec![];
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') | KeyCode::Backspace => {
+                self.info = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => card.scroll = card.scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => card.scroll = card.scroll.saturating_sub(1),
+            KeyCode::Char('J') | KeyCode::PageDown => card.scroll = card.scroll.saturating_add(10),
+            KeyCode::Char('K') | KeyCode::PageUp => card.scroll = card.scroll.saturating_sub(10),
+            KeyCode::Char('o') => {
+                if let InfoState::Ready(i) = &card.state {
+                    if let Some(src) = &i.source {
+                        return vec![Action::ReaderShow {
+                            url: src.url.clone(),
+                            label: format!("{} · {}", i.symbol, src.title),
+                        }];
+                    }
+                }
+                self.flash = Some("no source page for this card".into());
+            }
+            _ => {}
+        }
+        vec![]
     }
 
     /// Rows taken by the list sections (they come before the watchlist).
@@ -758,6 +830,9 @@ impl App {
             return vec![];
         }
         self.flash = None;
+        if self.info.is_some() {
+            return self.on_info_key(key);
+        }
         if self.find.is_some() {
             return self.on_find_key(key);
         }
@@ -803,6 +878,10 @@ impl App {
             Cmd::Search => self.open_search(),
             Cmd::Find => self.open_find(),
             Cmd::GoInPlay => return self.open_inplay(),
+            Cmd::Info => {
+                let sym = self.selected_symbol().map(str::to_string);
+                return self.open_info(sym);
+            }
             Cmd::GoLists => {
                 if lr > 0 {
                     self.find = None;
@@ -1111,6 +1190,10 @@ impl App {
             Cmd::Find => self.open_find(),
             Cmd::Back | Cmd::GoWatchlist => self.mode = Mode::Watchlist,
             Cmd::Help => self.show_help = true,
+            Cmd::Info => {
+                let sym = self.inplay.selected_symbol();
+                return self.open_info(sym);
+            }
             Cmd::Search => self.open_search(),
             Cmd::Down if len > 0 => self.inplay.selected = (ip_sel + 1).min(len - 1),
             Cmd::Up => self.inplay.selected = ip_sel.saturating_sub(1),
@@ -1494,6 +1577,7 @@ impl App {
                 return self.open_inplay();
             }
             Cmd::Help => self.show_help = true,
+            Cmd::Info => return self.open_info(Some(sym)),
             Cmd::Range(r) => return self.set_range(r),
             Cmd::NextRange => {
                 let i = (range_idx + 1).min(HistoryRange::ALL.len() - 1);
@@ -1838,6 +1922,29 @@ mod tests {
             crate::lists::add(&mut f, name, &syms, Some("why"), Utc::now());
         }
         f
+    }
+
+    #[test]
+    fn i_opens_the_info_card_for_the_row_and_keys_drive_it() {
+        let mut a = App::new(vec!["SPY".into(), "EUR_USD".into()], "IEX");
+        let acts = a.on_key(key(KeyCode::Char('i')));
+        assert_eq!(acts, vec![Action::FetchInfo("SPY".into())]);
+        assert!(matches!(a.info.as_ref().unwrap().state, InfoState::Loading));
+        // A late reply for another symbol is ignored.
+        a.set_info("QQQ", Err("x".into()));
+        assert!(matches!(a.info.as_ref().unwrap().state, InfoState::Loading));
+        a.set_info("SPY", Err("offline".into()));
+        assert!(matches!(&a.info.as_ref().unwrap().state, InfoState::Failed(e) if e == "offline"));
+        // While open, j scrolls the card (not the list) and esc closes it.
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!((a.info.as_ref().unwrap().scroll, a.selected), (1, 0));
+        a.on_key(key(KeyCode::Esc));
+        assert!(a.info.is_none());
+        // From the symbol screen it's that symbol's card.
+        typ(&mut a, "j");
+        a.on_key(key(KeyCode::Enter));
+        let acts = a.on_key(key(KeyCode::Char('i')));
+        assert_eq!(acts, vec![Action::FetchInfo("EUR_USD".into())]);
     }
 
     #[test]
