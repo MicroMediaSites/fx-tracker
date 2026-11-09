@@ -1187,6 +1187,11 @@ impl App {
                     d.chart.pan(n_candles, delta);
                 }
             }
+            Cmd::ToggleIchimoku => {
+                if let Some(d) = self.detail.as_mut() {
+                    d.chart.ichimoku = !d.chart.ichimoku;
+                }
+            }
             Cmd::ToggleMa => {
                 if let Some(d) = self.detail.as_mut() {
                     d.chart.ma = !d.chart.ma;
@@ -1549,6 +1554,17 @@ mod tests {
                 .map(Vec::len),
             Some(3)
         );
+    }
+
+    #[test]
+    fn v_i_toggles_ichimoku() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Enter));
+        assert!(!a.detail.as_ref().unwrap().chart.ichimoku);
+        typ(&mut a, "vi");
+        assert!(a.detail.as_ref().unwrap().chart.ichimoku);
+        typ(&mut a, "vi");
+        assert!(!a.detail.as_ref().unwrap().chart.ichimoku);
     }
 
     #[test]
