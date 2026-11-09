@@ -1,7 +1,7 @@
 //! Named symbol lists (`~/.wickd/lists.json`, wickd-lists AGT-2391).
 //!
 //! A list is an ordered set of stocks and/or forex pairs, each with an
-//! optional note (why it's there). Lists are separate from the TUI's general
+//! optional note and free-form plan. Lists are separate from the TUI's general
 //! watchlist (`tui.json`), from the in-play screen, and from the forex
 //! streamer's `~/.wickd/watchlist.json`. They are the agent-facing surface:
 //! `wickd list …` writes them; the TUI shows them as watchlist sections and
@@ -19,9 +19,8 @@
 //!   "version": 1,
 //!   "lists": {
 //!     "mon-11-9": [
-//!       {"symbol": "NET", "why": "earnings: sales +39%, +10% Fri",
-//!        "call": "continues", "constraints": "stop below Fri low",
-//!        "signal": "holds Fri close after 8:00 on volume",
+//!       {"symbol": "NET", "note": "earnings: sales +39%, +10% Fri",
+//!        "plan": "Expect: continues\nGo: holds Fri close after 8:00",
 //!        "added": "2026-11-09T03:00:00Z"}
 //!     ]
 //!   }
@@ -57,58 +56,96 @@ pub fn no_list(name: &str) -> anyhow::Error {
     invalid(format!("no list '{name}' (see `wickd list ls`)"))
 }
 
-/// One symbol on a list, with the plan for it (all optional; wickd-learn
-/// D-13): why it's listed, the call, the constraints, and the signal to act
-/// on. Files written before these fields used a single `note`, which reads
-/// as `why`.
+/// One symbol on a list: a short `note` (the list's NOTE column) and a
+/// free-form `plan` (any text, line breaks kept; the TUI's plan box). Both
+/// optional.
+///
+/// Older files load too: AGT-2404's `why` reads as the note, and its
+/// `call` / `constraints` / `signal` fold into the plan as text
+/// ("Expect: …", "Go: …", "Limits: …"). The original single `note` is
+/// still the note.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RawEntry")]
 pub struct Entry {
     pub symbol: String,
-    #[serde(default, alias = "note", skip_serializing_if = "Option::is_none")]
-    pub why: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call: Option<String>,
+    pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub constraints: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signal: Option<String>,
+    pub plan: Option<String>,
     pub added: DateTime<Utc>,
 }
 
-/// Plan fields to write onto entries: `Some("")` clears a field, `None`
-/// leaves it as it is.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Plan {
-    pub why: Option<String>,
-    pub call: Option<String>,
-    pub constraints: Option<String>,
-    pub signal: Option<String>,
+/// Every shape an entry has been saved in.
+#[derive(Deserialize)]
+struct RawEntry {
+    symbol: String,
+    #[serde(default, alias = "why")]
+    note: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    call: Option<String>,
+    #[serde(default)]
+    constraints: Option<String>,
+    #[serde(default)]
+    signal: Option<String>,
+    added: DateTime<Utc>,
 }
 
-impl Plan {
-    /// Just a `why` (the old single note).
-    pub fn why(s: &str) -> Self {
+impl From<RawEntry> for Entry {
+    fn from(r: RawEntry) -> Self {
+        let folded: Vec<String> = [("Expect", r.call), ("Go", r.signal), ("Limits", r.constraints)]
+            .into_iter()
+            .filter_map(|(label, v)| v.filter(|v| !v.trim().is_empty()).map(|v| format!("{label}: {v}")))
+            .collect();
+        let plan = match (r.plan.filter(|p| !p.trim().is_empty()), folded.is_empty()) {
+            (Some(p), true) => Some(p),
+            (Some(p), false) => Some(format!("{p}\n{}", folded.join("\n"))),
+            (None, false) => Some(folded.join("\n")),
+            (None, true) => None,
+        };
+        Entry {
+            symbol: r.symbol,
+            note: r.note,
+            plan,
+            added: r.added,
+        }
+    }
+}
+
+/// Fields to write onto entries: `Some("")` clears a field, `None` leaves
+/// it as it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Fields {
+    pub note: Option<String>,
+    pub plan: Option<String>,
+}
+
+impl Fields {
+    /// Just a note.
+    pub fn note(s: &str) -> Self {
         Self {
-            why: Some(s.to_string()),
+            note: Some(s.to_string()),
             ..Self::default()
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.why.is_none() && self.call.is_none() && self.constraints.is_none() && self.signal.is_none()
+        self.note.is_none() && self.plan.is_none()
     }
 
     fn apply(&self, e: &mut Entry) {
-        let set = |field: &mut Option<String>, v: &Option<String>| {
-            if let Some(v) = v {
-                let v = v.trim();
-                *field = (!v.is_empty()).then(|| v.to_string());
-            }
-        };
-        set(&mut e.why, &self.why);
-        set(&mut e.call, &self.call);
-        set(&mut e.constraints, &self.constraints);
-        set(&mut e.signal, &self.signal);
+        if let Some(v) = &self.note {
+            // The note is one line.
+            let v = v.split_whitespace().collect::<Vec<_>>().join(" ");
+            e.note = (!v.is_empty()).then_some(v);
+        }
+        if let Some(v) = &self.plan {
+            // The plan is kept as written (line breaks included), minus
+            // trailing blank space.
+            let v = v.trim_end();
+            e.plan = (!v.trim().is_empty()).then(|| v.to_string());
+        }
     }
 }
 
@@ -262,8 +299,8 @@ pub fn check_known(symbols: &[String], known: Option<&HashSet<String>>) -> Resul
     Ok(())
 }
 
-/// What an add changed: symbols that are new, and existing ones whose plan
-/// fields were written.
+/// What an add changed: symbols that are new, and existing ones whose note
+/// or plan was written.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Added {
     pub added: Vec<String>,
@@ -271,8 +308,8 @@ pub struct Added {
 }
 
 /// Add `symbols` to `list` (created if missing). An existing entry keeps its
-/// place; the given plan fields replace its fields (others are kept).
-pub fn add(file: &mut ListsFile, list: &str, symbols: &[String], plan: &Plan, now: DateTime<Utc>) -> Added {
+/// place; a given note / plan replaces its note / plan.
+pub fn add(file: &mut ListsFile, list: &str, symbols: &[String], plan: &Fields, now: DateTime<Utc>) -> Added {
     let entries = file.lists.entry(list.to_string()).or_default();
     let mut out = Added::default();
     for sym in symbols {
@@ -286,10 +323,8 @@ pub fn add(file: &mut ListsFile, list: &str, symbols: &[String], plan: &Plan, no
             None => {
                 let mut e = Entry {
                     symbol: sym.clone(),
-                    why: None,
-                    call: None,
-                    constraints: None,
-                    signal: None,
+                    note: None,
+                    plan: None,
                     added: now,
                 };
                 plan.apply(&mut e);
@@ -301,12 +336,12 @@ pub fn add(file: &mut ListsFile, list: &str, symbols: &[String], plan: &Plan, no
     out
 }
 
-/// Write plan fields onto one existing entry (e.g. the call, before the
-/// open). The symbol must already be on the list.
-pub fn set(file: &mut ListsFile, list: &str, symbol: &str, plan: &Plan) -> Result<Entry> {
+/// Write the note and/or plan of one existing entry (e.g. the plan, before
+/// the open). The symbol must already be on the list.
+pub fn set(file: &mut ListsFile, list: &str, symbol: &str, plan: &Fields) -> Result<Entry> {
     if plan.is_empty() {
         return Err(invalid(
-            "nothing to set: give --why, --call, --constraints and/or --signal".into(),
+            "nothing to set: give --note and/or --plan (or --plan-file)".into(),
         ));
     }
     let entries = file.lists.get_mut(list).ok_or_else(|| no_list(list))?;
@@ -345,19 +380,19 @@ mod tests {
     #[test]
     fn add_keeps_order_updates_fields_and_remove_reports() {
         let mut f = ListsFile::default();
-        let r = add(&mut f, "tomorrow", &["NVDA".into(), "AMD".into()], &Plan::why("earnings"), now());
+        let r = add(&mut f, "tomorrow", &["NVDA".into(), "AMD".into()], &Fields::note("earnings"), now());
         assert_eq!(r.added, ["NVDA", "AMD"]);
-        // Re-adding NVDA with a new why: same place, updated, not new.
-        let r = add(&mut f, "tomorrow", &["NVDA".into(), "EUR_USD".into()], &Plan::why("gap up"), now());
+        // Re-adding NVDA with a new note: same place, updated, not new.
+        let r = add(&mut f, "tomorrow", &["NVDA".into(), "EUR_USD".into()], &Fields::note("gap up"), now());
         assert_eq!((r.added, r.updated), (vec!["EUR_USD".to_string()], vec!["NVDA".to_string()]));
         let syms: Vec<_> = f.lists["tomorrow"].iter().map(|e| e.symbol.as_str()).collect();
         assert_eq!(syms, ["NVDA", "AMD", "EUR_USD"]);
-        assert_eq!(f.lists["tomorrow"][0].why.as_deref(), Some("gap up"));
-        assert_eq!(f.lists["tomorrow"][1].why.as_deref(), Some("earnings"));
+        assert_eq!(f.lists["tomorrow"][0].note.as_deref(), Some("gap up"));
+        assert_eq!(f.lists["tomorrow"][1].note.as_deref(), Some("earnings"));
         // No fields given: nothing changes, nothing "updated".
-        let r = add(&mut f, "tomorrow", &["AMD".into()], &Plan::default(), now());
+        let r = add(&mut f, "tomorrow", &["AMD".into()], &Fields::default(), now());
         assert!(r.added.is_empty() && r.updated.is_empty());
-        assert_eq!(f.lists["tomorrow"][1].why.as_deref(), Some("earnings"));
+        assert_eq!(f.lists["tomorrow"][1].note.as_deref(), Some("earnings"));
         let gone = remove(&mut f, "tomorrow", &["AMD".into(), "TSLA".into()]).unwrap();
         assert_eq!(gone, ["AMD"]);
         assert!(remove(&mut f, "nope", &["X".into()]).is_err());
@@ -367,7 +402,7 @@ mod tests {
     fn day_lists_sort_by_the_date_in_their_name() {
         let mut f = ListsFile::default();
         for name in ["fri-11-13", "mon-11-9", "thu-11-12", "ideas", "tue-11-10", "wed-11-11"] {
-            add(&mut f, name, &["SPY".into()], &Plan::default(), now());
+            add(&mut f, name, &["SPY".into()], &Fields::default(), now());
         }
         let names: Vec<String> = ordered(f).into_iter().map(|(n, _)| n).collect();
         // `ideas` has no date: it sorts by when it was made (Nov 9, tying
@@ -379,48 +414,51 @@ mod tests {
     }
 
     #[test]
-    fn set_writes_one_field_and_keeps_the_rest() {
+    fn set_writes_one_field_and_keeps_the_other() {
         let mut f = ListsFile::default();
-        let plan = Plan {
-            why: Some("earnings +39%".into()),
-            constraints: Some("stop below Fri low".into()),
-            ..Plan::default()
-        };
-        add(&mut f, "mon-11-9", &["NET".into()], &plan, now());
-        let e = set(
-            &mut f,
-            "mon-11-9",
-            "NET",
-            &Plan {
-                call: Some("continues".into()),
-                ..Plan::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(e.call.as_deref(), Some("continues"));
-        assert_eq!(e.why.as_deref(), Some("earnings +39%"));
-        assert_eq!(e.constraints.as_deref(), Some("stop below Fri low"));
+        add(&mut f, "mon-11-9", &["NET".into()], &Fields::note("earnings +39%"), now());
+        let plan = "Expect: continues\n\nGo: holds Fri close after 8:00\n";
+        let e = set(&mut f, "mon-11-9", "NET", &Fields { plan: Some(plan.into()), ..Fields::default() }).unwrap();
+        // Line breaks kept (trailing whitespace dropped); note untouched.
+        assert_eq!(e.plan.as_deref(), Some("Expect: continues\n\nGo: holds Fri close after 8:00"));
+        assert_eq!(e.note.as_deref(), Some("earnings +39%"));
+        // The note is one line.
+        let e = set(&mut f, "mon-11-9", "NET", &Fields::note("two\nlines")).unwrap();
+        assert_eq!(e.note.as_deref(), Some("two lines"));
         // An empty value clears that field only.
-        let e = set(&mut f, "mon-11-9", "NET", &Plan { constraints: Some(" ".into()), ..Plan::default() }).unwrap();
-        assert_eq!((e.constraints, e.call.as_deref()), (None, Some("continues")));
-        // Errors are validation errors: no fields, unknown symbol, no list.
+        let e = set(&mut f, "mon-11-9", "NET", &Fields { plan: Some(" ".into()), ..Fields::default() }).unwrap();
+        assert_eq!((e.plan, e.note.as_deref()), (None, Some("two lines")));
         for err in [
-            set(&mut f, "mon-11-9", "NET", &Plan::default()).unwrap_err(),
-            set(&mut f, "mon-11-9", "AMD", &Plan::why("x")).unwrap_err(),
-            set(&mut f, "nope", "NET", &Plan::why("x")).unwrap_err(),
+            set(&mut f, "mon-11-9", "NET", &Fields::default()).unwrap_err(),
+            set(&mut f, "mon-11-9", "AMD", &Fields::note("x")).unwrap_err(),
+            set(&mut f, "nope", "NET", &Fields::note("x")).unwrap_err(),
         ] {
             assert!(err.downcast_ref::<ValidationError>().is_some(), "{err}");
         }
     }
 
     #[test]
-    fn old_note_only_files_read_note_as_why_and_write_why() {
-        let old = r#"{"version":1,"lists":{"mon-11-9":[{"symbol":"NET","note":"earnings","added":"2026-11-09T06:09:58Z"}]}}"#;
+    fn every_older_entry_shape_still_loads() {
+        let old = r#"{"version":1,"lists":{"mon-11-9":[
+            {"symbol":"NET","note":"earnings","added":"2026-11-09T06:09:58Z"},
+            {"symbol":"ABNB","why":"buyback","call":"continues","constraints":"stop below Fri low",
+             "signal":"holds Fri close","added":"2026-11-09T06:09:58Z"},
+            {"symbol":"FROG","why":"jumped","added":"2026-11-09T06:09:58Z"}]}}"#;
         let f: ListsFile = serde_json::from_str(old).unwrap();
-        let e = &f.lists["mon-11-9"][0];
-        assert_eq!((e.why.as_deref(), e.call.as_deref()), (Some("earnings"), None));
+        let e = &f.lists["mon-11-9"];
+        assert_eq!((e[0].note.as_deref(), e[0].plan.as_deref()), (Some("earnings"), None));
+        assert_eq!(e[1].note.as_deref(), Some("buyback"));
+        assert_eq!(
+            e[1].plan.as_deref(),
+            Some("Expect: continues\nGo: holds Fri close\nLimits: stop below Fri low")
+        );
+        assert_eq!((e[2].note.as_deref(), e[2].plan.as_deref()), (Some("jumped"), None));
+        // Saved back in the new shape only.
         let out = serde_json::to_string(&f).unwrap();
-        assert!(out.contains(r#""why":"earnings""#) && !out.contains("note"), "{out}");
+        for gone in ["why", "call", "constraints", "signal"] {
+            assert!(!out.contains(&format!("\"{gone}\"")), "{gone} in {out}");
+        }
+        assert_eq!(serde_json::from_str::<ListsFile>(&out).unwrap(), f);
     }
 
     #[test]
@@ -453,7 +491,7 @@ mod tests {
                 std::thread::spawn(move || {
                     for j in 0..10 {
                         update_at(&path, |f| {
-                            add(f, "t", &[format!("S{i}_{j}")], &Plan::default(), now());
+                            add(f, "t", &[format!("S{i}_{j}")], &Fields::default(), now());
                             Ok(())
                         })
                         .unwrap();
@@ -473,11 +511,11 @@ mod tests {
         let path = dir.path().join("lists.json");
         assert!(load_at(&path).unwrap().lists.is_empty());
         update_at(&path, |f| {
-            add(f, "tomorrow", &["SPY".into()], &Plan::why("open drive"), now());
+            add(f, "tomorrow", &["SPY".into()], &Fields::note("open drive"), now());
             Ok(())
         })
         .unwrap();
         let f = load_at(&path).unwrap();
-        assert_eq!(f.lists["tomorrow"][0].why.as_deref(), Some("open drive"));
+        assert_eq!(f.lists["tomorrow"][0].note.as_deref(), Some("open drive"));
     }
 }

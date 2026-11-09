@@ -184,44 +184,44 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 
 Lists of stocks and/or forex pairs, kept in `~/.wickd/lists.json` (name them
 anything: `a-z`, `0-9`, `-`, `_`; have as many as you like — a dated list per
-trading day works well, e.g. `mon-11-9`). Each symbol carries a plan, four
-optional fields: **why** it's listed, your **call**, the **constraints**
-(stop, size, "watch only"), and the **signal** to act on. Lists are separate
-from the TUI watchlist and the in-play screen, and they're how an agent builds
-a plan for you. `wickd tui` shows the lists at the top of the watchlist
-screen: one list open (symbol, why, price, change), every other list folded
-to a one-line header, so stocks and forex stay readable however many lists
-you keep. `g l` jumps to the open list; pressed again it opens the next list
-(wrapping). Lists run in the order of the date in their name (`mon-11-9`
-before `tue-11-10`), otherwise by when they were made; on start the TUI opens
-today's list (or the next one coming). Selecting a row shows its plan
-underneath as **expect** (the call) and **go** (the signal), only the ones
-filled in (the why is already the row). The TUI picks up changes within ~2
-seconds while it's open; `w d` on a list row removes it (`w u` undoes).
+trading day works well, e.g. `mon-11-9`). Each symbol can have a short
+**note** (one line) and a **plan**: free text, any length, line breaks kept.
+Lists are separate from the TUI watchlist and the in-play screen, and they're
+how an agent builds a plan for you. `wickd tui` shows the lists at the top of
+the watchlist screen: one list open (symbol, company name, note, price,
+change), every other list folded to a one-line header, so stocks and forex
+stay readable however many lists you keep. `g l` jumps to the open list;
+pressed again it opens the next list (wrapping). Lists run in the order of
+the date in their name (`mon-11-9` before `tue-11-10`), otherwise by when they
+were made; on start the TUI opens today's list (or the next one coming).
+Selecting a row shows its plan underneath exactly as written (no box when it
+has none). The TUI picks up changes within ~2 seconds while it's open; `w d`
+on a list row removes it (`w u` undoes).
 
 ```sh
-wickd list add mon-11-9 NET --why "earnings: sales +39%, +10% Fri" \
-    --constraints "stop below Fri low; small size" \
-    --signal "holds Fri close after 8:00 on heavy volume"
-wickd list set mon-11-9 NET --call "continues"   # one field, before the open
-wickd list add mon-11-9 EUR_USD                 # pairs too (eur/usd works)
-wickd list show mon-11-9                        # every entry, all fields (JSON)
-wickd list ls                                   # every list + count
+wickd list add mon-11-9 NET --note "earnings: sales +39%, +10% Fri"
+wickd list set mon-11-9 NET --plan "Expect: drifts higher. Go: holds Fri close after 8:00."
+wickd list set mon-11-9 NET --plan-file plan.txt   # multi-line; `-` reads stdin
+wickd list add mon-11-9 EUR_USD                    # pairs too (eur/usd works)
+wickd list show mon-11-9                           # every entry, note + plan (JSON)
+wickd list ls                                      # every list + count
 wickd list rm mon-11-9 NET
-wickd list clear mon-11-9                       # empty it (keeps the name)
+wickd list clear mon-11-9                          # empty it (keeps the name)
 wickd list delete mon-11-9
 ```
 
 - `add` creates the list if needed; re-adding a symbol keeps its place and
-  writes only the fields given. `set` changes fields on a symbol already on
-  the list (an empty value, `--call ""`, clears that field). The old `--note`
-  flag still works and means `--why`; lists saved with `note` read it as
-  `why`. Commas work too: `add mon-11-9 NVDA,AMD`.
+  writes only what's given. `set` changes the note and/or plan of a symbol
+  already on the list; an empty value (`--plan ""`) clears it. Commas work
+  too: `add mon-11-9 NVDA,AMD`.
 - `add`, `set` and `rm` answer with what changed (`added`, `updated`, the
   changed entries / `removed`) and the list's `count`, not the whole list.
-  **Changed in AGT-2404:** `added` used to be a count and `add`/`rm` used to
-  echo every entry; JSON (here and in `wickd info`'s `lists`) now says `why`
-  where it said `note`. Read the whole list with `show`.
+  Read the whole list with `show`.
+- **Changed in AGT-2406:** entries are `note` + `plan` (JSON here and in
+  `wickd info`'s `lists`). The four AGT-2404 fields are gone: a saved `why`
+  loads as the note, and `call` / `signal` / `constraints` fold into the plan
+  as "Expect: …", "Go: …", "Limits: …" lines. `--why` still works as `--note`;
+  `--call`, `--constraints` and `--signal` are removed.
 - Symbols are checked against the cached Alpaca and OANDA symbol lists (`wickd
   tui` fills them); an unknown symbol is an error (exit 4) and nothing is
   written. Before any cache exists, symbols are accepted and listed under
