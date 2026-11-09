@@ -212,6 +212,9 @@ wickd list delete mon-11-9
   `why`. Commas work too: `add mon-11-9 NVDA,AMD`.
 - `add`, `set` and `rm` answer with what changed (`added`, `updated`, the
   changed entries / `removed`) and the list's `count`, not the whole list.
+  **Changed in AGT-2404:** `added` used to be a count and `add`/`rm` used to
+  echo every entry; JSON (here and in `wickd info`'s `lists`) now says `why`
+  where it said `note`. Read the whole list with `show`.
 - Symbols are checked against the cached Alpaca and OANDA symbol lists (`wickd
   tui` fills them); an unknown symbol is an error (exit 4) and nothing is
   written. Before any cache exists, symbols are accepted and listed under
