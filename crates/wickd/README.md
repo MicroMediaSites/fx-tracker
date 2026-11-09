@@ -129,8 +129,10 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   `v i` toggles the Ichimoku cloud (9/26/52, desktop-app colours): tenkan,
   kijun, chikou, and the cloud between senkou A and B as a faint green or red
   tint, projected 26 periods ahead into reserved space right of the newest
-  candle. On the 6M and 1Y charts it uses the same warm-up history, so the
-  cloud spans the whole chart. Elsewhere it is computed on that range's bars.
+  candle (the senkou spans are not drawn as lines; the tint marks both
+  edges). Extra history is fetched behind every range's window (the MA
+  warm-up on 6M/1Y; a few sessions of the same bar size on 1D/5D/1M), so the
+  cloud and lines span the whole chart.
   `v s` toggles support and resistance: swing highs and lows in the visible
   window, grouped when they are within half an average candle of each other.
   Up to 3 resistance levels above price and 3 support levels below are shown,
