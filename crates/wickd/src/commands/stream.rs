@@ -69,6 +69,11 @@ pub struct StreamArgs {
     /// h004. Default: the single/default account.
     #[arg(long, default_value = crate::vault_store::DEFAULT_ACCOUNT)]
     pub account: String,
+    /// Daemon mode: send price ticks to socket clients only, not stdout
+    /// (stdout is a log file under launchd; streaming `all` would fill it).
+    /// Health and error events are still written.
+    #[arg(long)]
+    pub hub_only: bool,
 }
 
 pub async fn run(args: StreamArgs, out: Out) -> ! {
@@ -135,7 +140,7 @@ async fn stream(args: StreamArgs) -> Result<()> {
     // (identical NDJSON lines) as well as stdout. Binding also reclaims a stale
     // socket left by a crash and refuses to start a second concurrent stream.
     let hub = StreamHub::bind().await.context("starting stream socket hub")?;
-    let (sink_impl, consumer_gone) = NdjsonSink::with_hub(hub.sender());
+    let (sink_impl, consumer_gone) = NdjsonSink::with_hub_opts(hub.sender(), !args.hub_only);
     // The always-on stream process is the main contributor to the persistent
     // per-instrument spread history (`~/.wickd/spreads.db`) that grades live
     // spreads in the ticket view. Best-effort: wrap() falls back to the bare
