@@ -66,6 +66,10 @@ pub struct NdjsonSink {
     /// Present only for `wickd stream`'s socket hub: every emitted line is also
     /// broadcast here for fan-out. `None` for the other sinks (e.g. `AlertSink`).
     hub: Option<tokio::sync::broadcast::Sender<String>>,
+    /// Write price ticks to stdout too. Off for the launchd daemon
+    /// (`--hub-only`), whose stdout is a log file: ticks go to socket clients
+    /// only, while health/error events still reach the log.
+    ticks_to_stdout: bool,
 }
 
 impl NdjsonSink {
@@ -79,6 +83,7 @@ impl NdjsonSink {
                 closed: Arc::new(AtomicBool::new(false)),
                 consumer_gone: consumer_gone.clone(),
                 hub: None,
+                ticks_to_stdout: true,
             },
             consumer_gone,
         )
@@ -89,12 +94,22 @@ impl NdjsonSink {
     pub fn with_hub(
         hub: tokio::sync::broadcast::Sender<String>,
     ) -> (Self, Arc<tokio::sync::Notify>) {
+        Self::with_hub_opts(hub, true)
+    }
+
+    /// [`NdjsonSink::with_hub`], choosing whether price ticks also go to
+    /// stdout (`false` = hub only; non-tick events are always written).
+    pub fn with_hub_opts(
+        hub: tokio::sync::broadcast::Sender<String>,
+        ticks_to_stdout: bool,
+    ) -> (Self, Arc<tokio::sync::Notify>) {
         let consumer_gone = Arc::new(tokio::sync::Notify::new());
         (
             Self {
                 closed: Arc::new(AtomicBool::new(false)),
                 consumer_gone: consumer_gone.clone(),
                 hub: Some(hub),
+                ticks_to_stdout,
             },
             consumer_gone,
         )
@@ -112,6 +127,9 @@ impl NdjsonSink {
         // this can't stall the OANDA read loop. No subscribers is not an error.
         if let Some(hub) = &self.hub {
             let _ = hub.send(line.clone());
+        }
+        if event == "price-update" && !self.ticks_to_stdout {
+            return;
         }
 
         // Lock + write directly (rather than `println!`) so a broken pipe
@@ -551,6 +569,20 @@ mod tests {
             time: "2026-06-30T00:00:00Z".to_string(),
             tradeable: true,
         }
+    }
+
+    // AGT-2386: daemon (hub-only) mode still fans every tick and health event
+    // out to socket clients; only stdout skips the ticks.
+    #[test]
+    fn hub_only_sink_still_broadcasts_ticks() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let (sink, _gone) = NdjsonSink::with_hub_opts(tx, false);
+        sink.price_update(&price("EUR_USD", "1.0850", "1.0852"));
+        let line = rx.try_recv().expect("tick reached the hub");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["event"], "price-update");
+        assert_eq!(v["instrument"], "EUR_USD");
+        assert!(!sink.ticks_to_stdout && !sink.closed.load(Ordering::Relaxed));
     }
 
     // AGT-617 AC2/AC4: the sink drives the alert evaluator on every tick and

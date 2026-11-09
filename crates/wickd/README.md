@@ -150,6 +150,35 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 - **Keys**. Agents can export `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY`
   instead of using the keychain item (service `wickd`, account `alpaca`).
 
+## Stream daemon (`com.openthink.wickd-stream`)
+
+One always-on `wickd stream` process owns the OANDA price stream and shares
+it over `~/.wickd/stream.sock`; anything local (the TUI, `wickd watch`, `nc -U`)
+connects as a client and gets identical NDJSON lines. Clients never start or
+stop the upstream stream, so closing one never cuts another's feed.
+
+It runs `stream all --env practice --hub-only`: every instrument on the
+account, ticks to socket clients only. `--hub-only` keeps ticks out of stdout
+(a log file under launchd); health and error events are still logged.
+
+```sh
+# Install (template in crates/wickd/launchd/; the binary is a copy of wickd)
+cp target/release/wickd ~/.wickd/bin/wickd-stream
+sed "s#__HOME__#$HOME#g" crates/wickd/launchd/com.openthink.wickd-stream.plist \
+  > ~/Library/LaunchAgents/com.openthink.wickd-stream.plist
+launchctl enable gui/$(id -u)/com.openthink.wickd-stream
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.openthink.wickd-stream.plist
+
+# Uninstall
+launchctl bootout gui/$(id -u)/com.openthink.wickd-stream
+launchctl disable gui/$(id -u)/com.openthink.wickd-stream
+```
+
+launchd restarts it if it crashes (`KeepAlive` on unsuccessful exit, 30s
+throttle); a clean SIGTERM stops it. The first start may raise a keychain prompt
+for the OANDA key: choose "Always Allow". Logs:
+`~/Library/Logs/wickd/stream.{out,err}.log`.
+
 ## Named accounts (`--account`)
 
 One OANDA practice login fans out into several practice *sub-accounts* — one
