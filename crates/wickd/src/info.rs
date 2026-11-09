@@ -236,6 +236,21 @@ pub async fn fetch(symbol: &str, refresh: bool) -> Result<SymbolInfo> {
     Ok(info)
 }
 
+/// A stock couldn't be identified because there are no Alpaca keys (and no
+/// cached stock list): a setup problem, not an unknown symbol.
+#[derive(Debug)]
+pub struct MissingKeys;
+
+impl std::fmt::Display for MissingKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "can't identify stocks without Alpaca keys: run `wickd alpaca login` (or open `wickd tui` once to cache the symbol list)",
+        )
+    }
+}
+
+impl std::error::Error for MissingKeys {}
+
 /// The symbol isn't a listed stock (Alpaca 404) or isn't offered by OANDA.
 #[derive(Debug)]
 pub struct NotFound(pub String);
@@ -324,6 +339,7 @@ async fn fetch_stock(
     now: DateTime<Utc>,
     failed: &mut bool,
 ) -> Result<SymbolInfo> {
+    let mut no_keys = false;
     let mut info = SymbolInfo {
         symbol: symbol.to_string(),
         name: String::new(),
@@ -356,20 +372,30 @@ async fn fetch_stock(
                 }
             }
         }
-        // No keys is a setup choice, not a passing failure: still cacheable.
-        _ => info
-            .notes
-            .push("Alpaca: no keys (`wickd alpaca login`); trading flags omitted".into()),
+        // No keys: the card is thinner, and isn't cached, so logging in
+        // later fills it in on the next call.
+        _ => {
+            info.notes
+                .push("Alpaca: no keys (`wickd alpaca login`); trading flags omitted".into());
+            *failed = true;
+            no_keys = true;
+        }
     }
     if info.name.is_empty() {
         if let Some(a) = cached_asset_name(home, symbol) {
             info.name = a;
         }
     }
-    // Without Alpaca keys, a symbol missing from the cached stock list too is
-    // unknown (rather than a blank card cached for a month).
-    if info.name.is_empty() && !*failed {
-        return Err(NotFound(symbol.to_string()).into());
+    // Nothing identified the symbol. With keys that means Alpaca doesn't
+    // list it (a 404 already returned NotFound); without keys and without a
+    // cached stock list we can't tell, so say what's missing instead.
+    if info.name.is_empty() {
+        if no_keys {
+            return Err(MissingKeys.into());
+        }
+        if !*failed {
+            return Err(NotFound(symbol.to_string()).into());
+        }
     }
 
     let (wiki, sec) = tokio::join!(
@@ -880,10 +906,12 @@ async fn fetch_pair(
                 *failed = true;
             }
         },
-        // No credentials is a setup choice, not a passing failure.
-        Err(_) => info
-            .notes
-            .push("OANDA: no practice credentials (`wickd login`)".into()),
+        // No credentials: thinner card, not cached (fills in after login).
+        Err(_) => {
+            info.notes
+                .push("OANDA: no practice credentials (`wickd login`)".into());
+            *failed = true;
+        }
     }
     // Each currency's article.
     for code in [base, quote] {

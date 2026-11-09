@@ -235,8 +235,10 @@ OANDA doesn't offer) exits 4 with error kind `not_found`. `kind` is always
   `facts` has OANDA's pip size, price decimals, margin rate and leverage,
   and minimum trade (practice account, read-only).
 - `notes` lists any source that couldn't be reached, or was skipped (no
-  Alpaca keys). A card where a source failed is returned but not cached;
-  missing keys don't stop caching.
+  Alpaca keys). A card where a source failed or keys were missing is
+  returned but not cached, so it fills in after `wickd alpaca login` /
+  `wickd login`. With no Alpaca keys and no cached stock list, a stock
+  can't be identified at all: exit 2, `no_alpaca_keys`.
 - `lists` names every `wickd list` the symbol is on, with its note (read
   fresh each call, never cached).
 

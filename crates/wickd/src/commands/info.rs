@@ -31,6 +31,9 @@ pub async fn run(args: InfoArgs, out: Out) -> ! {
         Err(e) if e.downcast_ref::<info::NotFound>().is_some() => {
             out.fail(exit::VALIDATION, "not_found", format!("{e:#}"))
         }
+        Err(e) if e.downcast_ref::<info::MissingKeys>().is_some() => {
+            out.fail(exit::AUTH, "no_alpaca_keys", format!("{e:#}"))
+        }
         Err(e) => out.fail(exit::GENERIC, "info_failed", format!("{e:#}")),
     }
 }
