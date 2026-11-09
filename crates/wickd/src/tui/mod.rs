@@ -416,6 +416,7 @@ pub async fn run(client: AlpacaClient, watchlist: Vec<String>, opts: Options) ->
     let mut app = App::new(watchlist, feed_label);
     app.history_delayed = history_delayed;
     app.api_budget = Some(budget);
+    app.refresh_secs = opts.refresh.as_secs();
     tokio::task::spawn_blocking(move || run_loop(app, requests, reader_tx, reply_rx, wanted, opts))
         .await
         .context("tui task panicked")?

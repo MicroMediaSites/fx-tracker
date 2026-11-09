@@ -356,6 +356,8 @@ pub struct App {
     pub fx_error: Option<String>,
     /// Attached to the stream daemon: forex rows tick live.
     pub fx_live: bool,
+    /// Quote refresh interval (`--refresh`), shown when not streaming.
+    pub refresh_secs: u64,
     pub last_quotes: Option<DateTime<Local>>,
     /// Transient one-line message for the footer.
     pub flash: Option<String>,
@@ -390,6 +392,7 @@ impl App {
             quotes_error: None,
             fx_error: None,
             fx_live: false,
+            refresh_secs: 15,
             last_quotes: None,
             flash: None,
             undo: None,
@@ -527,8 +530,10 @@ impl App {
                 );
             }
         }
+        let Some(price) = mid.to_f64() else {
+            return; // unrepresentable: skip rather than plot a bogus bar
+        };
         if let Some(d) = self.detail.as_mut().filter(|d| d.symbol == q.instrument) {
-            let price = mid.to_f64().unwrap_or(0.0);
             for (range, bars) in d.history.iter_mut() {
                 super::fx::apply_tick(bars, price, q.time, super::fx::bar_seconds(*range));
             }

@@ -397,7 +397,11 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
         render_stock_table(frame, area, app, &stocks, pos(&stocks), title);
         return;
     }
-    let feed = if app.fx_live { "live" } else { "refresh 15s" };
+    let feed = if app.fx_live {
+        "live (stream)".to_string()
+    } else {
+        format!("refresh {}s", app.refresh_secs)
+    };
     let mut fx_title = format!(
         " forex · {} · OANDA practice · {feed} ",
         app.watchlist.len() - start
