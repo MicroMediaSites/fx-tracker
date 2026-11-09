@@ -35,6 +35,7 @@ mod events;
 mod feed;
 mod fs_perms;
 mod lists;
+mod info;
 /// Shim: the socket-hub client (probe/attach/partition) moved to
 /// wickd-core::hub_client (AGT-652) so the desktop app shares it.
 mod hub {
@@ -71,6 +72,7 @@ use commands::calendar::CalendarArgs;
 use commands::candles::CandlesArgs;
 use commands::dashboard::DashboardArgs;
 use commands::feed::FeedArgs;
+use commands::info::InfoArgs;
 use commands::instruments::InstrumentsArgs;
 use commands::login::{LoginArgs, LogoutArgs};
 use commands::pending::PendingArgs;
@@ -117,6 +119,8 @@ enum Command {
     Dashboard(DashboardArgs),
     /// Stock ticker TUI: watchlist, symbol search, price-history drill-down (Alpaca data).
     Tui(TuiArgs),
+    /// What a stock or forex pair is: summary, facts, industry → JSON.
+    Info(InfoArgs),
     /// Alpaca market-data keys for `wickd tui`: login | status | logout.
     Alpaca(AlpacaArgs),
     /// Named symbol lists with notes (agent-writable): ls | show | add | rm |
@@ -176,6 +180,7 @@ async fn main() {
         Command::Dashboard(args) => commands::dashboard::run(args, out).await,
         Command::Tui(args) => commands::tui::run(args, out).await,
         Command::List(args) => commands::list::run(args, out).await,
+        Command::Info(args) => commands::info::run(args, out).await,
         Command::Alpaca(args) => commands::alpaca::run(args, out).await,
         Command::Strategy(args) => commands::strategy::run(args, out).await,
         Command::Backtest(args) => commands::backtest::run(args, out).await,

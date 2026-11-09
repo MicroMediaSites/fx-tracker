@@ -4,6 +4,7 @@
 //! - `GET {data}/v2/stocks/snapshots?symbols=…&feed=…` — map keyed by symbol
 //! - `GET {data}/v2/stocks/bars?symbols=…&timeframe=…&start=…` — `{"bars":{SYM:[…]},"next_page_token":…}`
 //! - `GET {trading}/v2/assets?status=active&asset_class=us_equity` — symbol list for search
+//! - `GET {trading}/v2/assets/{symbol}` — one asset's class + trading flags
 //! - `GET {trading}/v2/clock` — open/closed + next open/close
 //!
 //! ## Free (Basic) plan
@@ -360,6 +361,13 @@ impl AlpacaClient {
         .await
     }
 
+    /// One asset's details (class, exchange, and whether it can be traded,
+    /// shorted, bought on margin, or in fractional shares).
+    pub async fn asset_detail(&self, symbol: &str) -> Result<AssetDetail, AlpacaError> {
+        let url = format!("{}/v2/assets/{}", self.trading_base, symbol);
+        self.get(&url, &[]).await
+    }
+
     /// Market clock (open/closed, next open/close).
     pub async fn clock(&self) -> Result<MarketClock, AlpacaError> {
         let url = format!("{}/v2/clock", self.trading_base);
@@ -467,11 +475,58 @@ pub struct NewsItem {
     pub url: Option<String>,
 }
 
+/// `GET /v2/assets/{symbol}`: one asset and what Alpaca allows with it.
+#[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize)]
+pub struct AssetDetail {
+    pub symbol: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub exchange: String,
+    /// e.g. `us_equity`.
+    #[serde(default)]
+    pub class: String,
+    #[serde(default)]
+    pub tradable: bool,
+    #[serde(default)]
+    pub shortable: bool,
+    #[serde(default)]
+    pub marginable: bool,
+    #[serde(default)]
+    pub easy_to_borrow: bool,
+    #[serde(default)]
+    pub fractionable: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn asset_detail_parses() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/assets/QQQ"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "x", "class": "us_equity", "exchange": "NASDAQ", "symbol": "QQQ",
+                "name": "Invesco QQQ Trust, Series 1", "status": "active", "tradable": true,
+                "marginable": true, "shortable": true, "easy_to_borrow": true,
+                "fractionable": true, "attributes": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let a = client(&server, QuoteFeed::Iex)
+            .await
+            .asset_detail("QQQ")
+            .await
+            .unwrap();
+        assert_eq!(a.name, "Invesco QQQ Trust, Series 1");
+        assert_eq!((a.class.as_str(), a.exchange.as_str()), ("us_equity", "NASDAQ"));
+        assert!(a.tradable && a.shortable && a.marginable && a.fractionable);
+    }
 
     fn creds() -> AlpacaCredentials {
         AlpacaCredentials {
