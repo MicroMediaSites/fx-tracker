@@ -16,6 +16,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 use wickd_core::equities::{eastern_offset_hours, Asset, Bar, HistoryRange};
 use wickd_core::models::candle::Candle as OandaCandle;
@@ -37,16 +39,16 @@ pub fn is_fx(symbol: &str) -> bool {
 
 /// One pip: 0.01 for JPY-quoted pairs, else 0.0001 (OANDA's pipLocation for
 /// currencies).
-pub fn pip_size(symbol: &str) -> f64 {
+pub fn pip_size(symbol: &str) -> Decimal {
     if symbol.ends_with("_JPY") {
-        0.01
+        dec!(0.01)
     } else {
-        0.0001
+        dec!(0.0001)
     }
 }
 
 /// Price decimals OANDA quotes: 3 for JPY-quoted pairs, else 5.
-pub fn decimals(symbol: &str) -> usize {
+pub fn decimals(symbol: &str) -> u32 {
     if symbol.ends_with("_JPY") {
         3
     } else {
@@ -55,65 +57,63 @@ pub fn decimals(symbol: &str) -> usize {
 }
 
 /// A price difference in pips.
-pub fn pips(symbol: &str, delta: f64) -> f64 {
+pub fn pips(symbol: &str, delta: Decimal) -> Decimal {
     delta / pip_size(symbol)
 }
 
 /// A pair's quote for the watchlist: the latest bid/ask plus the current
-/// trading day's open/high/low and closes (5-minute bars since 17:00 New
-/// York), for the change columns and the sparkline.
+/// trading day's open/high/low (exact, from OANDA's price strings) and its
+/// closes as f64 for the sparkline only (5-minute bars since 17:00 New York).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FxQuote {
-    pub bid: f64,
-    pub ask: f64,
+    pub bid: Decimal,
+    pub ask: Decimal,
     pub time: DateTime<Utc>,
-    pub open: Option<f64>,
-    pub high: Option<f64>,
-    pub low: Option<f64>,
+    pub open: Option<Decimal>,
+    pub high: Option<Decimal>,
+    pub low: Option<Decimal>,
     pub closes: Vec<f64>,
 }
 
 impl FxQuote {
-    pub fn mid(&self) -> f64 {
-        (self.bid + self.ask) / 2.0
+    pub fn mid(&self) -> Decimal {
+        (self.bid + self.ask) / dec!(2)
     }
 
     /// Change since the trading day's open (mid prices).
-    pub fn change(&self) -> Option<f64> {
+    pub fn change(&self) -> Option<Decimal> {
         self.open.map(|o| self.mid() - o)
     }
 
-    pub fn change_pct(&self) -> Option<f64> {
-        self.open.filter(|o| *o != 0.0).map(|o| (self.mid() - o) / o * 100.0)
+    pub fn change_pct(&self) -> Option<Decimal> {
+        self.open
+            .filter(|o| !o.is_zero())
+            .map(|o| (self.mid() - o) / o * dec!(100))
     }
 }
 
-/// Bid/ask for `pairs` from OANDA's pricing endpoint, as
-/// `(instrument, bid, ask, time)`.
-fn parse_prices(v: &serde_json::Value) -> Vec<(String, f64, f64, DateTime<Utc>)> {
-    let num = |p: &serde_json::Value, side: &str| -> Option<f64> {
-        p.get(side)?.get(0)?.get("price")?.as_str()?.parse().ok()
-    };
-    v.get("prices")
-        .and_then(|p| p.as_array())
-        .map(|prices| {
-            prices
-                .iter()
-                .filter_map(|p| {
-                    Some((
-                        p.get("instrument")?.as_str()?.to_string(),
-                        num(p, "bids")?,
-                        num(p, "asks")?,
-                        p.get("time")?.as_str()?.parse().ok()?,
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// The trading day so far for one pair: (open, high, low, closes).
+type Day = (Option<Decimal>, Option<Decimal>, Option<Decimal>, Vec<f64>);
+
+async fn trading_day(client: &OandaClient, symbol: &str, from: &str) -> Day {
+    // A missing day (weekend, fetch error) only blanks the day columns.
+    let candles: Vec<OandaCandle> =
+        endpoints::get_candles(client, symbol, Granularity::M5, Some(5000), Some(from), None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.mid.close > Decimal::ZERO)
+            .collect();
+    (
+        candles.first().map(|c| c.mid.open),
+        candles.iter().map(|c| c.mid.high).max(),
+        candles.iter().map(|c| c.mid.low).min(),
+        candles.iter().map(|c| c.mid.close.to_f64().unwrap_or(0.0)).collect(),
+    )
 }
 
 /// Quotes for `pairs`: one pricing call for bid/ask, plus each pair's
-/// 5-minute bars since the trading day's open.
+/// 5-minute bars since the trading day's open (fetched concurrently).
 pub async fn quotes(
     client: &OandaClient,
     pairs: &[String],
@@ -122,43 +122,32 @@ pub async fn quotes(
     if pairs.is_empty() {
         return Ok(HashMap::new());
     }
-    let url = format!(
-        "{}/v3/accounts/{}/pricing?instruments={}",
-        client.base_url(),
-        client.account_id(),
-        pairs.join(",")
-    );
-    let body: serde_json::Value = client
-        .get(&url)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| format!("OANDA pricing: {e}"))?
-        .json()
+    let prices = endpoints::get_pricing(client, pairs)
         .await
         .map_err(|e| format!("OANDA pricing: {e}"))?;
     let from = trading_day_start(now).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let mut out = HashMap::new();
-    for (sym, bid, ask, time) in parse_prices(&body) {
-        // A missing day (weekend, fetch error) only blanks the day columns.
-        let day: Vec<Bar> = endpoints::get_candles(client, &sym, Granularity::M5, Some(5000), Some(&from), None)
-            .await
-            .map(|c| c.iter().filter(|c| c.mid.close > rust_decimal::Decimal::ZERO).map(to_bar).collect())
-            .unwrap_or_default();
-        out.insert(
-            sym,
-            FxQuote {
-                bid,
-                ask,
-                time,
-                open: day.first().map(|b| b.open),
-                high: day.iter().map(|b| b.high).reduce(f64::max),
-                low: day.iter().map(|b| b.low).reduce(f64::min),
-                closes: day.iter().map(|b| b.close).collect(),
-            },
-        );
-    }
-    Ok(out)
+    let days = futures_util::future::join_all(
+        prices.iter().map(|p| trading_day(client, &p.instrument, &from)),
+    )
+    .await;
+    Ok(prices
+        .into_iter()
+        .zip(days)
+        .map(|(p, (open, high, low, closes))| {
+            (
+                p.instrument,
+                FxQuote {
+                    bid: p.bid,
+                    ask: p.ask,
+                    time: p.time,
+                    open,
+                    high,
+                    low,
+                    closes,
+                },
+            )
+        })
+        .collect())
 }
 
 /// OANDA's instrument list as search entries (`EUR_USD`, "EUR/USD").
@@ -298,34 +287,21 @@ mod tests {
     }
 
     #[test]
-    fn pips_and_decimals_follow_the_quote_currency() {
+    fn pips_decimals_and_change_are_exact() {
         assert_eq!(decimals("EUR_USD"), 5);
         assert_eq!(decimals("USD_JPY"), 3);
-        assert!((pips("EUR_USD", 0.00123) - 12.3).abs() < 1e-9);
-        assert!((pips("USD_JPY", 0.25) - 25.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn pricing_response_parses_bid_ask() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"prices":[{"instrument":"EUR_USD","time":"2026-11-09T03:00:00Z",
-            "bids":[{"price":"1.11540"}],"asks":[{"price":"1.11548"}]},
-            {"instrument":"BAD","time":"x","bids":[],"asks":[]}]}"#,
-        )
-        .unwrap();
-        let p = parse_prices(&v);
-        assert_eq!(p.len(), 1);
-        assert_eq!((p[0].0.as_str(), p[0].1, p[0].2), ("EUR_USD", 1.1154, 1.11548));
+        assert_eq!(pips("EUR_USD", dec!(0.00123)), dec!(12.3));
+        assert_eq!(pips("USD_JPY", dec!(0.25)), dec!(25));
         let q = FxQuote {
-            bid: 1.1154,
-            ask: 1.1156,
-            time: p[0].3,
-            open: Some(1.1145),
+            bid: dec!(1.1154),
+            ask: dec!(1.1156),
+            time: t("2026-11-09T03:00:00Z"),
+            open: Some(dec!(1.1145)),
             high: None,
             low: None,
             closes: vec![],
         };
-        assert!((pips("EUR_USD", q.change().unwrap()) - 10.0).abs() < 1e-6);
+        assert_eq!(pips("EUR_USD", q.change().unwrap()), dec!(10));
     }
 
     #[test]

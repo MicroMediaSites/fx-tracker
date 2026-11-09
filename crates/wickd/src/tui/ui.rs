@@ -13,6 +13,7 @@ use wickd_core::equities::{Bar, HistoryRange, Snapshot};
 use super::app::{App, DetailState, DetailView, Mode};
 use super::chart::{self, ChartWidget, Palette, Style2, Zoom};
 use super::fx;
+use rust_decimal::prelude::ToPrimitive;
 use super::inplay::{self, Tag};
 use super::keymap::{self, Ctx, Entry};
 
@@ -496,8 +497,16 @@ fn render_stock_table(
 }
 
 /// A pair's price at OANDA's precision (5 decimals, 3 for JPY quotes).
-fn fx_price(sym: &str, p: f64) -> String {
-    format!("{p:.*}", fx::decimals(sym))
+fn fx_price(sym: &str, p: rust_decimal::Decimal) -> String {
+    let dp = fx::decimals(sym);
+    format!("{:.*}", dp as usize, p.round_dp(dp))
+}
+
+/// A signed decimal at one place (`+12.3`), for pips and percent cells.
+fn signed_1dp(d: rust_decimal::Decimal, dp: u32) -> String {
+    let r = d.round_dp(dp);
+    let sign = if r.is_sign_negative() && !r.is_zero() { "-" } else { "+" };
+    format!("{sign}{:.*}", dp as usize, r.abs())
 }
 
 fn render_fx_table(
@@ -518,22 +527,22 @@ fn render_fx_table(
         let sym = &app.watchlist[i];
         let q = app.fx_quotes.get(sym);
         let chg = q.and_then(|q| q.change());
-        let color = change_color(chg);
+        let color = change_color(chg.and_then(|c| c.to_f64()));
         let cell = |s: String| Cell::from(Line::from(s).alignment(Alignment::Right));
         let (bid, ask, spread) = match q {
             Some(q) => (
                 fx_price(sym, q.bid),
                 fx_price(sym, q.ask),
-                format!("{:.1}", fx::pips(sym, q.ask - q.bid)),
+                format!("{:.1}", fx::pips(sym, q.ask - q.bid).round_dp(1)),
             ),
             None => ("…".into(), String::new(), String::new()),
         };
         let pips = chg
-            .map(|c| format!("{:+.1}", fx::pips(sym, c)))
+            .map(|c| signed_1dp(fx::pips(sym, c), 1))
             .unwrap_or_default();
         let pct = q
             .and_then(|q| q.change_pct())
-            .map(|p| format!("{p:+.2}%"))
+            .map(|p| format!("{}%", signed_1dp(p, 2)))
             .unwrap_or_default();
         let range = q
             .and_then(|q| Some(format!("{} – {}", fx_price(sym, q.low?), fx_price(sym, q.high?))))

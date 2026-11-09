@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
-use crate::models::{Trade, Position, Order, Candle};
+use crate::models::{Trade, Position, Order, Candle, InstrumentPrice};
 use super::client::OandaClient;
-use super::types::{TradesResponse, PositionsResponse, OrdersResponse, MarketOrderRequest, EntryOrderRequest, OrderCreateResponse, ClosePositionRequest, ClosePositionResponse, CandlesResponse, AutochartistResponse, InstrumentsResponse, OandaInstrument, OandaBook, OrderBookResponse, PositionBookResponse};
+use super::types::{PricingResponse, TradesResponse, PositionsResponse, OrdersResponse, MarketOrderRequest, EntryOrderRequest, OrderCreateResponse, ClosePositionRequest, ClosePositionResponse, CandlesResponse, AutochartistResponse, InstrumentsResponse, OandaInstrument, OandaBook, OrderBookResponse, PositionBookResponse};
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -179,6 +179,24 @@ pub async fn get_account(client: &OandaClient) -> Result<super::types::OandaAcco
 }
 
 /// Fetch all tradeable instruments for the account
+/// Current bid/ask for `instruments` (one request). Instruments OANDA returns
+/// without a usable price (halted, unknown) are left out.
+pub async fn get_pricing(client: &OandaClient, instruments: &[String]) -> Result<Vec<InstrumentPrice>> {
+    let url = format!(
+        "{}/v3/accounts/{}/pricing?instruments={}",
+        client.base_url(),
+        client.account_id(),
+        instruments.join(",")
+    );
+    let text = client.get(&url).send().await?.text().await?;
+    let response: PricingResponse = parse_response(&text)?;
+    Ok(response
+        .prices
+        .into_iter()
+        .filter_map(|p| InstrumentPrice::try_from(p).ok())
+        .collect())
+}
+
 pub async fn get_instruments(client: &OandaClient) -> Result<Vec<OandaInstrument>> {
     let url = format!(
         "{}/v3/accounts/{}/instruments",
