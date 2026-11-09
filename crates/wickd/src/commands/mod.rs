@@ -11,6 +11,7 @@ pub mod candles;
 pub mod client;
 pub mod dashboard;
 pub mod feed;
+pub mod info;
 pub mod instruments;
 pub mod list;
 pub mod login;

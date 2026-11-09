@@ -28,6 +28,7 @@ feature — meant to be followed together by you and an agent.
 | `tui` | Stock ticker TUI: watchlist, symbol search, price-history drill-down (US equities) |
 | `list` | Named symbol lists (agent-writable; TUI watchlist sections) |
 | `alpaca login` / `status` / `logout` | Store / inspect / remove the Alpaca market-data keys `tui` uses |
+| `info` | What a stock or forex pair is: plain-language summary, facts, industry (JSON) |
 
 ## `wickd tui` — stock and forex ticker
 
@@ -199,6 +200,38 @@ wickd list delete tomorrow
 - Names: `a-z`, `0-9`, `-`, `_`.
 - Safe to run while the TUI is open or from several agents at once: every write
   re-reads the file under a lock and replaces it atomically.
+
+## `wickd info` — what is this symbol?
+
+```sh
+wickd info QQQ              # stock or ETF
+wickd info eur/usd          # forex pair (EUR_USD)
+wickd info NVDA --refresh   # skip the 30-day cache
+```
+
+Prints one JSON card (the same one the TUI shows):
+
+- **Stocks**: `summary` is the Wikipedia article's opening paragraph, found
+  by searching the company name and accepted only when the article title
+  clearly names the company and reads like a business. Otherwise `summary`
+  is `null`, never a guess. `source` gives the article title and link.
+  `facts` lists Alpaca's exchange, class and trading flags (tradable,
+  shortable, easy to borrow, marginable, fractional). For SEC filers, `sec`
+  has the industry (SIC), headquarters, state of incorporation and fiscal
+  year end from EDGAR. Most ETFs have no SEC record, so `sec` is `null` for
+  them.
+- **Pairs**: `summary` explains the quote (how many quote-currency units one
+  base unit buys), `currencies` has each currency's Wikipedia summary, and
+  `facts` has OANDA's pip size, price decimals, margin rate and leverage,
+  and minimum trade (practice account, read-only).
+- `notes` lists any source that couldn't be reached. A card with notes is
+  returned but not cached.
+
+Cards are cached in `~/.wickd/cache/info/<SYM>.json` for 30 days, and the
+SEC ticker map in `~/.wickd/cache/sec-tickers.json` for 7. SEC requests
+identify the caller with a contact email, as SEC's fair-access policy
+requires. Wikipedia requests send only the app name and repo URL. Alpaca
+keys are optional: without them, the trading flags are left out.
 
 ## Stream daemon (`com.openthink.wickd-stream`)
 
