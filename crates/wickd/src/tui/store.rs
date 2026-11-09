@@ -1,7 +1,9 @@
 //! On-disk state for `wickd tui`, under the wickd data home (`~/.wickd`):
 //!
-//! - `tui.json` — `{"watchlist": ["SPY", …]}` (the operator's symbols, in order)
-//! - `cache/alpaca-assets.json` — the symbol list for search, refreshed daily
+//! - `tui.json` — `{"watchlist": ["SPY", …, "EUR_USD", …], "fx_seeded": true}`
+//!   (the operator's symbols in order: stocks, then forex pairs)
+//! - `cache/alpaca-assets.json` — the stock list for search, refreshed daily
+//! - `cache/oanda-instruments.json` — the forex pairs for search, same TTL
 //!
 //! Single writer (the TUI process), so a tmp-file + rename is enough to keep a
 //! crash mid-write from truncating the file.
@@ -25,6 +27,9 @@ const ASSET_CACHE_TTL_HOURS: i64 = 24;
 struct TuiFile {
     #[serde(default)]
     watchlist: Vec<String>,
+    /// The default pairs were added once; removing them all keeps them gone.
+    #[serde(default)]
+    fx_seeded: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -43,6 +48,18 @@ fn tui_path(home: &Path) -> PathBuf {
 
 fn assets_path(home: &Path) -> PathBuf {
     home.join("cache").join("alpaca-assets.json")
+}
+
+fn fx_assets_path(home: &Path) -> PathBuf {
+    home.join("cache").join("oanda-instruments.json")
+}
+
+/// Stocks first, then forex pairs, each in their saved order (the watchlist
+/// shows them as two sections).
+pub fn sectioned(symbols: Vec<String>) -> Vec<String> {
+    let (fx, stocks): (Vec<String>, Vec<String>) =
+        symbols.into_iter().partition(|s| super::fx::is_fx(s));
+    stocks.into_iter().chain(fx).collect()
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -65,23 +82,31 @@ pub fn load_watchlist_in(home: &Path) -> Result<Vec<String>> {
     let file: TuiFile = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("{} is not valid JSON", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DEFAULT_WATCHLIST.iter().map(|s| s.to_string()).collect())
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => TuiFile {
+            watchlist: DEFAULT_WATCHLIST.iter().map(|s| s.to_string()).collect(),
+            fx_seeded: false,
+        },
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     let mut seen = std::collections::HashSet::new();
-    Ok(file
+    let mut list: Vec<String> = file
         .watchlist
         .iter()
         .map(|s| normalize_symbol(s))
         .filter(|s| !s.is_empty() && seen.insert(s.clone()))
-        .collect())
+        .collect();
+    // Existing watchlists get the default pairs once (the next save records
+    // `fx_seeded`, so removing them later sticks).
+    if !file.fx_seeded && !list.iter().any(|s| super::fx::is_fx(s)) {
+        list.extend(super::fx::DEFAULT_PAIRS.iter().map(|s| s.to_string()));
+    }
+    Ok(sectioned(list))
 }
 
 pub fn save_watchlist_in(home: &Path, symbols: &[String]) -> Result<()> {
     let file = TuiFile {
         watchlist: symbols.to_vec(),
+        fx_seeded: true,
     };
     write_atomic(&tui_path(home), &serde_json::to_vec_pretty(&file)?)
 }
@@ -109,6 +134,21 @@ pub fn save_assets_in(home: &Path, assets: &[Asset], now: DateTime<Utc>) -> Resu
     write_atomic(&assets_path(home), &serde_json::to_vec(&cache)?)
 }
 
+/// The cached OANDA instrument list if it's younger than the TTL.
+pub fn cached_fx_assets(now: DateTime<Utc>) -> Option<Vec<Asset>> {
+    let bytes = std::fs::read(fx_assets_path(&home().ok()?)).ok()?;
+    let cache: AssetCache = serde_json::from_slice(&bytes).ok()?;
+    (now - cache.fetched_at < Duration::hours(ASSET_CACHE_TTL_HOURS)).then_some(cache.assets)
+}
+
+pub fn save_fx_assets(assets: &[Asset], now: DateTime<Utc>) -> Result<()> {
+    let cache = AssetCache {
+        fetched_at: now,
+        assets: assets.to_vec(),
+    };
+    write_atomic(&fx_assets_path(&home()?), &serde_json::to_vec(&cache)?)
+}
+
 pub fn cached_assets(now: DateTime<Utc>) -> Option<Vec<Asset>> {
     cached_assets_in(&home().ok()?, now)
 }
@@ -126,7 +166,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wl = load_watchlist_in(dir.path()).unwrap();
         assert_eq!(wl[0], "SPY");
-        assert_eq!(wl.len(), DEFAULT_WATCHLIST.len());
+        // Stocks, then the default pairs.
+        assert_eq!(wl.len(), DEFAULT_WATCHLIST.len() + super::super::fx::DEFAULT_PAIRS.len());
+        assert_eq!(wl[DEFAULT_WATCHLIST.len()], "EUR_USD");
 
         save_watchlist_in(dir.path(), &["tsla".into(), "TSLA".into(), " amd ".into()]).unwrap();
         // Normalised + de-duplicated on load.
@@ -138,6 +180,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         save_watchlist_in(dir.path(), &[]).unwrap();
         assert!(load_watchlist_in(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn existing_lists_get_the_default_pairs_once_and_sections_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pre-forex file: no pairs, no fx_seeded flag.
+        std::fs::write(tui_path(dir.path()), r#"{"watchlist":["TSLA","AMD"]}"#).unwrap();
+        let wl = load_watchlist_in(dir.path()).unwrap();
+        assert_eq!(&wl[..3], ["TSLA", "AMD", "EUR_USD"]);
+        // Once saved, removing every pair sticks.
+        save_watchlist_in(dir.path(), &["TSLA".into()]).unwrap();
+        assert_eq!(load_watchlist_in(dir.path()).unwrap(), vec!["TSLA"]);
+        // Mixed order on disk loads as stocks, then pairs.
+        save_watchlist_in(dir.path(), &["GBP_USD".into(), "TSLA".into(), "EUR_USD".into()])
+            .unwrap();
+        assert_eq!(
+            load_watchlist_in(dir.path()).unwrap(),
+            vec!["TSLA", "GBP_USD", "EUR_USD"]
+        );
     }
 
     #[test]

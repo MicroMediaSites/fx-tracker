@@ -555,7 +555,15 @@ pub struct StreamPrice {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PriceBucket {
     pub price: String,
+    #[serde(default)]
     pub liquidity: i64,
+}
+
+/// `GET /v3/accounts/{id}/pricing` response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PricingResponse {
+    #[serde(default)]
+    pub prices: Vec<StreamPrice>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

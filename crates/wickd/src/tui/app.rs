@@ -333,6 +333,8 @@ pub struct App {
     pub watchlist: Vec<String>,
     pub selected: usize,
     pub snapshots: HashMap<String, Snapshot>,
+    /// Forex pair quotes (OANDA), keyed like `snapshots`.
+    pub fx_quotes: HashMap<String, super::fx::FxQuote>,
     /// Today's closes per symbol, for the watchlist sparkline.
     pub sparks: HashMap<String, Vec<f64>>,
     pub assets: Vec<Asset>,
@@ -350,6 +352,8 @@ pub struct App {
     pub find: Option<FindState>,
     pub inplay: InPlayState,
     pub quotes_error: Option<String>,
+    /// Last OANDA (forex) failure, shown on the forex section.
+    pub fx_error: Option<String>,
     pub last_quotes: Option<DateTime<Local>>,
     /// Transient one-line message for the footer.
     pub flash: Option<String>,
@@ -368,6 +372,7 @@ impl App {
             watchlist,
             selected: 0,
             snapshots: HashMap::new(),
+            fx_quotes: HashMap::new(),
             sparks: HashMap::new(),
             assets: Vec::new(),
             asset_index: HashMap::new(),
@@ -381,6 +386,7 @@ impl App {
             find: None,
             inplay: InPlayState::default(),
             quotes_error: None,
+            fx_error: None,
             last_quotes: None,
             flash: None,
             undo: None,
@@ -392,7 +398,23 @@ impl App {
 
     // ── data updates ────────────────────────────────────────────────────────
 
+    /// Replace the stock search entries (forex entries are kept).
     pub fn set_assets(&mut self, assets: Vec<Asset>) {
+        self.merge_assets(false, assets);
+    }
+
+    /// Replace the forex search entries (stock entries are kept).
+    pub fn set_fx_assets(&mut self, assets: Vec<Asset>) {
+        self.merge_assets(true, assets);
+    }
+
+    fn merge_assets(&mut self, fx: bool, incoming: Vec<Asset>) {
+        let is_fx = |a: &Asset| a.exchange == super::fx::FX_EXCHANGE;
+        let mut assets: Vec<Asset> = std::mem::take(&mut self.assets)
+            .into_iter()
+            .filter(|a| is_fx(a) != fx)
+            .collect();
+        assets.extend(incoming);
         self.asset_index = assets
             .iter()
             .enumerate()
@@ -455,6 +477,34 @@ impl App {
 
     pub fn selected_symbol(&self) -> Option<&str> {
         self.watchlist.get(self.selected).map(String::as_str)
+    }
+
+    /// Index of the first forex pair (the watchlist is stocks, then pairs);
+    /// `watchlist.len()` when there are none.
+    pub fn fx_start(&self) -> usize {
+        self.watchlist
+            .iter()
+            .position(|s| super::fx::is_fx(s))
+            .unwrap_or(self.watchlist.len())
+    }
+
+    /// Forex pairs to quote (watchlist + an open pair's detail).
+    pub fn fx_symbols(&self) -> Vec<String> {
+        self.quote_symbols()
+            .into_iter()
+            .filter(|s| super::fx::is_fx(s))
+            .collect()
+    }
+
+    /// Where a symbol belongs when (re)inserted near `idx`: inside its own
+    /// section.
+    fn section_index(&self, sym: &str, idx: usize) -> usize {
+        let start = self.fx_start();
+        if super::fx::is_fx(sym) {
+            idx.clamp(start, self.watchlist.len())
+        } else {
+            idx.min(start)
+        }
     }
 
     pub fn in_watchlist(&self, symbol: &str) -> bool {
@@ -526,6 +576,19 @@ impl App {
             Cmd::Search => self.open_search(),
             Cmd::Find => self.open_find(),
             Cmd::GoInPlay => return self.open_inplay(),
+            Cmd::GoStocks if len > 0 => {
+                self.find = None;
+                self.selected = 0;
+            }
+            Cmd::GoForex => {
+                let start = self.fx_start();
+                if start < len {
+                    self.find = None;
+                    self.selected = start;
+                } else {
+                    self.flash = Some("no forex pairs — / to search, tab to add".into());
+                }
+            }
             Cmd::WatchAdd => {
                 self.open_search();
                 self.flash = Some("find a symbol, then tab to add it".into());
@@ -536,12 +599,23 @@ impl App {
                     return self.open_detail(sym, Mode::Watchlist);
                 }
             }
-            Cmd::WatchMoveDown if len > 1 && self.selected + 1 < len => {
+            // Moves stay inside a section (stocks above, pairs below).
+            Cmd::WatchMoveDown
+                if len > 1
+                    && self.selected + 1 < len
+                    && super::fx::is_fx(&self.watchlist[self.selected])
+                        == super::fx::is_fx(&self.watchlist[self.selected + 1]) =>
+            {
                 self.watchlist.swap(self.selected, self.selected + 1);
                 self.selected += 1;
                 return vec![Action::SaveWatchlist];
             }
-            Cmd::WatchMoveUp if self.selected > 0 && len > 1 => {
+            Cmd::WatchMoveUp
+                if self.selected > 0
+                    && len > 1
+                    && super::fx::is_fx(&self.watchlist[self.selected])
+                        == super::fx::is_fx(&self.watchlist[self.selected - 1]) =>
+            {
                 self.watchlist.swap(self.selected, self.selected - 1);
                 self.selected -= 1;
                 return vec![Action::SaveWatchlist];
@@ -558,7 +632,7 @@ impl App {
             Cmd::WatchUndo => {
                 if let Some((idx, sym)) = self.undo.take() {
                     if !self.in_watchlist(&sym) {
-                        let idx = idx.min(self.watchlist.len());
+                        let idx = self.section_index(&sym, idx);
                         self.watchlist.insert(idx, sym.clone());
                         self.selected = idx;
                         self.flash = Some(format!("restored {sym}"));
@@ -1003,7 +1077,7 @@ impl App {
         vec![]
     }
 
-    fn toggle_watchlist(&mut self, sym: String) -> Vec<Action> {
+    pub(super) fn toggle_watchlist(&mut self, sym: String) -> Vec<Action> {
         if let Some(pos) = self.watchlist.iter().position(|s| *s == sym) {
             self.watchlist.remove(pos);
             if self.selected >= self.watchlist.len() {
@@ -1012,7 +1086,9 @@ impl App {
             self.flash = Some(format!("removed {sym} from watchlist"));
             vec![Action::SaveWatchlist]
         } else {
-            self.watchlist.push(sym.clone());
+            // Stocks go at the end of the stocks section, pairs at the end.
+            let idx = self.section_index(&sym, self.watchlist.len());
+            self.watchlist.insert(idx, sym.clone());
             self.flash = Some(format!("added {sym} to watchlist"));
             vec![Action::SaveWatchlist, Action::RefreshQuotes]
         }
@@ -1487,6 +1563,44 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn watchlist_sections_jump_move_and_add_in_place() {
+        let mut a = App::new(
+            vec!["SPY".into(), "QQQ".into(), "EUR_USD".into(), "USD_JPY".into()],
+            "IEX",
+        );
+        assert_eq!(a.fx_start(), 2);
+        typ(&mut a, "gx");
+        assert_eq!(a.selected, 2);
+        // Moving the first pair up would cross into stocks: refused.
+        typ(&mut a, "wk");
+        assert_eq!((a.watchlist[2].as_str(), a.selected), ("EUR_USD", 2));
+        typ(&mut a, "gs");
+        assert_eq!(a.selected, 0);
+        // A new stock lands at the end of stocks, a new pair at the very end.
+        a.toggle_watchlist("AAPL".into());
+        a.toggle_watchlist("GBP_USD".into());
+        assert_eq!(
+            a.watchlist,
+            ["SPY", "QQQ", "AAPL", "EUR_USD", "USD_JPY", "GBP_USD"]
+        );
+        assert_eq!(a.fx_symbols(), ["EUR_USD", "USD_JPY", "GBP_USD"]);
+    }
+
+    #[test]
+    fn forex_search_entries_survive_a_stock_list_refresh() {
+        let mut a = app();
+        let pair = Asset {
+            symbol: "EUR_USD".into(),
+            name: "EUR/USD".into(),
+            exchange: super::super::fx::FX_EXCHANGE.into(),
+            tradable: true,
+        };
+        a.set_fx_assets(vec![pair.clone()]);
+        a.set_assets(vec![]);
+        assert_eq!(a.asset("EUR_USD"), Some(&pair));
     }
 
     #[test]

@@ -12,19 +12,160 @@
 //! forex "day" is the trading day that rolls at 17:00 New York, so 1D shows
 //! the current trading day and 5D the last five.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
-use wickd_core::equities::{eastern_offset_hours, Bar, HistoryRange};
+use wickd_core::equities::{eastern_offset_hours, Asset, Bar, HistoryRange};
 use wickd_core::models::candle::Candle as OandaCandle;
 use wickd_core::oanda::endpoints::{self, Granularity};
 use wickd_core::oanda::OandaClient;
 
 use super::chart;
 
+/// Pairs a new watchlist starts with (wickd-forex D-6).
+pub const DEFAULT_PAIRS: [&str; 5] = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD"];
+
+/// `exchange` label on the search entries built from OANDA's instrument list.
+pub const FX_EXCHANGE: &str = "OANDA";
+
 /// True for an OANDA instrument name (`EUR_USD`), false for a stock symbol.
 pub fn is_fx(symbol: &str) -> bool {
     symbol.contains('_')
+}
+
+/// One pip: 0.01 for JPY-quoted pairs, else 0.0001 (OANDA's pipLocation for
+/// currencies).
+pub fn pip_size(symbol: &str) -> Decimal {
+    if symbol.ends_with("_JPY") {
+        dec!(0.01)
+    } else {
+        dec!(0.0001)
+    }
+}
+
+/// Price decimals OANDA quotes: 3 for JPY-quoted pairs, else 5.
+pub fn decimals(symbol: &str) -> u32 {
+    if symbol.ends_with("_JPY") {
+        3
+    } else {
+        5
+    }
+}
+
+/// A price difference in pips.
+pub fn pips(symbol: &str, delta: Decimal) -> Decimal {
+    delta / pip_size(symbol)
+}
+
+/// A pair's quote for the watchlist: the latest bid/ask plus the current
+/// trading day's open/high/low (exact, from OANDA's price strings) and its
+/// closes as f64 for the sparkline only (5-minute bars since 17:00 New York).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FxQuote {
+    pub bid: Decimal,
+    pub ask: Decimal,
+    pub time: DateTime<Utc>,
+    pub open: Option<Decimal>,
+    pub high: Option<Decimal>,
+    pub low: Option<Decimal>,
+    pub closes: Vec<f64>,
+}
+
+impl FxQuote {
+    pub fn mid(&self) -> Decimal {
+        (self.bid + self.ask) / dec!(2)
+    }
+
+    /// Change since the trading day's open (mid prices).
+    pub fn change(&self) -> Option<Decimal> {
+        self.open.map(|o| self.mid() - o)
+    }
+
+    pub fn change_pct(&self) -> Option<Decimal> {
+        self.open
+            .filter(|o| !o.is_zero())
+            .map(|o| (self.mid() - o) / o * dec!(100))
+    }
+}
+
+/// The trading day so far for one pair: (open, high, low, closes).
+type Day = (Option<Decimal>, Option<Decimal>, Option<Decimal>, Vec<f64>);
+
+async fn trading_day(client: &OandaClient, symbol: &str, from: &str) -> Day {
+    // A missing day (weekend, fetch error) only blanks the day columns.
+    let candles: Vec<OandaCandle> =
+        endpoints::get_candles(client, symbol, Granularity::M5, Some(5000), Some(from), None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.mid.close > Decimal::ZERO)
+            .collect();
+    (
+        candles.first().map(|c| c.mid.open),
+        candles.iter().map(|c| c.mid.high).max(),
+        candles.iter().map(|c| c.mid.low).min(),
+        candles.iter().map(|c| c.mid.close.to_f64().unwrap_or(0.0)).collect(),
+    )
+}
+
+/// Quotes for `pairs`: one pricing call for bid/ask, plus each pair's
+/// 5-minute bars since the trading day's open (fetched concurrently).
+pub async fn quotes(
+    client: &OandaClient,
+    pairs: &[String],
+    now: DateTime<Utc>,
+) -> Result<HashMap<String, FxQuote>, String> {
+    if pairs.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let prices = endpoints::get_pricing(client, pairs)
+        .await
+        .map_err(|e| format!("OANDA pricing: {e}"))?;
+    let from = trading_day_start(now).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let days = futures_util::future::join_all(
+        prices.iter().map(|p| trading_day(client, &p.instrument, &from)),
+    )
+    .await;
+    Ok(prices
+        .into_iter()
+        .zip(days)
+        .map(|(p, (open, high, low, closes))| {
+            (
+                p.instrument,
+                FxQuote {
+                    bid: p.bid,
+                    ask: p.ask,
+                    time: p.time,
+                    open,
+                    high,
+                    low,
+                    closes,
+                },
+            )
+        })
+        .collect())
+}
+
+/// OANDA's instrument list as search entries (`EUR_USD`, "EUR/USD").
+pub async fn instruments(client: &OandaClient) -> Result<Vec<Asset>, String> {
+    let list = endpoints::get_instruments(client)
+        .await
+        .map_err(|e| format!("OANDA instruments: {e}"))?;
+    let mut assets: Vec<Asset> = list
+        .into_iter()
+        .map(|i| Asset {
+            symbol: i.name,
+            name: i.display_name,
+            exchange: FX_EXCHANGE.to_string(),
+            tradable: true,
+        })
+        .collect();
+    assets.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    Ok(assets)
 }
 
 /// OANDA granularity for each range (same bar sizes as the stock ranges).
@@ -143,6 +284,24 @@ mod tests {
             volume: 1.0,
             vwap: None,
         }
+    }
+
+    #[test]
+    fn pips_decimals_and_change_are_exact() {
+        assert_eq!(decimals("EUR_USD"), 5);
+        assert_eq!(decimals("USD_JPY"), 3);
+        assert_eq!(pips("EUR_USD", dec!(0.00123)), dec!(12.3));
+        assert_eq!(pips("USD_JPY", dec!(0.25)), dec!(25));
+        let q = FxQuote {
+            bid: dec!(1.1154),
+            ask: dec!(1.1156),
+            time: t("2026-11-09T03:00:00Z"),
+            open: Some(dec!(1.1145)),
+            high: None,
+            low: None,
+            closes: vec![],
+        };
+        assert_eq!(pips("EUR_USD", q.change().unwrap()), dec!(10));
     }
 
     #[test]
