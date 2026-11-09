@@ -449,6 +449,10 @@ fn run_loop(
     let mut quotes_in_flight = false;
     let mut fx_in_flight = false;
     let mut pairs_wanted: Vec<String> = Vec::new();
+    // `wickd list` edits land while the TUI runs: reload lists.json when its
+    // modification time changes (checked every 2s).
+    let mut lists_check = Every::new(Duration::from_secs(2));
+    let mut lists_seen: Option<std::time::SystemTime> = None;
     // Rebuild the in-play list every minute while it's on screen.
     let mut inplay_timer = Every::new(Duration::from_secs(60));
 
@@ -503,6 +507,21 @@ fn run_loop(
                 Reply::InPlay(r) => actions.extend(app.set_inplay(r)),
                 Reply::News(sym, r) => app.set_news(sym, r),
                 Reply::Reader(ev) => actions.extend(app.set_reader(ev)),
+            }
+        }
+
+        if lists_check.due() || lists_seen.is_none() {
+            if let Ok(path) = crate::lists::lists_path() {
+                let mtime = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                if lists_seen != Some(mtime) {
+                    lists_seen = Some(mtime);
+                    match crate::lists::load_at(&path) {
+                        Ok(f) => app.set_lists(f),
+                        Err(e) => app.flash = Some(format!("lists.json: {e:#}")),
+                    }
+                }
             }
         }
 
@@ -617,6 +636,18 @@ fn run_loop(
                     if let Err(e) = store::save_watchlist(&app.watchlist) {
                         app.flash = Some(format!("could not save watchlist: {e:#}"));
                     }
+                }
+                Action::RemoveFromList { list, symbol } => {
+                    // Locked read-modify-write: never clobbers an agent's edits.
+                    let r = crate::lists::lists_path().and_then(|p| {
+                        crate::lists::update_at(&p, |f| {
+                            crate::lists::remove(f, &list, std::slice::from_ref(&symbol))
+                        })
+                    });
+                    if let Err(e) = r {
+                        app.flash = Some(format!("could not update list {list}: {e:#}"));
+                    }
+                    lists_seen = None; // reload to the file's truth
                 }
             }
         }

@@ -68,6 +68,7 @@ pub enum Cmd {
     GoWatchlist,
     GoInPlay,
     GoStocks,
+    GoLists,
     GoForex,
     Find,
     FocusNews,
@@ -250,6 +251,7 @@ pub static BINDINGS: &[Binding] = &[
     pre('g', &[K::Number], Cmd::GoRow, "row n (then g)", W),
     pre('g', &[K::Char('w')], Cmd::GoWatchlist, "watchlist", DI),
     pre('g', &[K::Char('i')], Cmd::GoInPlay, "in play today", WD),
+    pre('g', &[K::Char('l')], Cmd::GoLists, "lists (wickd list)", W),
     pre('g', &[K::Char('s')], Cmd::GoStocks, "stocks section", W),
     pre('g', &[K::Char('x')], Cmd::GoForex, "forex section", W),
     pre(

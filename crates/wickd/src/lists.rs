@@ -4,8 +4,8 @@
 //! optional note (why it's there). Lists are separate from the TUI's general
 //! watchlist (`tui.json`), from the in-play screen, and from the forex
 //! streamer's `~/.wickd/watchlist.json`. They are the agent-facing surface:
-//! `wickd list …` writes them; the TUI will show them as watchlist sections
-//! (AGT-2392).
+//! `wickd list …` writes them; the TUI shows them as watchlist sections and
+//! can remove entries.
 //!
 //! ## Writers
 //!

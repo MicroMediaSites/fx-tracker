@@ -119,8 +119,8 @@ enum Command {
     Tui(TuiArgs),
     /// Alpaca market-data keys for `wickd tui`: login | status | logout.
     Alpaca(AlpacaArgs),
-    /// Named symbol lists with notes (agent-writable): ls | show | add | rm |
-    /// clear | delete.
+    /// Named symbol lists with notes (agent-writable; TUI watchlist sections):
+    /// ls | show | add | rm | clear | delete.
     List(ListArgs),
     /// List built-in strategies, or run one over candles → JSON signals.
     Strategy(StrategyArgs),

@@ -52,7 +52,7 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   back out (`esc`), search (`/`), refresh (`r`) and quit (`q`). A prefix letter
   opens a category, and a panel lists the next keys:
   - `g` go to: `g g` top, `g e` end, `g <n> g` row n, `g w` watchlist, `g i`
-    in play today, `g s` / `g x` the stocks / forex section.
+    in play today, `g l` / `g s` / `g x` the lists / stocks / forex section.
   - `w` watchlist: `w a` add, `w d` remove, `w u` undo, `w j`/`w k` move.
   - `t` time range: `t d`/`t w`/`t m`/`t 6`/`t y`/`t 5`/`t a` for
     1D/5D/1M/6M/1Y/5Y/MAX.
@@ -177,8 +177,10 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 Lists of stocks and/or forex pairs, each symbol with an optional note, kept in
 `~/.wickd/lists.json`. They're separate from the TUI watchlist and the in-play
 screen, and they're the way an agent builds a list for you (say, what to watch
-tomorrow) with these commands. (The TUI's list sections arrive with the next
-change, AGT-2392.)
+tomorrow) with these commands, and `wickd tui` shows each list as a section
+at the top of the watchlist screen (symbol, note, price, change). The TUI
+picks up changes within ~2 seconds while it's open; `g l` jumps to the lists,
+and `w d` on a list row removes it from that list.
 
 ```sh
 wickd list add tomorrow NVDA AMD --note "earnings beat; watch 185"
