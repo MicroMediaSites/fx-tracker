@@ -1098,13 +1098,27 @@ fn render_chart_view(
     // 50/200-day averages (daily ranges; warm-up bars make the 200-day span
     // the whole chart). Daily ranges are never session-filtered, so candle
     // bar indices line up with the visible bars.
-    let overlays = match (d.chart.ma && chart::ma_range(range), d.bars()) {
-        (true, Some(vis)) => chart::moving_averages(
-            d.warmup.get(&range).map_or(&[][..], Vec::as_slice),
-            vis,
-            &candles,
-        ),
+    let warm = d.warmup.get(&range).map_or(&[][..], Vec::as_slice);
+    let mut overlays = match (d.chart.ma && chart::ma_range(range), d.bars()) {
+        (true, Some(vis)) => chart::moving_averages(warm, vis, &candles),
         _ => Vec::new(),
+    };
+    // Ichimoku on the same bars the candles were built from (session-filtered
+    // on intraday ranges; daily ranges get the warm-up history so the cloud
+    // spans the whole chart).
+    let (cloud, future) = match (d.chart.ichimoku, d.bars()) {
+        (true, Some(bars)) => {
+            let (vis, _) = chart::session_bars(bars, range, d.chart.extended);
+            let warm = if chart::ma_range(range) {
+                warm
+            } else {
+                &[][..]
+            };
+            let (ov, cloud, fut) = chart::ichimoku_overlays(warm, &vis, &candles);
+            overlays.extend(ov);
+            (Some(cloud), fut)
+        }
+        _ => (None, 0),
     };
     let zoom = d.chart.zoom_level();
     let mut title = format!(
@@ -1138,6 +1152,9 @@ fn render_chart_view(
     if delayed {
         title.push_str(" · 15m delayed");
     }
+    if d.chart.ichimoku {
+        title.push_str(" · Ichimoku 9/26/52");
+    }
     if d.chart.ma {
         title.push_str(if chart::ma_range(range) {
             " · MA 50/200"
@@ -1163,6 +1180,8 @@ fn render_chart_view(
             last_price: snap.and_then(Snapshot::last),
             delayed,
             overlays: &overlays,
+            cloud: cloud.as_ref(),
+            future,
             fmt_price,
             fmt_volume,
             time_label: &time_label,
@@ -1765,6 +1784,15 @@ mod tests {
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('m'));
         shoot(&app, "4b-1y-moving-averages");
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('i'));
+        shoot(&app, "4c-1y-ichimoku");
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('m'));
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('m'));
         app.snapshots

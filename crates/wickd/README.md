@@ -126,6 +126,11 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   200 extra trading days are fetched behind the window (in the same request)
   so the 200-day line spans the whole chart. Their values at the cursor show
   in the readout.
+  `v i` toggles the Ichimoku cloud (9/26/52, desktop-app colours): tenkan,
+  kijun, chikou, and the cloud between senkou A and B as a faint green or red
+  tint, projected 26 periods ahead into reserved space right of the newest
+  candle. On the 6M and 1Y charts it uses the same warm-up history, so the
+  cloud spans the whole chart. Elsewhere it is computed on that range's bars.
 - **Data**. Quotes poll every 15s (`--refresh`). On the free plan, live quotes
   are IEX-only (about 3% of volume). `--feed delayed-sip` trades that for
   all-exchange quotes 15 minutes behind. History is always consolidated and

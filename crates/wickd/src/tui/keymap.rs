@@ -58,6 +58,7 @@ pub enum Cmd {
     ZoomReset,
     ToggleExtended,
     ToggleMa,
+    ToggleIchimoku,
     Range(HistoryRange),
     GoTop,
     GoEnd,
@@ -326,6 +327,13 @@ pub static BINDINGS: &[Binding] = &[
         &[K::Char('m')],
         Cmd::ToggleMa,
         "50/200-day averages",
+        D,
+    ),
+    pre(
+        'v',
+        &[K::Char('i')],
+        Cmd::ToggleIchimoku,
+        "Ichimoku cloud",
         D,
     ),
     pre(

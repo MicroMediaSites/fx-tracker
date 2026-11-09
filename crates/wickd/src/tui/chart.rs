@@ -230,6 +230,141 @@ pub fn moving_averages(warmup: &[Bar], visible: &[Bar], candles: &[Candle]) -> V
     ]
 }
 
+// ── Ichimoku ────────────────────────────────────────────────────────────────
+
+/// Standard settings: tenkan 9, kijun 26, senkou B 52, displacement 26.
+pub const ICHI_TENKAN: usize = 9;
+pub const ICHI_KIJUN: usize = 26;
+pub const ICHI_SENKOU_B: usize = 52;
+pub const ICHI_SHIFT: usize = 26;
+
+// Same palette as the wickd desktop app (INDICATOR_COLORS).
+pub const TENKAN_COLOR: Color = Color::Rgb(212, 164, 57);
+pub const KIJUN_COLOR: Color = Color::Rgb(74, 144, 194);
+pub const SPAN_A_COLOR: Color = Color::Rgb(118, 168, 126);
+pub const SPAN_B_COLOR: Color = Color::Rgb(194, 120, 120);
+pub const CHIKOU_COLOR: Color = Color::Rgb(220, 220, 220);
+/// Faint cloud tints (span A above B / below B).
+pub const CLOUD_UP: Color = Color::Rgb(22, 52, 44);
+pub const CLOUD_DOWN: Color = Color::Rgb(60, 30, 36);
+
+/// The cloud's two edges, one value per candle slot (candles, then the
+/// projected slots to the right of the newest candle).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Cloud {
+    pub a: Vec<Option<f64>>,
+    pub b: Vec<Option<f64>>,
+}
+
+/// Ichimoku in *bar* space, extended [`ICHI_SHIFT`] bars into the future
+/// (where only the displaced spans have values).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IchimokuSeries {
+    pub tenkan: Vec<Option<f64>>,
+    pub kijun: Vec<Option<f64>>,
+    /// Senkou A, already displaced forward by [`ICHI_SHIFT`].
+    pub span_a: Vec<Option<f64>>,
+    /// Senkou B, already displaced forward by [`ICHI_SHIFT`].
+    pub span_b: Vec<Option<f64>>,
+    /// Chikou: the close [`ICHI_SHIFT`] bars later, plotted here.
+    pub chikou: Vec<Option<f64>>,
+}
+
+/// (highest high + lowest low) / 2 over the `p` bars ending at `i`.
+fn midpoint(bars: &[Bar], i: usize, p: usize) -> Option<f64> {
+    if i + 1 < p || i >= bars.len() {
+        return None;
+    }
+    let w = &bars[i + 1 - p..=i];
+    let h = w.iter().map(|b| b.high).fold(f64::NEG_INFINITY, f64::max);
+    let l = w.iter().map(|b| b.low).fold(f64::INFINITY, f64::min);
+    Some((h + l) / 2.0)
+}
+
+pub fn ichimoku_series(bars: &[Bar]) -> IchimokuSeries {
+    let n = bars.len();
+    let len = n + ICHI_SHIFT;
+    let tenkan: Vec<Option<f64>> = (0..len).map(|i| midpoint(bars, i, ICHI_TENKAN)).collect();
+    let kijun: Vec<Option<f64>> = (0..len).map(|i| midpoint(bars, i, ICHI_KIJUN)).collect();
+    let back = |i: usize| i.checked_sub(ICHI_SHIFT).filter(|j| *j < n);
+    let span_a = (0..len)
+        .map(|i| {
+            let j = back(i)?;
+            Some((tenkan[j]? + kijun[j]?) / 2.0)
+        })
+        .collect();
+    let span_b = (0..len)
+        .map(|i| midpoint(bars, back(i)?, ICHI_SENKOU_B))
+        .collect();
+    let chikou = (0..len)
+        .map(|i| bars.get(i + ICHI_SHIFT).map(|b| b.close))
+        .collect();
+    IchimokuSeries {
+        tenkan,
+        kijun,
+        span_a,
+        span_b,
+        chikou,
+    }
+}
+
+/// Ichimoku overlays + cloud for `candles` built from `visible` bars (with
+/// `warmup` bars before them), and how many projected slots they need to
+/// the right of the newest candle (26 bars, in candle units when merged).
+pub fn ichimoku_overlays(
+    warmup: &[Bar],
+    visible: &[Bar],
+    candles: &[Candle],
+) -> (Vec<Overlay>, Cloud, usize) {
+    let all: Vec<Bar> = warmup.iter().chain(visible).cloned().collect();
+    let s = ichimoku_series(&all);
+    let off = warmup.len();
+    let Some(last) = candles.last() else {
+        return (Vec::new(), Cloud::default(), 0);
+    };
+    let k = last.bars.max(1);
+    let future = ICHI_SHIFT.div_ceil(k);
+    let sample = |v: &[Option<f64>]| -> Vec<Option<f64>> {
+        candles
+            .iter()
+            .map(|c| v.get(off + c.end).copied().flatten())
+            .chain((1..=future).map(|j| v.get(off + last.end + j * k).copied().flatten()))
+            .collect()
+    };
+    let overlays = vec![
+        Overlay {
+            label: "Tenkan",
+            color: TENKAN_COLOR,
+            values: sample(&s.tenkan),
+        },
+        Overlay {
+            label: "Kijun",
+            color: KIJUN_COLOR,
+            values: sample(&s.kijun),
+        },
+        Overlay {
+            label: "SpanA",
+            color: SPAN_A_COLOR,
+            values: sample(&s.span_a),
+        },
+        Overlay {
+            label: "SpanB",
+            color: SPAN_B_COLOR,
+            values: sample(&s.span_b),
+        },
+        Overlay {
+            label: "Chikou",
+            color: CHIKOU_COLOR,
+            values: sample(&s.chikou),
+        },
+    ];
+    let cloud = Cloud {
+        a: sample(&s.span_a),
+        b: sample(&s.span_b),
+    };
+    (overlays, cloud, future)
+}
+
 /// Simple moving average: element `i` averages `values[i+1-n..=i]`; `None`
 /// until `n` values exist (no fake early values).
 pub fn sma(values: &[f64], n: usize) -> Vec<Option<f64>> {
@@ -278,6 +413,8 @@ pub struct ChartView {
     pub extended: bool,
     /// Show the 50/200-day moving averages (daily ranges).
     pub ma: bool,
+    /// Show the Ichimoku cloud.
+    pub ichimoku: bool,
     /// Candles that fit, as last measured by the renderer.
     pub visible: Cell<usize>,
     /// Fit mode (the default): the whole range spread across the width,
@@ -295,6 +432,7 @@ impl Default for ChartView {
             right: None,
             extended: false,
             ma: false,
+            ichimoku: false,
             visible: Cell::new(60),
             fit: true,
             plot_cols: Cell::new(120),
@@ -666,7 +804,13 @@ pub struct ChartWidget<'a> {
     /// newest candle to the live price so the gap reads as "moved since".
     pub delayed: bool,
     /// Lines drawn over the candles (behind them), included in the scale.
+    /// May be longer than `candles` by `future` projected slots.
     pub overlays: &'a [Overlay],
+    /// Shaded band between two lines (the Ichimoku cloud), same indexing.
+    pub cloud: Option<&'a Cloud>,
+    /// Empty slots reserved right of the newest candle (Ichimoku projection)
+    /// while the window is pinned to the latest candle.
+    pub future: usize,
     pub fmt_price: fn(f64) -> String,
     pub fmt_volume: fn(f64) -> String,
     /// Full timestamp label for the readout.
@@ -704,9 +848,12 @@ impl Widget for ChartWidget<'_> {
         let plot_w = area.width.saturating_sub(axis_w);
         self.view.plot_cols.set(plot_w as usize);
         // Columns per candle (fractional in fit mode) and body width.
-        let (slot_f, bw, visible) = if self.view.fit {
-            let shown = n.min(plot_w.max(1) as usize);
-            let avg = f64::from(plot_w) / shown.max(1) as f64;
+        let (slot_f, bw, visible, fut) = if self.view.fit {
+            // Fit everything plus the projected slots across the width.
+            let total = (n + self.future).min(plot_w.max(1) as usize).max(1);
+            let fut = self.future.min(total.saturating_sub(1));
+            let shown = (total - fut).min(n).max(1);
+            let avg = f64::from(plot_w) / total as f64;
             let bw = if avg >= 6.0 {
                 5
             } else if avg >= 4.0 {
@@ -714,14 +861,16 @@ impl Widget for ChartWidget<'_> {
             } else {
                 1
             };
-            (avg, bw, shown)
+            (avg, bw, shown, fut)
         } else {
             let slot = zoom.slot().max(1) as usize;
-            (
-                slot as f64,
-                zoom.body() as usize,
-                (plot_w as usize / slot).max(1),
-            )
+            let slots = (plot_w as usize / slot).max(1);
+            let fut = if self.view.right.is_none() {
+                self.future.min(slots.saturating_sub(1))
+            } else {
+                0
+            };
+            (slot as f64, zoom.body() as usize, (slots - fut).max(1), fut)
         };
         self.view.visible.set(visible);
         let (start, end) = if self.view.fit {
@@ -729,6 +878,8 @@ impl Widget for ChartWidget<'_> {
         } else {
             self.view.window(n, visible)
         };
+        // Projection only when the newest candle is on screen.
+        let fut = if end == n { fut } else { 0 };
         let win = &self.candles[start..end];
         let cursor = self.view.cursor_idx(n);
 
@@ -747,7 +898,7 @@ impl Widget for ChartWidget<'_> {
         let x0 = area.x;
         let x_axis = area.x + plot_w;
         // Right-align a short window so the newest candle hugs the axis.
-        let used = (win.len() as f64 * slot_f).min(f64::from(plot_w));
+        let used = ((win.len() + fut) as f64 * slot_f).min(f64::from(plot_w));
         let xs = f64::from(x0) + (f64::from(plot_w) - used).max(0.0);
         let x_of = |i: usize| -> u16 { (xs + (i as f64 * slot_f).floor()) as u16 };
 
@@ -767,8 +918,17 @@ impl Widget for ChartWidget<'_> {
             hi = hi.max(p);
         }
         // Overlays in the visible window stay on scale too.
-        for o in self.overlays {
-            for v in o.values.get(start..end).unwrap_or(&[]).iter().flatten() {
+        let span = start..end + fut;
+        for vals in self
+            .overlays
+            .iter()
+            .map(|o| &o.values)
+            .chain(self.cloud.iter().flat_map(|c| [&c.a, &c.b]))
+        {
+            let slice = vals
+                .get(span.start..span.end.min(vals.len()))
+                .unwrap_or(&[]);
+            for v in slice.iter().flatten() {
                 lo = lo.min(*v);
                 hi = hi.max(*v);
             }
@@ -835,7 +995,7 @@ impl Widget for ChartWidget<'_> {
                 .overlays
                 .iter()
                 .flat_map(|o| {
-                    let pts: Vec<Option<(f64, f64)>> = (start..end)
+                    let pts: Vec<Option<(f64, f64)>> = (start..end + fut)
                         .map(|i| {
                             o.values.get(i).copied().flatten().map(|v| {
                                 let x = f64::from(x_of(i - start) - x0) + bw as f64 / 2.0;
@@ -867,6 +1027,29 @@ impl Widget for ChartWidget<'_> {
                     }
                 })
                 .render(Rect::new(x0, y0, plot_w, price_rows), buf);
+        }
+
+        // Cloud: a faint background tint between its edges. Painted after the
+        // overlay Canvas (which resets the background of its whole area) and
+        // before the candles; it only sets backgrounds, so lines show through.
+        if let Some(cl) = self.cloud {
+            for i in start..end + fut {
+                let (Some(a), Some(b)) = (
+                    cl.a.get(i).copied().flatten(),
+                    cl.b.get(i).copied().flatten(),
+                ) else {
+                    continue;
+                };
+                let tint = if a >= b { CLOUD_UP } else { CLOUD_DOWN };
+                let (top, bot) = (row_of(a.max(b)), row_of(a.min(b)));
+                let xa = x_of(i - start);
+                let xb = x_of(i - start + 1).max(xa + 1).min(x_axis);
+                for x in xa..xb {
+                    for r in top..=bot.min(price_rows - 1) {
+                        buf[(x, y0 + r)].set_bg(tint);
+                    }
+                }
+            }
         }
 
         // Cursor column (behind the candles).
@@ -1251,6 +1434,8 @@ mod tests {
             last_price: None,
             delayed: false,
             overlays: &ov,
+            cloud: None,
+            future: 0,
             fmt_price: |p| format!("{p:.2}"),
             fmt_volume: |v| format!("{v:.0}"),
             time_label: &label,
@@ -1312,6 +1497,148 @@ mod tests {
         );
     }
 
+    fn ichi_bars(n: usize) -> Vec<Bar> {
+        // Exact quarter values so Decimal and f64 agree bit for bit.
+        (0..n)
+            .map(|i| {
+                let base = 100.0 + ((i * 7) % 23) as f64 * 0.25 - ((i * 3) % 11) as f64 * 0.5;
+                bar(
+                    "2026-01-01T05:00:00Z",
+                    base,
+                    base + 1.25 + (i % 5) as f64 * 0.25,
+                    base - 1.0 - (i % 3) as f64 * 0.25,
+                    base + 0.5,
+                    1.0,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ichimoku_matches_the_existing_wickd_core_indicator() {
+        use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+        use wickd_core::backtest::indicators::{IchimokuIndicator, Indicator};
+        use wickd_core::models::{Candle as FxCandle, Ohlc};
+        let bars = ichi_bars(120);
+        let ours = ichimoku_series(&bars);
+        let mut theirs = IchimokuIndicator::new(9, 26, 52, 26);
+        let d = |x: f64| rust_decimal::Decimal::from_f64(x).unwrap();
+        for (i, b) in bars.iter().enumerate() {
+            let out = theirs.on_candle(&FxCandle {
+                time: b.time,
+                mid: Ohlc {
+                    open: d(b.open),
+                    high: d(b.high),
+                    low: d(b.low),
+                    close: d(b.close),
+                },
+                volume: 1,
+                complete: true,
+            });
+            let get = |k: &str| out.get(k).and_then(|v| v.to_f64());
+            assert_eq!(ours.tenkan[i], get("tenkan"), "tenkan @{i}");
+            assert_eq!(ours.kijun[i], get("kijun"), "kijun @{i}");
+            // Raw (undisplaced) senkou at bar i is ours at i + 26.
+            assert_eq!(
+                ours.span_a[i + ICHI_SHIFT],
+                get("senkou_a_raw"),
+                "span A @{i}"
+            );
+            assert_eq!(
+                ours.span_b[i + ICHI_SHIFT],
+                get("senkou_b_raw"),
+                "span B @{i}"
+            );
+            // Chikou: the close at bar i, plotted 26 bars back.
+            if i >= ICHI_SHIFT {
+                assert_eq!(
+                    ours.chikou[i - ICHI_SHIFT],
+                    get("chikou_raw"),
+                    "chikou @{i}"
+                );
+            }
+        }
+        // The future tail only has the displaced spans.
+        let last = bars.len() + ICHI_SHIFT - 1;
+        assert!(
+            ours.span_a[last].is_some()
+                && ours.tenkan[last].is_none()
+                && ours.chikou[last].is_none()
+        );
+    }
+
+    #[test]
+    fn ichimoku_overlays_project_26_bars_in_candle_units() {
+        let warm = ichi_bars(80);
+        let vis = ichi_bars(60);
+        let fine = build(&vis, 1);
+        let (ov, cloud, fut) = ichimoku_overlays(&warm, &vis, &fine);
+        assert_eq!(fut, 26);
+        assert_eq!(ov.len(), 5);
+        assert_eq!(cloud.a.len(), 60 + 26);
+        // With warm-up, the cloud and kijun exist from the first candle.
+        assert!(cloud.a[0].is_some() && cloud.b[0].is_some() && ov[1].values[0].is_some());
+        // Merged ×3: 26 bars ahead = 9 candle slots.
+        let merged = build(&vis, 3);
+        let (_, cloud3, fut3) = ichimoku_overlays(&warm, &vis, &merged);
+        assert_eq!(fut3, 9);
+        assert_eq!(cloud3.a.len(), merged.len() + 9);
+    }
+
+    #[test]
+    fn cloud_is_tinted_and_the_projection_leaves_room_right_of_the_last_candle() {
+        let warm = ichi_bars(80);
+        let vis = ichi_bars(60);
+        let candles = build(&vis, 1);
+        let (ov, cloud, fut) = ichimoku_overlays(&warm, &vis, &candles);
+        let v = ChartView::default(); // fit
+        let area = Rect::new(0, 0, 120, 26);
+        let mut buf = Buffer::empty(area);
+        let label = |t: DateTime<Utc>| t.format("%H:%M").to_string();
+        let boundary = |_p: Option<DateTime<Utc>>, _t: DateTime<Utc>| None;
+        ChartWidget {
+            candles: &candles,
+            view: &v,
+            style: Style2::Candles,
+            reference: None,
+            last_price: None,
+            delayed: false,
+            overlays: &ov,
+            cloud: Some(&cloud),
+            future: fut,
+            fmt_price: |p| format!("{p:.2}"),
+            fmt_volume: |v| format!("{v:.0}"),
+            time_label: &label,
+            boundary: &boundary,
+            palette: Palette {
+                up: Color::Green,
+                down: Color::Red,
+                dim: Color::DarkGray,
+                grid: Color::Gray,
+                text: Color::White,
+            },
+        }
+        .render(area, &mut buf);
+        let tinted = (0..26u16)
+            .flat_map(|y| (0..120u16).map(move |x| (x, y)))
+            .filter(|&(x, y)| matches!(buf[(x, y)].bg, CLOUD_UP | CLOUD_DOWN))
+            .count();
+        assert!(tinted > 50, "cloud tint cells: {tinted}");
+        // The rightmost candle body sits well left of the axis (room for 26
+        // projected slots); the projection still has tint.
+        let body_cols: Vec<u16> = (0..120u16)
+            .filter(|&x| {
+                (1..20u16)
+                    .any(|y| matches!(buf[(x, y)].symbol(), "█" | "┃" | "▀" | "▄" | "╹" | "╻"))
+            })
+            .collect();
+        let last_body = *body_cols.iter().max().unwrap();
+        assert!(last_body < 85, "last candle at col {last_body}");
+        let tint_right = (last_body + 3..105u16)
+            .any(|x| (1..20u16).any(|y| matches!(buf[(x, y)].bg, CLOUD_UP | CLOUD_DOWN)));
+        assert!(tint_right, "projected cloud drawn right of the last candle");
+    }
+
     #[test]
     fn ticks_and_volume_cap() {
         assert_eq!(nice_step(10.0, 5), 2.0);
@@ -1363,6 +1690,8 @@ mod tests {
             last_price: None,
             delayed: false,
             overlays: &[],
+            cloud: None,
+            future: 0,
             fmt_price: |p| format!("{p:.2}"),
             fmt_volume: |v| format!("{v:.0}"),
             time_label: &label,
@@ -1465,6 +1794,8 @@ mod tests {
                 last_price: Some(candles[29].close + 2.0),
                 delayed,
                 overlays: &[],
+                cloud: None,
+                future: 0,
                 fmt_price: |p| format!("{p:.2}"),
                 fmt_volume: |v| format!("{v:.0}"),
                 time_label: &label,
