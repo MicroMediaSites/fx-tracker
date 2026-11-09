@@ -189,6 +189,37 @@ impl Drop for Flock<'_> {
     }
 }
 
+/// The date a list is for, when its name ends in `M-D` (`mon-11-9` →
+/// Nov 9). The year comes from when the list was made (a December-made list
+/// for January rolls into the next year).
+pub fn name_date(name: &str, made: DateTime<Utc>) -> Option<chrono::NaiveDate> {
+    use chrono::Datelike;
+    let mut parts = name.rsplit('-');
+    let d: u32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let made = made.date_naive();
+    let year = if m < made.month() && made.month() - m > 6 {
+        made.year() + 1
+    } else {
+        made.year()
+    };
+    chrono::NaiveDate::from_ymd_opt(year, m, d)
+}
+
+/// Lists in display order: by the date in the name (day plans like
+/// `mon-11-9` run in calendar order), otherwise by when the list was made.
+pub fn ordered(file: ListsFile) -> Vec<(String, Vec<Entry>)> {
+    let key = |name: &str, entries: &[Entry]| -> chrono::NaiveDate {
+        let made = entries.iter().map(|e| e.added).min();
+        made.and_then(|m| name_date(name, m))
+            .or_else(|| made.map(|m| m.date_naive()))
+            .unwrap_or(chrono::NaiveDate::MAX)
+    };
+    let mut v: Vec<(String, Vec<Entry>)> = file.lists.into_iter().collect();
+    v.sort_by(|(an, ae), (bn, be)| key(an, ae).cmp(&key(bn, be)).then(an.cmp(bn)));
+    v
+}
+
 /// List names: lowercase letters, digits, `-` and `_` (they're typed in
 /// commands and shown as section titles).
 pub fn validate_name(name: &str) -> Result<String> {
@@ -330,6 +361,21 @@ mod tests {
         let gone = remove(&mut f, "tomorrow", &["AMD".into(), "TSLA".into()]).unwrap();
         assert_eq!(gone, ["AMD"]);
         assert!(remove(&mut f, "nope", &["X".into()]).is_err());
+    }
+
+    #[test]
+    fn day_lists_sort_by_the_date_in_their_name() {
+        let mut f = ListsFile::default();
+        for name in ["fri-11-13", "mon-11-9", "thu-11-12", "ideas", "tue-11-10", "wed-11-11"] {
+            add(&mut f, name, &["SPY".into()], &Plan::default(), now());
+        }
+        let names: Vec<String> = ordered(f).into_iter().map(|(n, _)| n).collect();
+        // `ideas` has no date: it sorts by when it was made (Nov 9, tying
+        // mon-11-9's date; ties go by name).
+        assert_eq!(names, ["ideas", "mon-11-9", "tue-11-10", "wed-11-11", "thu-11-12", "fri-11-13"]);
+        let dec: DateTime<Utc> = "2026-12-28T00:00:00Z".parse().unwrap();
+        assert_eq!(name_date("mon-1-4", dec), chrono::NaiveDate::from_ymd_opt(2027, 1, 4));
+        assert_eq!(name_date("swing", dec), None);
     }
 
     #[test]

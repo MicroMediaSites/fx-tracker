@@ -398,6 +398,9 @@ pub struct App {
     /// Rows count lists first, then the watchlist: `selected` indexes that
     /// combined order (see [`App::row`]).
     pub lists: Vec<(String, Vec<crate::lists::Entry>)>,
+    /// The one list shown expanded (index into `lists`); the others collapse
+    /// to a header line. Only its entries are rows.
+    pub expanded: usize,
     pub selected: usize,
     pub snapshots: HashMap<String, Snapshot>,
     /// Forex pair quotes (OANDA), keyed like `snapshots`.
@@ -448,6 +451,7 @@ impl App {
         Self {
             watchlist,
             lists: Vec::new(),
+            expanded: 0,
             selected: 0,
             snapshots: HashMap::new(),
             fx_quotes: HashMap::new(),
@@ -623,7 +627,7 @@ impl App {
 
     /// Rows taken by the list sections (they come before the watchlist).
     pub fn list_rows(&self) -> usize {
-        self.lists.iter().map(|(_, e)| e.len()).sum()
+        self.lists.get(self.expanded).map_or(0, |(_, e)| e.len())
     }
 
     /// Every row on the watchlist screen: list entries, then the watchlist.
@@ -633,12 +637,9 @@ impl App {
 
     /// What a row is.
     pub fn row(&self, r: usize) -> Option<ScreenRow> {
-        let mut base = 0;
-        for (li, (_, entries)) in self.lists.iter().enumerate() {
-            if r < base + entries.len() {
-                return Some(ScreenRow::List(li, r - base));
-            }
-            base += entries.len();
+        let base = self.list_rows();
+        if r < base {
+            return Some(ScreenRow::List(self.expanded, r));
         }
         (r - base < self.watchlist.len()).then_some(ScreenRow::Watch(r - base))
     }
@@ -669,7 +670,14 @@ impl App {
             };
             (list, sym)
         });
-        self.lists = file.lists.into_iter().collect();
+        let open = self.lists.get(self.expanded).map(|(n, _)| n.clone());
+        self.lists = crate::lists::ordered(file);
+        // Keep the open list open; on first load open today's day list (or
+        // the next one coming), else the first.
+        self.expanded = match open.and_then(|n| self.lists.iter().position(|(m, _)| *m == n)) {
+            Some(i) => i,
+            None => self.default_expanded(),
+        };
         let found = keep.and_then(|(list, sym)| {
             (0..self.total_rows()).find(|&r| {
                 self.row_symbol(r) == Some(sym.as_str())
@@ -681,6 +689,25 @@ impl App {
             })
         });
         self.selected = found.unwrap_or(self.selected).min(self.total_rows().saturating_sub(1));
+    }
+
+    /// Today's day list, else the next dated one coming, else the first.
+    fn default_expanded(&self) -> usize {
+        let today = Local::now().date_naive();
+        let dated: Vec<(usize, chrono::NaiveDate)> = self
+            .lists
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (name, entries))| {
+                let made = entries.iter().map(|e| e.added).min()?;
+                Some((i, crate::lists::name_date(name, made)?))
+            })
+            .collect();
+        dated
+            .iter()
+            .find(|(_, d)| *d == today)
+            .or_else(|| dated.iter().find(|(_, d)| *d > today))
+            .map_or(0, |(i, _)| *i)
     }
 
     /// A row's list entry (its plan fields), if it's a list row.
@@ -888,11 +915,20 @@ impl App {
                 return self.open_info(sym);
             }
             Cmd::GoLists => {
-                if lr > 0 {
+                if self.lists.is_empty() {
+                    self.flash = Some("no lists yet — `wickd list add <name> SYM…`".into());
+                } else {
+                    // Already on a list: open the next one (wrapping).
+                    // Otherwise jump to the open list.
+                    if matches!(self.row(self.selected), Some(ScreenRow::List(..))) || lr == 0 {
+                        self.expanded = (self.expanded + 1) % self.lists.len();
+                    }
                     self.find = None;
                     self.selected = 0;
-                } else {
-                    self.flash = Some("no lists yet — `wickd list add <name> SYM…`".into());
+                    let (name, entries) = &self.lists[self.expanded];
+                    if entries.is_empty() {
+                        self.flash = Some(format!("{name} is empty"));
+                    }
                 }
             }
             Cmd::GoStocks if self.fx_start() > 0 => {
@@ -1997,6 +2033,43 @@ mod tests {
         // Moving a list row is a no-op; moving a watchlist row still works.
         typ(&mut a, "wj");
         assert_eq!(a.selected_symbol(), Some("GBP_USD"));
+    }
+
+    #[test]
+    fn one_list_open_at_a_time_and_g_l_cycles_with_wrap() {
+        let mut a = App::new(vec!["SPY".into()], "IEX");
+        a.set_lists(lists_file(&[
+            ("tue-11-10", &["AMD"]),
+            ("mon-11-9", &["NET", "ABNB"]),
+            ("wed-11-11", &["TSLA"]),
+        ]));
+        // Date order, not alphabetical.
+        let names: Vec<&str> = a.lists.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["mon-11-9", "tue-11-10", "wed-11-11"]);
+        // Only the open list's entries are rows.
+        let open = a.expanded;
+        assert_eq!(a.list_rows(), a.lists[open].1.len());
+        // From the watchlist, g l jumps to the open list…
+        typ(&mut a, "gs");
+        typ(&mut a, "gl");
+        assert_eq!((a.expanded, a.selected), (open, 0));
+        // …then each g l opens the next list, wrapping around.
+        let mut seen = vec![a.expanded];
+        for _ in 0..3 {
+            typ(&mut a, "gl");
+            seen.push(a.expanded);
+        }
+        assert_eq!(seen, [open, (open + 1) % 3, (open + 2) % 3, open]);
+        assert_eq!(a.selected_symbol(), Some(a.lists[open].1[0].symbol.as_str()));
+        // A reload keeps the open list open.
+        typ(&mut a, "gl");
+        let before = a.lists[a.expanded].0.clone();
+        a.set_lists(lists_file(&[
+            ("tue-11-10", &["AMD"]),
+            ("mon-11-9", &["NET", "ABNB"]),
+            ("wed-11-11", &["TSLA"]),
+        ]));
+        assert_eq!(a.lists[a.expanded].0, before);
     }
 
     #[test]

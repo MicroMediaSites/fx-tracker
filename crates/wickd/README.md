@@ -53,7 +53,8 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   back out (`esc`), search (`/`), refresh (`r`) and quit (`q`). A prefix letter
   opens a category, and a panel lists the next keys:
   - `g` go to: `g g` top, `g e` end, `g <n> g` row n, `g w` watchlist, `g i`
-    in play today, `g l` / `g s` / `g x` the lists / stocks / forex section.
+    in play today, `g l` the open list (again: the next list), `g s` / `g x`
+    the stocks / forex section.
   - `w` watchlist: `w a` add, `w d` remove, `w u` undo, `w j`/`w k` move.
   - `t` time range: `t d`/`t w`/`t m`/`t 6`/`t y`/`t 5`/`t a` for
     1D/5D/1M/6M/1Y/5Y/MAX.
@@ -187,10 +188,16 @@ trading day works well, e.g. `mon-11-9`). Each symbol carries a plan, four
 optional fields: **why** it's listed, your **call**, the **constraints**
 (stop, size, "watch only"), and the **signal** to act on. Lists are separate
 from the TUI watchlist and the in-play screen, and they're how an agent builds
-a plan for you. `wickd tui` shows each list as a section at the top of the
-watchlist screen (symbol, why, price, change); selecting a row shows its full
-plan underneath. The TUI picks up changes within ~2 seconds while it's open;
-`g l` jumps to the lists, and `w d` on a list row removes it (`w u` undoes).
+a plan for you. `wickd tui` shows the lists at the top of the watchlist
+screen: one list open (symbol, why, price, change), every other list folded
+to a one-line header, so stocks and forex stay readable however many lists
+you keep. `g l` jumps to the open list; pressed again it opens the next list
+(wrapping). Lists run in the order of the date in their name (`mon-11-9`
+before `tue-11-10`), otherwise by when they were made; on start the TUI opens
+today's list (or the next one coming). Selecting a row shows its plan
+underneath as **expect** (the call) and **go** (the signal), only the ones
+filled in (the why is already the row). The TUI picks up changes within ~2
+seconds while it's open; `w d` on a list row removes it (`w u` undoes).
 
 ```sh
 wickd list add mon-11-9 NET --why "earnings: sales +39%, +10% Fri" \
