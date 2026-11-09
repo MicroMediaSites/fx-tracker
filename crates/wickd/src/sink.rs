@@ -56,7 +56,7 @@ impl EventSink for NoopSink {
 /// which `stream`'s run loop races against `ctrl_c()` so the process exits 0
 /// instead of hanging forever waiting on a Ctrl-C that will never come.
 ///
-/// When constructed with [`NdjsonSink::with_hub`] the sink also publishes each
+/// When constructed with [`NdjsonSink::with_hub_opts`] the sink also publishes each
 /// finished line into a [`tokio::sync::broadcast`] channel (AGT-615), which the
 /// socket hub (`crate::stream_hub`) fans out to every connected client. stdout
 /// still receives the identical line, so the single-consumer path is unchanged.
@@ -90,15 +90,8 @@ impl NdjsonSink {
     }
 
     /// Like [`NdjsonSink::new`] but also fans every emitted line out to `hub`
-    /// (the socket-hub broadcast, AGT-615) in addition to stdout.
-    pub fn with_hub(
-        hub: tokio::sync::broadcast::Sender<String>,
-    ) -> (Self, Arc<tokio::sync::Notify>) {
-        Self::with_hub_opts(hub, true)
-    }
-
-    /// [`NdjsonSink::with_hub`], choosing whether price ticks also go to
-    /// stdout (`false` = hub only; non-tick events are always written).
+    /// (the socket-hub broadcast, AGT-615). `ticks_to_stdout = false` is the
+    /// daemon's hub-only mode (non-tick events are always written).
     pub fn with_hub_opts(
         hub: tokio::sync::broadcast::Sender<String>,
         ticks_to_stdout: bool,

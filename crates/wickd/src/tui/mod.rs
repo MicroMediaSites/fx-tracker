@@ -67,6 +67,8 @@ enum Request {
     Clock,
     InPlay(Vec<String>),
     News(String),
+    FxQuotes(Vec<String>),
+    FxAssets,
 }
 
 /// Results coming back to the run loop.
@@ -80,6 +82,8 @@ enum Reply {
     News(String, Result<Vec<NewsItem>, String>),
     Reader(reader::ReaderEvent),
     Warmup(String, HistoryRange, Vec<Bar>),
+    FxQuotes(Result<HashMap<String, fx::FxQuote>, String>),
+    FxAssets(Result<Vec<Asset>, String>),
 }
 
 /// Headline lookback, shared by the list's NEWS column and the side pane so
@@ -181,6 +185,16 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                 let stocks = |syms: Vec<String>| -> Vec<String> {
                     syms.into_iter().filter(|s| !fx::is_fx(s)).collect()
                 };
+                let get_oanda = || -> Result<OandaClient, String> {
+                    if let Some(c) = oanda.lock().ok().and_then(|g| g.clone()) {
+                        return Ok(c);
+                    }
+                    oanda_client().inspect(|c| {
+                        if let Ok(mut g) = oanda.lock() {
+                            *g = Some(c.clone());
+                        }
+                    })
+                };
                 let reply = match req {
                     Request::Snapshots(syms) => {
                         let syms = stocks(syms);
@@ -193,17 +207,25 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                     Request::Sparks(syms) if stocks(syms.clone()).is_empty() => {
                         Reply::Sparks(Ok(HashMap::new()))
                     }
+                    Request::FxQuotes(pairs) => Reply::FxQuotes(match get_oanda() {
+                        Ok(c) => fx::quotes(&c, &pairs, Utc::now()).await,
+                        Err(e) => Err(e),
+                    }),
+                    Request::FxAssets => {
+                        let now = Utc::now();
+                        Reply::FxAssets(match store::cached_fx_assets(now) {
+                            Some(a) => Ok(a),
+                            None => match get_oanda() {
+                                Ok(c) => fx::instruments(&c).await.inspect(|a| {
+                                    // Cache write failure only costs a refetch.
+                                    let _ = store::save_fx_assets(a, now);
+                                }),
+                                Err(e) => Err(e),
+                            },
+                        })
+                    }
                     Request::History(sym, range) if fx::is_fx(&sym) => {
-                        let cached = oanda.lock().ok().and_then(|g| g.clone());
-                        let client = match cached {
-                            Some(c) => Ok(c),
-                            None => oanda_client().inspect(|c| {
-                                if let Ok(mut g) = oanda.lock() {
-                                    *g = Some(c.clone());
-                                }
-                            }),
-                        };
-                        let r = match client {
+                        let r = match get_oanda() {
                             Ok(c) => fx::history(&c, &sym, range, Utc::now()).await,
                             Err(e) => Err(e),
                         };
@@ -404,6 +426,7 @@ fn run_loop(
         let _ = requests.send(r);
     };
     send(Request::Assets);
+    send(Request::FxAssets);
 
     let mut quotes = Every::new(opts.refresh);
     let mut sparks = Every::new(Duration::from_secs(60));
@@ -411,6 +434,7 @@ fn run_loop(
     // Live 1D chart refresh while a detail view is open.
     let mut intraday = Every::new(Duration::from_secs(60));
     let mut quotes_in_flight = false;
+    let mut fx_in_flight = false;
     // Rebuild the in-play list every minute while it's on screen.
     let mut inplay_timer = Every::new(Duration::from_secs(60));
 
@@ -437,6 +461,20 @@ fn run_loop(
                 }
                 Reply::History(sym, range, r) => app.set_history(&sym, range, r),
                 Reply::Warmup(sym, range, bars) => app.set_warmup(&sym, range, bars),
+                Reply::FxQuotes(r) => {
+                    fx_in_flight = false;
+                    match r {
+                        Ok(map) => {
+                            app.fx_quotes.extend(map);
+                            app.fx_error = None;
+                        }
+                        Err(e) => app.fx_error = Some(e),
+                    }
+                }
+                Reply::FxAssets(r) => match r {
+                    Ok(a) => app.set_fx_assets(a),
+                    Err(e) => app.fx_error = Some(e),
+                },
                 Reply::Assets(r) => match r {
                     Ok(a) => app.set_assets(a),
                     Err(e) => app.assets_error = Some(e),
@@ -454,9 +492,16 @@ fn run_loop(
 
         // 2. Scheduled polls.
         let syms = app.quote_symbols();
-        if quotes.due() && !syms.is_empty() && !quotes_in_flight {
-            quotes_in_flight = true;
-            send(Request::Snapshots(syms));
+        if quotes.due() {
+            if !syms.is_empty() && !quotes_in_flight {
+                quotes_in_flight = true;
+                send(Request::Snapshots(syms));
+            }
+            let pairs = app.fx_symbols();
+            if !pairs.is_empty() && !fx_in_flight {
+                fx_in_flight = true;
+                send(Request::FxQuotes(pairs));
+            }
         }
         if sparks.due() && !app.watchlist.is_empty() {
             send(Request::Sparks(app.watchlist.clone()));

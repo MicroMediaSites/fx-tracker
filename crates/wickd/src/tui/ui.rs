@@ -12,6 +12,7 @@ use wickd_core::equities::{Bar, HistoryRange, Snapshot};
 
 use super::app::{App, DetailState, DetailView, Mode};
 use super::chart::{self, ChartWidget, Palette, Style2, Zoom};
+use super::fx;
 use super::inplay::{self, Tag};
 use super::keymap::{self, Ctx, Entry};
 
@@ -363,10 +364,8 @@ fn quote_cells(snap: Option<&Snapshot>) -> (String, String, String, Color) {
 }
 
 fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" watchlist · {} ", app.watchlist.len()));
     if app.watchlist.is_empty() {
+        let block = Block::default().borders(Borders::ALL).title(" watchlist · 0 ");
         frame.render_widget(
             Paragraph::new("No symbols yet — press / to search and tab to add.")
                 .style(Style::default().fg(DIM))
@@ -375,22 +374,76 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
+    // Watchlist indices on screen (only matches while `g f` is active), and
+    // the selected one.
+    let (shown, sel): (Vec<usize>, Option<usize>) = match &app.find {
+        Some(f) => {
+            let m = app.find_matches();
+            let sel = m.get(f.selected).copied();
+            (m, sel)
+        }
+        None => ((0..app.watchlist.len()).collect(), Some(app.selected)),
+    };
+    let start = app.fx_start();
+    let (stocks, pairs): (Vec<usize>, Vec<usize>) = shown.into_iter().partition(|&i| i < start);
+    let has_stocks = start > 0;
+    let has_pairs = start < app.watchlist.len();
+    // Row position of the selection within one section's table.
+    let pos = |rows: &[usize]| sel.and_then(|s| rows.iter().position(|&i| i == s));
+
+    if !has_pairs {
+        let title = format!(" watchlist · {} ", app.watchlist.len());
+        render_stock_table(frame, area, app, &stocks, pos(&stocks), title);
+        return;
+    }
+    let mut fx_title = format!(" forex · {} · OANDA practice ", app.watchlist.len() - start);
+    if let Some(e) = &app.fx_error {
+        let e: String = e.chars().take(60).collect();
+        fx_title = format!("{fx_title}· {e} ");
+    }
+    if !has_stocks {
+        render_fx_table(frame, area, app, &pairs, pos(&pairs), fx_title);
+        return;
+    }
+    // Both sections at their natural height, stacked; if that doesn't fit,
+    // pairs keep up to half the screen and the stocks table scrolls.
+    let stock_h = stocks.len() as u16 + 3;
+    let fx_h = (pairs.len() as u16 + 3).max(4);
+    let constraints = if stock_h + fx_h <= area.height {
+        [
+            Constraint::Length(stock_h),
+            Constraint::Length(fx_h),
+            Constraint::Min(0),
+        ]
+    } else {
+        let fx_h = fx_h.min((area.height / 2).max(4));
+        [Constraint::Min(4), Constraint::Length(fx_h), Constraint::Length(0)]
+    };
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let stock_title = format!(" stocks · {} ", start);
+    render_stock_table(frame, parts[0], app, &stocks, pos(&stocks), stock_title);
+    render_fx_table(frame, parts[1], app, &pairs, pos(&pairs), fx_title);
+}
+
+fn render_stock_table(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    rows: &[usize],
+    sel: Option<usize>,
+    title: String,
+) {
     let spark_w: usize = 24;
     let header = header_row(
         &["SYMBOL", "NAME"],
         &["LAST", "CHG", "CHG%", "DAY RANGE", "VOLUME"],
         &["TODAY"],
     );
-    // While `g f` is active only matching rows show.
-    let shown: Vec<&String> = match &app.find {
-        Some(_) => app
-            .find_matches()
-            .into_iter()
-            .map(|i| &app.watchlist[i])
-            .collect(),
-        None => app.watchlist.iter().collect(),
-    };
-    let rows = shown.into_iter().map(|sym| {
+    let rows = rows.iter().map(|&i| {
+        let sym = &app.watchlist[i];
         let snap = app.snapshots.get(sym);
         let (last, chg, pct, color) = quote_cells(snap);
         let name = app
@@ -435,11 +488,84 @@ fn render_watchlist(frame: &mut Frame, area: Rect, app: &App) {
     ];
     let table = Table::new(rows, widths)
         .header(header)
-        .block(block)
+        .block(Block::default().borders(Borders::ALL).title(title))
         .column_spacing(2)
         .row_highlight_style(selected_row());
-    let sel = app.find.as_ref().map_or(app.selected, |f| f.selected);
-    let mut state = TableState::default().with_selected(Some(sel));
+    let mut state = TableState::default().with_selected(sel);
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// A pair's price at OANDA's precision (5 decimals, 3 for JPY quotes).
+fn fx_price(sym: &str, p: f64) -> String {
+    format!("{p:.*}", fx::decimals(sym))
+}
+
+fn render_fx_table(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    rows: &[usize],
+    sel: Option<usize>,
+    title: String,
+) {
+    let spark_w: usize = 24;
+    let header = header_row(
+        &["PAIR"],
+        &["BID", "ASK", "SPREAD", "CHG PIPS", "CHG%", "DAY RANGE"],
+        &["TODAY"],
+    );
+    let rows = rows.iter().map(|&i| {
+        let sym = &app.watchlist[i];
+        let q = app.fx_quotes.get(sym);
+        let chg = q.and_then(|q| q.change());
+        let color = change_color(chg);
+        let cell = |s: String| Cell::from(Line::from(s).alignment(Alignment::Right));
+        let (bid, ask, spread) = match q {
+            Some(q) => (
+                fx_price(sym, q.bid),
+                fx_price(sym, q.ask),
+                format!("{:.1}", fx::pips(sym, q.ask - q.bid)),
+            ),
+            None => ("…".into(), String::new(), String::new()),
+        };
+        let pips = chg
+            .map(|c| format!("{:+.1}", fx::pips(sym, c)))
+            .unwrap_or_default();
+        let pct = q
+            .and_then(|q| q.change_pct())
+            .map(|p| format!("{p:+.2}%"))
+            .unwrap_or_default();
+        let range = q
+            .and_then(|q| Some(format!("{} – {}", fx_price(sym, q.low?), fx_price(sym, q.high?))))
+            .unwrap_or_default();
+        let spark = q.map(|q| sparkline(&q.closes, spark_w)).unwrap_or_default();
+        Row::new(vec![
+            Cell::from(sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+            cell(bid),
+            cell(ask),
+            cell(spread).style(Style::default().fg(DIM)),
+            cell(pips).style(Style::default().fg(color)),
+            cell(pct).style(Style::default().fg(color)),
+            cell(range),
+            Cell::from(spark).style(Style::default().fg(color)),
+        ])
+    });
+    let widths = [
+        Constraint::Min(8),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(6),
+        Constraint::Length(8),
+        Constraint::Length(7),
+        Constraint::Length(19),
+        Constraint::Length(spark_w as u16),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .column_spacing(2)
+        .row_highlight_style(selected_row());
+    let mut state = TableState::default().with_selected(sel);
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -1721,6 +1847,43 @@ mod tests {
         }
         h.push_str("</pre>");
         h
+    }
+
+    /// Watchlist with both sections: sample stocks + LIVE forex quotes from
+    /// OANDA practice.
+    /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_watchlist_sections -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn snapshot_watchlist_sections() {
+        let dir = std::env::var("WICKD_TUI_SNAPSHOT_DIR").expect("set WICKD_TUI_SNAPSHOT_DIR");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = sample_app();
+        for p in fx::DEFAULT_PAIRS {
+            app.toggle_watchlist(p.to_string());
+        }
+        let client = super::super::oanda_client().expect("OANDA practice credentials");
+        app.fx_quotes = fx::quotes(&client, &app.fx_symbols(), Utc::now()).await.unwrap();
+        app.flash = None;
+        let (w, h) = (158u16, 30u16);
+        let shoot = |app: &App, name: &str| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, app)).unwrap();
+            std::fs::write(
+                format!("{dir}/{name}.html"),
+                to_html(term.backend().buffer(), name),
+            )
+            .unwrap();
+        };
+        shoot(&app, "1-watchlist-stocks-and-forex");
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('x'));
+        shoot(&app, "2-g-x-jumps-to-forex");
+        press(&mut app, KeyCode::Char('/'));
+        for c in "eur".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        app.set_fx_assets(fx::instruments(&client).await.unwrap());
+        shoot(&app, "3-search-finds-pairs");
     }
 
     /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_charts -- --ignored`
