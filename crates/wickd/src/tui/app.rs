@@ -1187,6 +1187,11 @@ impl App {
                     d.chart.pan(n_candles, delta);
                 }
             }
+            Cmd::ToggleLevels => {
+                if let Some(d) = self.detail.as_mut() {
+                    d.chart.levels = !d.chart.levels;
+                }
+            }
             Cmd::ToggleIchimoku => {
                 if let Some(d) = self.detail.as_mut() {
                     d.chart.ichimoku = !d.chart.ichimoku;
@@ -1554,6 +1559,16 @@ mod tests {
                 .map(Vec::len),
             Some(3)
         );
+    }
+
+    #[test]
+    fn v_s_toggles_support_resistance() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Enter));
+        typ(&mut a, "vs");
+        assert!(a.detail.as_ref().unwrap().chart.levels);
+        typ(&mut a, "vs");
+        assert!(!a.detail.as_ref().unwrap().chart.levels);
     }
 
     #[test]

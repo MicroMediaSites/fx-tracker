@@ -59,6 +59,7 @@ pub enum Cmd {
     ToggleExtended,
     ToggleMa,
     ToggleIchimoku,
+    ToggleLevels,
     Range(HistoryRange),
     GoTop,
     GoEnd,
@@ -334,6 +335,13 @@ pub static BINDINGS: &[Binding] = &[
         &[K::Char('i')],
         Cmd::ToggleIchimoku,
         "Ichimoku cloud",
+        D,
+    ),
+    pre(
+        'v',
+        &[K::Char('s')],
+        Cmd::ToggleLevels,
+        "support / resistance",
         D,
     ),
     pre(

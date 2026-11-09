@@ -1155,6 +1155,9 @@ fn render_chart_view(
     if d.chart.ichimoku {
         title.push_str(" · Ichimoku 9/26/52");
     }
+    if d.chart.levels {
+        title.push_str(" · S/R");
+    }
     if d.chart.ma {
         title.push_str(if chart::ma_range(range) {
             " · MA 50/200"
@@ -1182,6 +1185,7 @@ fn render_chart_view(
             overlays: &overlays,
             cloud: cloud.as_ref(),
             future,
+            levels: d.chart.levels,
             fmt_price,
             fmt_volume,
             time_label: &time_label,
@@ -1789,6 +1793,15 @@ mod tests {
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('i'));
         shoot(&app, "4c-1y-ichimoku");
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('s'));
+        shoot(&app, "4d-1y-support-resistance");
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('i'));
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('i'));
         press(&mut app, KeyCode::Char('v'));

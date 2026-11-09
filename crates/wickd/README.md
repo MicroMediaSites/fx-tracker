@@ -131,6 +131,11 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   tint, projected 26 periods ahead into reserved space right of the newest
   candle. On the 6M and 1Y charts it uses the same warm-up history, so the
   cloud spans the whole chart. Elsewhere it is computed on that range's bars.
+  `v s` toggles support and resistance: swing highs and lows in the visible
+  window, grouped when they are within half an average candle of each other.
+  Up to 3 resistance levels above price and 3 support levels below are shown,
+  strongest first, as dashed lines tagged `R 549.95 ×1` or `S 533.66 ×5`
+  (×n = touches).
 - **Data**. Quotes poll every 15s (`--refresh`). On the free plan, live quotes
   are IEX-only (about 3% of volume). `--feed delayed-sip` trades that for
   all-exchange quotes 15 minutes behind. History is always consolidated and

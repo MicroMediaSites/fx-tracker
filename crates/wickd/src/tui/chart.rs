@@ -365,6 +365,96 @@ pub fn ichimoku_overlays(
     (overlays, cloud, future)
 }
 
+// ── support / resistance ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelKind {
+    Support,
+    Resistance,
+}
+
+/// A horizontal level built from clustered swing highs/lows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Level {
+    pub price: f64,
+    /// Swing points that formed it (more = stronger).
+    pub touches: usize,
+    pub kind: LevelKind,
+}
+
+pub const SUPPORT_COLOR: Color = Color::Rgb(110, 160, 190);
+pub const RESISTANCE_COLOR: Color = Color::Rgb(200, 140, 100);
+/// Background behind level tags so they stay legible over candles.
+const GRID_BG: Color = Color::Rgb(21, 26, 34);
+
+/// Support/resistance from the swing highs and lows in `candles`.
+///
+/// - A swing high is a candle whose high is the highest of the `L` candles
+///   either side (swing low: lowest low), with `L` scaled to the window
+///   (2..=8).
+/// - Swing points within half an average candle range of each other merge
+///   into one level (its price is their mean; `touches` counts them).
+/// - Levels above the last close are resistance, below are support; the
+///   `per_side` strongest of each are kept (ties: nearest to price).
+pub fn swing_levels(candles: &[Candle], per_side: usize) -> Vec<Level> {
+    let n = candles.len();
+    if n < 7 || per_side == 0 {
+        return Vec::new();
+    }
+    let l = (n / 30).clamp(2, 8);
+    let mut pivots: Vec<f64> = Vec::new();
+    for i in l..n.saturating_sub(l) {
+        let w = &candles[i - l..=i + l];
+        let c = &candles[i];
+        if w.iter().all(|x| x.high <= c.high) {
+            pivots.push(c.high);
+        }
+        if w.iter().all(|x| x.low >= c.low) {
+            pivots.push(c.low);
+        }
+    }
+    let avg_range = candles.iter().map(|c| c.high - c.low).sum::<f64>() / n as f64;
+    let tol = (avg_range * 0.5).max(f64::EPSILON);
+    pivots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Greedy clusters over the sorted prices.
+    let mut clusters: Vec<Vec<f64>> = Vec::new();
+    for p in pivots {
+        match clusters.last_mut() {
+            Some(c) if p - c.iter().sum::<f64>() / c.len() as f64 <= tol => c.push(p),
+            _ => clusters.push(vec![p]),
+        }
+    }
+    let last = candles[n - 1].close;
+    let mut levels: Vec<Level> = clusters
+        .into_iter()
+        .map(|c| {
+            let price = c.iter().sum::<f64>() / c.len() as f64;
+            Level {
+                price,
+                touches: c.len(),
+                kind: if price >= last {
+                    LevelKind::Resistance
+                } else {
+                    LevelKind::Support
+                },
+            }
+        })
+        .collect();
+    levels.sort_by(|a, b| {
+        b.touches.cmp(&a.touches).then(
+            (a.price - last)
+                .abs()
+                .partial_cmp(&(b.price - last).abs())
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    let mut out: Vec<Level> = Vec::new();
+    for kind in [LevelKind::Resistance, LevelKind::Support] {
+        out.extend(levels.iter().filter(|l| l.kind == kind).take(per_side));
+    }
+    out
+}
+
 /// Simple moving average: element `i` averages `values[i+1-n..=i]`; `None`
 /// until `n` values exist (no fake early values).
 pub fn sma(values: &[f64], n: usize) -> Vec<Option<f64>> {
@@ -415,6 +505,8 @@ pub struct ChartView {
     pub ma: bool,
     /// Show the Ichimoku cloud.
     pub ichimoku: bool,
+    /// Show support/resistance levels.
+    pub levels: bool,
     /// Candles that fit, as last measured by the renderer.
     pub visible: Cell<usize>,
     /// Fit mode (the default): the whole range spread across the width,
@@ -433,6 +525,7 @@ impl Default for ChartView {
             extended: false,
             ma: false,
             ichimoku: false,
+            levels: false,
             visible: Cell::new(60),
             fit: true,
             plot_cols: Cell::new(120),
@@ -811,6 +904,8 @@ pub struct ChartWidget<'a> {
     /// Empty slots reserved right of the newest candle (Ichimoku projection)
     /// while the window is pinned to the latest candle.
     pub future: usize,
+    /// Draw support/resistance levels found in the visible window.
+    pub levels: bool,
     pub fmt_price: fn(f64) -> String,
     pub fmt_volume: fn(f64) -> String,
     /// Full timestamp label for the readout.
@@ -989,6 +1084,36 @@ impl Widget for ChartWidget<'_> {
             }
         }
 
+        // Support / resistance (from the visible candles): lines behind the
+        // candles now; their tags are drawn on top after the candles.
+        let mut level_tags: Vec<(u16, String, Color)> = Vec::new();
+        if self.levels {
+            for lv in swing_levels(win, 3) {
+                if lv.price < lo || lv.price > hi {
+                    continue;
+                }
+                let color = match lv.kind {
+                    LevelKind::Support => SUPPORT_COLOR,
+                    LevelKind::Resistance => RESISTANCE_COLOR,
+                };
+                let row = y0 + row_of(lv.price);
+                for x in x0..x_axis {
+                    buf.set_string(x, row, "╌", Style::default().fg(color));
+                }
+                let tag = format!(
+                    " {} {} ×{} ",
+                    if lv.kind == LevelKind::Support {
+                        "S"
+                    } else {
+                        "R"
+                    },
+                    (self.fmt_price)(lv.price),
+                    lv.touches
+                );
+                level_tags.push((row, tag, color));
+            }
+        }
+
         // Overlay lines (behind the candles; broken where undefined).
         if !self.overlays.is_empty() {
             let segs: Vec<(f64, f64, f64, f64, Color)> = self
@@ -1122,6 +1247,19 @@ impl Widget for ChartWidget<'_> {
                         }
                     });
                 canvas.render(Rect::new(x0, y0, plot_w, price_rows), buf);
+            }
+        }
+
+        // Level tags on top of the candles, at the right edge of the plot.
+        for (row, tag, color) in &level_tags {
+            let w = tag.chars().count() as u16;
+            if w + 2 < plot_w {
+                buf.set_string(
+                    x_axis - w - 1,
+                    *row,
+                    tag,
+                    Style::default().fg(*color).bg(GRID_BG),
+                );
             }
         }
 
@@ -1436,6 +1574,7 @@ mod tests {
             overlays: &ov,
             cloud: None,
             future: 0,
+            levels: false,
             fmt_price: |p| format!("{p:.2}"),
             fmt_volume: |v| format!("{v:.0}"),
             time_label: &label,
@@ -1606,6 +1745,7 @@ mod tests {
             overlays: &ov,
             cloud: Some(&cloud),
             future: fut,
+            levels: false,
             fmt_price: |p| format!("{p:.2}"),
             fmt_volume: |v| format!("{v:.0}"),
             time_label: &label,
@@ -1637,6 +1777,73 @@ mod tests {
         let tint_right = (last_body + 3..105u16)
             .any(|x| (1..20u16).any(|y| matches!(buf[(x, y)].bg, CLOUD_UP | CLOUD_DOWN)));
         assert!(tint_right, "projected cloud drawn right of the last candle");
+    }
+
+    #[test]
+    fn swing_levels_find_a_double_top_and_double_bottom() {
+        // Oscillates between ~100 and ~110 twice, ending mid-range at 105.
+        let path = [
+            103.0, 105.0, 107.0, 109.0, 110.0, 108.0, 106.0, 104.0, 102.0, 100.0, 102.0, 104.0,
+            106.0, 108.0, 110.2, 108.0, 106.0, 104.0, 102.0, 100.2, 102.0, 104.0, 105.0, 105.0,
+        ];
+        let bars: Vec<Bar> = path
+            .iter()
+            .map(|&c| bar("2026-01-01T05:00:00Z", c, c + 0.3, c - 0.3, c, 1.0))
+            .collect();
+        let lv = swing_levels(&build(&bars, 1), 3);
+        let r = lv
+            .iter()
+            .find(|l| l.kind == LevelKind::Resistance)
+            .expect("resistance");
+        let s = lv
+            .iter()
+            .find(|l| l.kind == LevelKind::Support)
+            .expect("support");
+        assert!((r.price - 110.4).abs() < 0.3 && r.touches == 2, "{r:?}");
+        assert!((s.price - 99.8).abs() < 0.3 && s.touches == 2, "{s:?}");
+        // At most 3 per side; tiny inputs give nothing.
+        assert!(lv.iter().filter(|l| l.kind == LevelKind::Support).count() <= 3);
+        assert!(swing_levels(&build(&bars[..5], 1), 3).is_empty());
+    }
+
+    #[test]
+    fn levels_draw_as_lines_with_tags() {
+        let candles = build(&walk(120), 1);
+        let v = ChartView::default();
+        let area = Rect::new(0, 0, 120, 26);
+        let mut buf = Buffer::empty(area);
+        let label = |t: DateTime<Utc>| t.format("%H:%M").to_string();
+        let boundary = |_p: Option<DateTime<Utc>>, _t: DateTime<Utc>| None;
+        ChartWidget {
+            candles: &candles,
+            view: &v,
+            style: Style2::Candles,
+            reference: None,
+            last_price: None,
+            delayed: false,
+            overlays: &[],
+            cloud: None,
+            future: 0,
+            levels: true,
+            fmt_price: |p| format!("{p:.2}"),
+            fmt_volume: |v| format!("{v:.0}"),
+            time_label: &label,
+            boundary: &boundary,
+            palette: Palette {
+                up: Color::Green,
+                down: Color::Red,
+                dim: Color::DarkGray,
+                grid: Color::Gray,
+                text: Color::White,
+            },
+        }
+        .render(area, &mut buf);
+        let t = text(&buf);
+        assert!(t.contains(" R ") || t.contains(" S "), "{t}");
+        let colored = (0..26u16).any(|y| {
+            (0..120u16).any(|x| matches!(buf[(x, y)].fg, SUPPORT_COLOR | RESISTANCE_COLOR))
+        });
+        assert!(colored, "{t}");
     }
 
     #[test]
@@ -1692,6 +1899,7 @@ mod tests {
             overlays: &[],
             cloud: None,
             future: 0,
+            levels: false,
             fmt_price: |p| format!("{p:.2}"),
             fmt_volume: |v| format!("{v:.0}"),
             time_label: &label,
@@ -1796,6 +2004,7 @@ mod tests {
                 overlays: &[],
                 cloud: None,
                 future: 0,
+                levels: false,
                 fmt_price: |p| format!("{p:.2}"),
                 fmt_volume: |v| format!("{v:.0}"),
                 time_label: &label,
