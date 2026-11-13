@@ -53,7 +53,10 @@ pub enum Action {
     /// Load the info card for a symbol (`wickd info`).
     FetchInfo(String),
     /// Remove a symbol from a named list (`~/.wickd/lists.json`).
-    RemoveFromList { list: String, symbol: String },
+    RemoveFromList {
+        list: String,
+        symbol: String,
+    },
     /// Put a removed entry back on a named list (`w u`), note included.
     RestoreToList {
         list: String,
@@ -110,6 +113,8 @@ pub struct InPlayState {
 
 /// Rows a J/K (shift) step moves in a list.
 pub const LIST_PAGE: usize = 10;
+/// Small steps in one big (`J`/`K`) price-line step.
+pub const PRICE_BIG_STEP: i32 = 5;
 /// Headlines a J/K step moves in the headlines pane.
 pub const NEWS_PAGE: usize = 3;
 
@@ -427,6 +432,8 @@ pub struct App {
     pub journal: super::journal::JournalState,
     /// Active `g f` filter on the watchlist / in-play list.
     pub find: Option<FindState>,
+    /// The chart's `p` prompt: digits typed so far for the price line.
+    pub price_input: Option<String>,
     pub inplay: InPlayState,
     pub quotes_error: Option<String>,
     /// Last OANDA (forex) failure, shown on the forex section.
@@ -472,6 +479,7 @@ impl App {
             detail: None,
             journal: super::journal::JournalState::new(super::journal::default_dir()),
             find: None,
+            price_input: None,
             inplay: InPlayState::default(),
             quotes_error: None,
             fx_error: None,
@@ -667,7 +675,10 @@ impl App {
     /// the same symbol in the same kind of section when it's still there.
     pub fn set_lists(&mut self, file: crate::lists::ListsFile) {
         let keep = self.row(self.selected).map(|r| {
-            let sym = self.row_symbol(self.selected).unwrap_or_default().to_string();
+            let sym = self
+                .row_symbol(self.selected)
+                .unwrap_or_default()
+                .to_string();
             let list = match r {
                 ScreenRow::List(li, _) => Some(self.lists[li].0.clone()),
                 ScreenRow::Watch(_) => None,
@@ -692,7 +703,9 @@ impl App {
                     }
             })
         });
-        self.selected = found.unwrap_or(self.selected).min(self.total_rows().saturating_sub(1));
+        self.selected = found
+            .unwrap_or(self.selected)
+            .min(self.total_rows().saturating_sub(1));
     }
 
     /// Today's day list, else the next dated one coming, else the first.
@@ -733,7 +746,11 @@ impl App {
             if let Some(p) = s.last() {
                 self.ticks.observe(format!("{sym}:last"), p);
             }
-            if let Some(q) = s.latest_quote.as_ref().filter(|q| q.bid > 0.0 && q.ask > 0.0) {
+            if let Some(q) = s
+                .latest_quote
+                .as_ref()
+                .filter(|q| q.bid > 0.0 && q.ask > 0.0)
+            {
                 self.ticks.observe(format!("{sym}:bid"), q.bid);
                 self.ticks.observe(format!("{sym}:ask"), q.ask);
             }
@@ -761,7 +778,12 @@ impl App {
             match self.fx_quotes.get_mut(&sym) {
                 Some(cur) if cur.time > q.time => {
                     let (bid, ask, time) = (cur.bid, cur.ask, cur.time);
-                    *cur = super::fx::FxQuote { bid, ask, time, ..q };
+                    *cur = super::fx::FxQuote {
+                        bid,
+                        ask,
+                        time,
+                        ..q
+                    };
                 }
                 _ => {
                     self.fx_quotes.insert(sym.clone(), q);
@@ -872,6 +894,10 @@ impl App {
         }
         if self.find.is_some() {
             return self.on_find_key(key);
+        }
+        if self.price_input.is_some() {
+            self.on_price_key(key);
+            return vec![];
         }
         let Some(ctx) = self.ctx() else {
             return self.on_search_key(key);
@@ -1409,6 +1435,38 @@ impl App {
         });
     }
 
+    /// The `p` prompt: type an exact price for the chart's price line.
+    /// `enter` sets it (empty removes the line), `esc` cancels.
+    fn on_price_key(&mut self, key: KeyEvent) {
+        let Some(q) = self.price_input.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.price_input = None,
+            KeyCode::Backspace => {
+                q.pop();
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() && q.len() < 14 => q.push(c),
+            // One decimal point (a comma works too).
+            KeyCode::Char('.' | ',') if !q.contains('.') && q.len() < 14 => q.push('.'),
+            KeyCode::Enter => {
+                let text = self.price_input.take().unwrap_or_default();
+                let Some(d) = self.detail.as_mut() else {
+                    return;
+                };
+                if text.is_empty() {
+                    d.chart.price = None;
+                    return;
+                }
+                match text.parse::<f64>() {
+                    Ok(p) if p > 0.0 && p.is_finite() => d.chart.price = Some(p),
+                    _ => self.flash = Some(format!("not a price: {text}")),
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn on_find_key(&mut self, key: KeyEvent) -> Vec<Action> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let matches = self.find_matches();
@@ -1700,6 +1758,30 @@ impl App {
             Cmd::ViewCandles => view(self, Some(DetailView::Candles)),
             Cmd::ViewLine => view(self, Some(DetailView::Line)),
             Cmd::ViewTable => view(self, Some(DetailView::Table)),
+            // On a chart, up/down move the price line: one small step, or
+            // a big one with J/K.
+            Cmd::Down | Cmd::Up | Cmd::PageDown | Cmd::PageUp if is_chart => {
+                let steps = match cmd {
+                    Cmd::Up => 1,
+                    Cmd::Down => -1,
+                    Cmd::PageUp => PRICE_BIG_STEP,
+                    _ => -PRICE_BIG_STEP,
+                };
+                if let Some(d) = self.detail.as_mut() {
+                    let from = d
+                        .candles()
+                        .and_then(|(c, _)| c.get(d.chart.cursor_idx(c.len())).map(|c| c.close));
+                    if let Some(from) = from {
+                        d.chart.move_price(steps, from);
+                    }
+                }
+            }
+            Cmd::PriceEnter if is_chart => self.price_input = Some(String::new()),
+            Cmd::PriceClear => {
+                if let Some(d) = self.detail.as_mut() {
+                    d.chart.price = None;
+                }
+            }
             Cmd::Down => scroll(self, &|s| s + 1),
             Cmd::Up => scroll(self, &|s| s.saturating_sub(1)),
             Cmd::PageDown => scroll(self, &|s| s + 20),
@@ -2029,7 +2111,13 @@ mod tests {
         let mut f = crate::lists::ListsFile::default();
         for (name, syms) in entries {
             let syms: Vec<String> = syms.iter().map(|s| s.to_string()).collect();
-            crate::lists::add(&mut f, name, &syms, &crate::lists::Fields::note("why"), Utc::now());
+            crate::lists::add(
+                &mut f,
+                name,
+                &syms,
+                &crate::lists::Fields::note("why"),
+                Utc::now(),
+            );
         }
         f
     }
@@ -2129,7 +2217,10 @@ mod tests {
             seen.push(a.expanded);
         }
         assert_eq!(seen, [open, (open + 1) % 3, (open + 2) % 3, open]);
-        assert_eq!(a.selected_symbol(), Some(a.lists[open].1[0].symbol.as_str()));
+        assert_eq!(
+            a.selected_symbol(),
+            Some(a.lists[open].1[0].symbol.as_str())
+        );
         // A reload keeps the open list open.
         typ(&mut a, "gl");
         let before = a.lists[a.expanded].0.clone();
@@ -2161,7 +2252,12 @@ mod tests {
     #[test]
     fn watchlist_sections_jump_move_and_add_in_place() {
         let mut a = App::new(
-            vec!["SPY".into(), "QQQ".into(), "EUR_USD".into(), "USD_JPY".into()],
+            vec![
+                "SPY".into(),
+                "QQQ".into(),
+                "EUR_USD".into(),
+                "USD_JPY".into(),
+            ],
             "IEX",
         );
         assert_eq!(a.fx_start(), 2);
@@ -2261,6 +2357,64 @@ mod tests {
         let d = a.detail.as_ref().unwrap();
         assert!(d.show_extended() && !d.chart.extended);
         assert_eq!(d.candles().unwrap().0.len(), 10);
+    }
+
+    #[test]
+    fn price_line_steps_and_takes_a_typed_price() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Enter)); // SPY
+        a.set_history("SPY", HistoryRange::Day1, Ok(session_bars(60)));
+        let price = |a: &App| a.detail.as_ref().unwrap().chart.price;
+        let set_step = |a: &App, s: f64| a.detail.as_ref().unwrap().chart.price_step.set(s);
+        assert_eq!(price(&a), None);
+        // The first step starts from the cursor candle's close, landing on
+        // a multiple of the step.
+        let close = {
+            let d = a.detail.as_ref().unwrap();
+            d.candles().unwrap().0.last().unwrap().close
+        };
+        set_step(&a, 0.5);
+        typ(&mut a, "k");
+        let p0 = price(&a).unwrap();
+        assert!(p0 > close && p0 - close <= 0.5 + 1e-9, "{p0} vs {close}");
+        assert!((p0 / 0.5 - (p0 / 0.5).round()).abs() < 1e-9);
+        // k/j: one small step. K/J: a big one.
+        typ(&mut a, "k");
+        assert!((price(&a).unwrap() - (p0 + 0.5)).abs() < 1e-9);
+        typ(&mut a, "jj");
+        assert!((price(&a).unwrap() - (p0 - 0.5)).abs() < 1e-9);
+        typ(&mut a, "K");
+        assert!((price(&a).unwrap() - (p0 - 0.5 + 2.5)).abs() < 1e-9);
+        typ(&mut a, "J");
+        assert!((price(&a).unwrap() - (p0 - 0.5)).abs() < 1e-9);
+        // p types an exact value; letters are ignored, one decimal point.
+        typ(&mut a, "p68a4.1.25");
+        assert_eq!(a.price_input.as_deref(), Some("684.125"));
+        a.on_key(key(KeyCode::Backspace));
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!((price(&a), a.price_input.clone()), (Some(684.12), None));
+        // From an off-grid value a step goes to the next round number.
+        typ(&mut a, "k");
+        assert!((price(&a).unwrap() - 684.5).abs() < 1e-9);
+        // esc leaves the line alone (and stays on the chart).
+        typ(&mut a, "p1");
+        a.on_key(key(KeyCode::Esc));
+        assert!(a.price_input.is_none() && a.mode == Mode::Detail);
+        assert!((price(&a).unwrap() - 684.5).abs() < 1e-9);
+        // The line survives a range change; x (or an empty p) removes it.
+        typ(&mut a, "2");
+        assert!(price(&a).is_some());
+        typ(&mut a, "x");
+        assert_eq!(price(&a), None);
+        typ(&mut a, "p5");
+        a.on_key(key(KeyCode::Enter));
+        typ(&mut a, "p");
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(price(&a), None);
+        // In the table view j/k still scroll rows.
+        a.on_key(key(KeyCode::Tab));
+        typ(&mut a, "jk");
+        assert_eq!(price(&a), None);
     }
 
     #[test]

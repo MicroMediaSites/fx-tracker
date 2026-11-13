@@ -61,6 +61,10 @@ pub enum Cmd {
     ToggleMa,
     ToggleIchimoku,
     ToggleLevels,
+    /// Type an exact price for the chart's price line.
+    PriceEnter,
+    /// Remove the price line.
+    PriceClear,
     Range(HistoryRange),
     GoTop,
     GoEnd,
@@ -180,6 +184,7 @@ const D: &[Ctx] = &[Ctx::Detail];
 const I: &[Ctx] = &[Ctx::InPlay];
 const WDI: &[Ctx] = &[Ctx::Watchlist, Ctx::Detail, Ctx::InPlay];
 const WI: &[Ctx] = &[Ctx::Watchlist, Ctx::InPlay];
+const WIJ: &[Ctx] = &[Ctx::Watchlist, Ctx::InPlay, Ctx::Journal];
 const J: &[Ctx] = &[Ctx::Journal];
 const DIJ: &[Ctx] = &[Ctx::Detail, Ctx::InPlay, Ctx::Journal];
 const WDJ: &[Ctx] = &[Ctx::Watchlist, Ctx::Detail, Ctx::Journal];
@@ -214,15 +219,30 @@ const fn pre(
 /// Every binding. Order is display order within a group.
 pub static BINDINGS: &[Binding] = &[
     // ── bare ──
-    bare(&[K::Down, K::Char('j')], Cmd::Down, "down", ALL),
-    bare(&[K::Up, K::Char('k')], Cmd::Up, "up", ALL),
+    bare(&[K::Down, K::Char('j')], Cmd::Down, "down", WIJ),
+    bare(&[K::Up, K::Char('k')], Cmd::Up, "up", WIJ),
     bare(
         &[K::Char('J'), K::PageDown],
         Cmd::PageDown,
         "down a page",
-        ALL,
+        WIJ,
     ),
-    bare(&[K::Char('K'), K::PageUp], Cmd::PageUp, "up a page", ALL),
+    bare(&[K::Char('K'), K::PageUp], Cmd::PageUp, "up a page", WIJ),
+    // On a chart these move the price line; in the price table they scroll.
+    bare(&[K::Down, K::Char('j')], Cmd::Down, "price line down", D),
+    bare(&[K::Up, K::Char('k')], Cmd::Up, "price line up", D),
+    bare(
+        &[K::Char('J'), K::PageDown],
+        Cmd::PageDown,
+        "price line down, big step",
+        D,
+    ),
+    bare(
+        &[K::Char('K'), K::PageUp],
+        Cmd::PageUp,
+        "price line up, big step",
+        D,
+    ),
     bare(
         &[K::Enter, K::Right, K::Char('l')],
         Cmd::Open,
@@ -238,6 +258,8 @@ pub static BINDINGS: &[Binding] = &[
     bare(&[K::Right, K::Char('l')], Cmd::EntryNewer, "newer entry", J),
     bare(&[K::Char('[')], Cmd::PrevHeading, "previous heading", J),
     bare(&[K::Char(']')], Cmd::NextHeading, "next heading", J),
+    bare(&[K::Char('p')], Cmd::PriceEnter, "type a price", D),
+    bare(&[K::Char('x')], Cmd::PriceClear, "remove line", D),
     bare(&[K::Char('H')], Cmd::PanLeft, "pan back", D),
     bare(&[K::Char('L')], Cmd::PanRight, "pan forward", D),
     bare(&[K::Char('+'), K::Char('=')], Cmd::ZoomIn, "zoom in", D),
