@@ -468,9 +468,6 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// The footer's hint line for a screen, generated from the keymap: the
-/// prefix categories first (they hold most commands), then the bare keys
-/// that aren't plain movement.
 /// The smallest price-line step for a symbol: a cent, or a tenth of a pip
 /// for a forex pair (OANDA's quote precision).
 pub(crate) fn price_tick(symbol: &str) -> f64 {
@@ -482,6 +479,9 @@ pub(crate) fn price_tick(symbol: &str) -> f64 {
     }
 }
 
+/// The footer's hint line for a screen, generated from the keymap: the
+/// prefix categories first (they hold most commands), then the bare keys
+/// that aren't plain movement.
 fn footer_hints(ctx: Ctx) -> String {
     let mut parts: Vec<String> = keymap::prefixes_in(ctx)
         .into_iter()

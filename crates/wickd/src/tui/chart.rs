@@ -536,6 +536,8 @@ pub struct ChartView {
     pub plot_cols: Cell<usize>,
     /// The price line: a horizontal cursor at an exact price (`j`/`k` step
     /// it, `p` types a value). `None` = no line.
+    /// Display only (f64 like the rest of the chart): anything that turns
+    /// this into an order, stop or alert price must use `Decimal`.
     pub price: Option<f64>,
     /// One small price-line step: a round number no bigger than one chart
     /// row, as last measured by the renderer.
@@ -755,7 +757,6 @@ pub fn half_row(p: f64, lo: f64, hi: f64, rows: u16) -> usize {
     ((frac * (units - 1) as f64).round() as usize).min(units - 1)
 }
 
-/// "Nice" tick step (1, 2, 2.5, 5 × 10ⁿ) giving about `target` ticks.
 /// The largest 1 / 2 / 5 × 10ⁿ value that is not above `raw` (never below
 /// `min`): the price line's small step.
 pub fn nice_floor(raw: f64, min: f64) -> f64 {
@@ -774,6 +775,7 @@ pub fn nice_floor(raw: f64, min: f64) -> f64 {
     (nice * mag).max(min)
 }
 
+/// "Nice" tick step (1, 2, 2.5, 5 × 10ⁿ) giving about `target` ticks.
 pub fn nice_step(range: f64, target: usize) -> f64 {
     if range <= 0.0 || target == 0 {
         return 1.0;
