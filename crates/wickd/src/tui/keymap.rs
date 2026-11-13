@@ -7,7 +7,7 @@
 //! Bare keys do the everyday things: move, open, back, search, quit. A
 //! letter *prefix* opens a category, and the next key picks the action:
 //!
-//!   g  go to       g g top · g e end · g w watchlist · g i in play · g <n> g row n
+//!   g  go to       g g top · g e end · g w watchlist · g i in play · g j journal · g <n> g row n
 //!   w  watchlist   w a add · w d remove · w u undo · w j / w k move
 //!   t  time range  t d 1D · t w 5D · t m 1M · t 6 6M · t y 1Y · t 5 5Y · t a MAX
 //!   v  view        v c candles · v l line · v t table · v e extended hours
@@ -31,6 +31,7 @@ pub enum Ctx {
     Watchlist,
     Detail,
     InPlay,
+    Journal,
 }
 
 /// What a key does.
@@ -67,6 +68,13 @@ pub enum Cmd {
     GoRow,
     GoWatchlist,
     GoInPlay,
+    GoJournal,
+    /// Journal: the previous (older) / next (newer) entry.
+    EntryOlder,
+    EntryNewer,
+    /// Journal: jump between headings.
+    PrevHeading,
+    NextHeading,
     GoStocks,
     GoLists,
     Info,
@@ -169,11 +177,13 @@ pub const PREFIXES: [(char, &str); 4] = [
 
 const W: &[Ctx] = &[Ctx::Watchlist];
 const D: &[Ctx] = &[Ctx::Detail];
-const WD: &[Ctx] = &[Ctx::Watchlist, Ctx::Detail];
 const I: &[Ctx] = &[Ctx::InPlay];
-const DI: &[Ctx] = &[Ctx::Detail, Ctx::InPlay];
 const WDI: &[Ctx] = &[Ctx::Watchlist, Ctx::Detail, Ctx::InPlay];
 const WI: &[Ctx] = &[Ctx::Watchlist, Ctx::InPlay];
+const J: &[Ctx] = &[Ctx::Journal];
+const DIJ: &[Ctx] = &[Ctx::Detail, Ctx::InPlay, Ctx::Journal];
+const WDJ: &[Ctx] = &[Ctx::Watchlist, Ctx::Detail, Ctx::Journal];
+const ALL: &[Ctx] = &[Ctx::Watchlist, Ctx::Detail, Ctx::InPlay, Ctx::Journal];
 
 const fn bare(keys: &'static [K], cmd: Cmd, label: &'static str, ctx: &'static [Ctx]) -> Binding {
     Binding {
@@ -204,15 +214,15 @@ const fn pre(
 /// Every binding. Order is display order within a group.
 pub static BINDINGS: &[Binding] = &[
     // ── bare ──
-    bare(&[K::Down, K::Char('j')], Cmd::Down, "down", WDI),
-    bare(&[K::Up, K::Char('k')], Cmd::Up, "up", WDI),
+    bare(&[K::Down, K::Char('j')], Cmd::Down, "down", ALL),
+    bare(&[K::Up, K::Char('k')], Cmd::Up, "up", ALL),
     bare(
         &[K::Char('J'), K::PageDown],
         Cmd::PageDown,
         "down a page",
-        WDI,
+        ALL,
     ),
-    bare(&[K::Char('K'), K::PageUp], Cmd::PageUp, "up a page", WDI),
+    bare(&[K::Char('K'), K::PageUp], Cmd::PageUp, "up a page", ALL),
     bare(
         &[K::Enter, K::Right, K::Char('l')],
         Cmd::Open,
@@ -224,6 +234,10 @@ pub static BINDINGS: &[Binding] = &[
     bare(&[K::Left, K::Char('h')], Cmd::FocusLeft, "← list", I),
     bare(&[K::Left, K::Char('h')], Cmd::CursorLeft, "cursor ←", D),
     bare(&[K::Right, K::Char('l')], Cmd::CursorRight, "cursor →", D),
+    bare(&[K::Left, K::Char('h')], Cmd::EntryOlder, "older entry", J),
+    bare(&[K::Right, K::Char('l')], Cmd::EntryNewer, "newer entry", J),
+    bare(&[K::Char('[')], Cmd::PrevHeading, "previous heading", J),
+    bare(&[K::Char(']')], Cmd::NextHeading, "next heading", J),
     bare(&[K::Char('H')], Cmd::PanLeft, "pan back", D),
     bare(&[K::Char('L')], Cmd::PanRight, "pan forward", D),
     bare(&[K::Char('+'), K::Char('=')], Cmd::ZoomIn, "zoom in", D),
@@ -243,16 +257,23 @@ pub static BINDINGS: &[Binding] = &[
     bare(&[K::Char('x')], Cmd::CloseReader, "close reader window", I),
     bare(&[K::Char('/')], Cmd::Search, "search", WDI),
     bare(&[K::Char('r')], Cmd::Refresh, "refresh", WDI),
-    bare(&[K::Esc, K::Char('q'), K::Backspace], Cmd::Back, "back", DI),
-    bare(&[K::Char('?')], Cmd::Help, "help", WDI),
+    bare(&[K::Char('r')], Cmd::Refresh, "reload from disk", J),
+    bare(
+        &[K::Esc, K::Char('q'), K::Backspace],
+        Cmd::Back,
+        "back",
+        DIJ,
+    ),
+    bare(&[K::Char('?')], Cmd::Help, "help", ALL),
     bare(&[K::Char('i')], Cmd::Info, "info: what is this?", WDI),
     bare(&[K::Char('q')], Cmd::Quit, "quit", W),
     // ── g: go to ──
-    pre('g', &[K::Char('g')], Cmd::GoTop, "top", WDI),
-    pre('g', &[K::Char('e')], Cmd::GoEnd, "end", WDI),
+    pre('g', &[K::Char('g')], Cmd::GoTop, "top", ALL),
+    pre('g', &[K::Char('e')], Cmd::GoEnd, "end", ALL),
     pre('g', &[K::Number], Cmd::GoRow, "row n (then g)", W),
-    pre('g', &[K::Char('w')], Cmd::GoWatchlist, "watchlist", DI),
-    pre('g', &[K::Char('i')], Cmd::GoInPlay, "in play today", WD),
+    pre('g', &[K::Char('w')], Cmd::GoWatchlist, "watchlist", DIJ),
+    pre('g', &[K::Char('i')], Cmd::GoInPlay, "in play today", WDJ),
+    pre('g', &[K::Char('j')], Cmd::GoJournal, "journal", WDI),
     pre('g', &[K::Char('l')], Cmd::GoLists, "lists (wickd list)", W),
     pre('g', &[K::Char('s')], Cmd::GoStocks, "stocks section", W),
     pre('g', &[K::Char('x')], Cmd::GoForex, "forex section", W),
@@ -710,8 +731,36 @@ mod tests {
     }
 
     #[test]
+    fn journal_keys() {
+        assert_eq!(
+            run(Ctx::Watchlist, &[c('g'), c('j')]),
+            vec![Step::Pending, Step::Act(Cmd::GoJournal, None)]
+        );
+        for ctx in [Ctx::Detail, Ctx::InPlay] {
+            assert_eq!(
+                run(ctx, &[c('g'), c('j')])[1],
+                Step::Act(Cmd::GoJournal, None)
+            );
+        }
+        let j = Ctx::Journal;
+        assert_eq!(run(j, &[c('h')]), vec![Step::Act(Cmd::EntryOlder, None)]);
+        assert_eq!(run(j, &[K::Right]), vec![Step::Act(Cmd::EntryNewer, None)]);
+        assert_eq!(run(j, &[c(']')]), vec![Step::Act(Cmd::NextHeading, None)]);
+        assert_eq!(run(j, &[c('J')]), vec![Step::Act(Cmd::PageDown, None)]);
+        for k in [K::Esc, c('q'), K::Backspace] {
+            assert_eq!(run(j, &[k]), vec![Step::Act(Cmd::Back, None)]);
+        }
+        assert_eq!(
+            run(j, &[c('g'), c('w')]),
+            vec![Step::Pending, Step::Act(Cmd::GoWatchlist, None)]
+        );
+        // Only "go to" opens here.
+        assert_eq!(prefixes_in(j).iter().map(|p| p.0).collect::<String>(), "g");
+    }
+
+    #[test]
     fn no_key_is_bound_twice_in_one_place() {
-        for ctx in [Ctx::Watchlist, Ctx::Detail, Ctx::InPlay] {
+        for ctx in [Ctx::Watchlist, Ctx::Detail, Ctx::InPlay, Ctx::Journal] {
             let mut seen: Vec<(Option<char>, K)> = Vec::new();
             for b in BINDINGS.iter().filter(|b| in_ctx(b, ctx)) {
                 for k in b.keys {

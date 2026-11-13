@@ -57,6 +57,12 @@ flate2 = "1"
 ratatui = "0.29"
 crossterm = "0.28"
 
+# Journal screen (`wickd tui`, `g j`): parse the markdown entries; the TUI lays
+# them out itself (tui/markdown.rs). unicode-width (already in the tree via
+# ratatui) measures text for wrapping.
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
+
 # News reader window (`wickd tui`): drive the ui-leaf Chrome window over the
 # DevTools protocol (loopback WebSocket + `/json/list` over HTTP).
 tokio-tungstenite = "0.28"

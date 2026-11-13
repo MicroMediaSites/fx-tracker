@@ -154,6 +154,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::Watchlist => render_watchlist(frame, chunks[1], app),
         Mode::Search => render_search(frame, chunks[1], app),
         Mode::InPlay => render_inplay(frame, chunks[1], app),
+        Mode::Journal => render_journal(frame, chunks[1], app),
         Mode::Detail => match &app.detail {
             Some(d) => render_detail(frame, chunks[1], app, d),
             None => render_watchlist(frame, chunks[1], app),
@@ -167,8 +168,109 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_info(frame, frame.area(), card);
     }
     if app.show_help {
-        render_help(frame, frame.area());
+        render_help(frame, frame.area(), app.mode);
     }
+}
+
+/// The journal (`g j`): one markdown entry, laid out for the page width and
+/// scrolled by line.
+fn render_journal(frame: &mut Frame, area: Rect, app: &App) {
+    use ratatui::widgets::Padding;
+    let j = &app.journal;
+    let dim = Style::default().fg(DIM);
+    let mut title = vec![Span::styled(
+        " Journal ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    if let Some(e) = j.current() {
+        title.push(Span::styled("· ", dim));
+        title.push(Span::styled(
+            format!("{} ", e.name),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        title.push(Span::styled(
+            format!("· {} of {} ", j.idx + 1, j.entries.len()),
+            dim,
+        ));
+    }
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .padding(Padding::horizontal(2))
+        .title(Line::from(title));
+    if let Some(t) = j.mtime {
+        let t: DateTime<Local> = t.into();
+        block = block.title(
+            Line::from(Span::styled(
+                format!(" saved {} ", t.format("%a %-I:%M %p")),
+                dim,
+            ))
+            .alignment(Alignment::Right),
+        );
+    }
+    let inner = block.inner(area);
+    j.page.set(usize::from(inner.height));
+
+    if j.current().is_none() || j.error.is_some() {
+        frame.render_widget(block, area);
+        let lines = match &j.error {
+            Some(e) => vec![Line::from(Span::styled(
+                format!("couldn't read the journal: {e}"),
+                Style::default().fg(Color::Yellow),
+            ))],
+            None => vec![
+                Line::from("No journal entries yet."),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("Looking for .md files in {}", j.dir.display()),
+                    dim,
+                )),
+                Line::from(Span::styled(
+                    "Set WICKD_JOURNAL_DIR to read a different folder.",
+                    dim,
+                )),
+            ],
+        };
+        let body = Rect {
+            y: inner.y + 1.min(inner.height),
+            height: inner.height.saturating_sub(1),
+            ..inner
+        };
+        frame.render_widget(
+            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+            body,
+        );
+        return;
+    }
+
+    let (lines, total, scroll) = j.with_rendered(inner.width, |r| {
+        let total = r.lines.len();
+        let scroll = j
+            .scroll
+            .min(total.saturating_sub(usize::from(inner.height)));
+        let shown: Vec<Line> = r
+            .lines
+            .iter()
+            .skip(scroll)
+            .take(usize::from(inner.height))
+            .cloned()
+            .collect();
+        (shown, total, scroll)
+    });
+    // Where the page is in the entry, bottom right.
+    let end = (scroll + usize::from(inner.height)).min(total);
+    let place = if total <= usize::from(inner.height) {
+        " all ".to_string()
+    } else if end == total {
+        " end ".to_string()
+    } else if scroll == 0 {
+        " top ".to_string()
+    } else {
+        format!(" {}% ", end * 100 / total.max(1))
+    };
+    block = block.title_bottom(Line::from(Span::styled(place, dim)).alignment(Alignment::Right));
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// SEC's `MMDD` fiscal year end as `Jan 31` (unchanged if it isn't MMDD).
@@ -1877,7 +1979,31 @@ fn help_section(title: &str, ctx: Ctx) -> Vec<Line<'static>> {
     out
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
+fn render_help(frame: &mut Frame, area: Rect, mode: Mode) {
+    // The journal has its own short card (the full one is already a
+    // screenful, and none of it applies there).
+    if mode == Mode::Journal {
+        let mut lines = help_section("journal", Ctx::Journal);
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "any key closes",
+            Style::default().fg(DIM),
+        )));
+        let w = 46.min(area.width.saturating_sub(2));
+        let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+        let rect = Rect {
+            x: area.x + (area.width.saturating_sub(w)) / 2,
+            y: area.y + (area.height.saturating_sub(h)) / 2,
+            width: w,
+            height: h,
+        };
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" keys ")),
+            rect,
+        );
+        return;
+    }
     let mut left = help_section("watchlist", Ctx::Watchlist);
     left.push(Line::from(""));
     left.extend(help_section("in play", Ctx::InPlay));
@@ -2551,6 +2677,157 @@ mod tests {
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('j'));
         shoot(&app, "3-row-without-plan");
+    }
+
+    fn journal_app(dir: &std::path::Path) -> App {
+        let mut app = App::new(vec!["AAPL".into()], "iex");
+        app.journal = crate::tui::journal::JournalState::new(dir.to_path_buf());
+        app
+    }
+
+    fn screen(app: &App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn journal_screen_shows_the_newest_entry_and_scrolls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body: String = (1..=60).map(|i| format!("para {i}\n\n")).collect();
+        std::fs::write(tmp.path().join("2026-11-12.md"), "# Thursday").unwrap();
+        std::fs::write(
+            tmp.path().join("2026-11-13.md"),
+            format!("# Friday\n\n{body}"),
+        )
+        .unwrap();
+        let mut app = journal_app(tmp.path());
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.mode, Mode::Journal);
+        let rows = screen(&app, 80, 20);
+        assert!(
+            rows[1].contains("Journal · 2026-11-13 · 2 of 2"),
+            "{}",
+            rows[1]
+        );
+        assert!(rows[2].contains("Friday") && rows[5].contains("para 1"));
+        assert!(rows[18].contains(" top "), "{}", rows[18]);
+        // J pages down; g e goes to the end; g g back to the top.
+        press(&mut app, KeyCode::Char('J'));
+        let rows = screen(&app, 80, 20);
+        assert!(!rows.iter().any(|r| r.contains("Friday")));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('e'));
+        let rows = screen(&app, 80, 20);
+        assert!(rows[17].contains("para 60") && rows[18].contains(" end "));
+        // h = the older entry, from its top.
+        press(&mut app, KeyCode::Char('h'));
+        let rows = screen(&app, 80, 20);
+        assert!(rows[1].contains("2026-11-12 · 1 of 2") && rows[2].contains("Thursday"));
+        assert!(rows[18].contains(" all "));
+        // ? lists this screen's keys, all of them on one card.
+        press(&mut app, KeyCode::Char('?'));
+        let help = screen(&app, 80, 30).join("\n");
+        for k in [
+            "older entry",
+            "newer entry",
+            "next heading",
+            "reload from disk",
+            "g w",
+            "back",
+        ] {
+            assert!(help.contains(k), "help is missing {k}:\n{help}");
+        }
+        press(&mut app, KeyCode::Char('?'));
+        // esc returns to where g j was pressed.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Watchlist);
+    }
+
+    #[test]
+    fn journal_empty_state_says_where_it_looks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("missing");
+        let mut app = journal_app(&dir);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('j'));
+        let all = screen(&app, 120, 12).join("\n");
+        assert!(all.contains("No journal entries yet."));
+        assert!(all.contains("missing"), "{all}");
+        assert!(all.contains("WICKD_JOURNAL_DIR"));
+    }
+
+    /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_journal -- --ignored`
+    /// writes HTML renders of the journal screen from the real journal
+    /// folder (`WICKD_JOURNAL_DIR`, else `~/trading-journal`).
+    #[test]
+    #[ignore]
+    fn snapshot_journal() {
+        let dir = std::env::var("WICKD_TUI_SNAPSHOT_DIR").expect("set WICKD_TUI_SNAPSHOT_DIR");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shoot = |app: &App, name: &str, w: u16, h: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, app)).unwrap();
+            std::fs::write(
+                format!("{dir}/{name}.html"),
+                to_html(term.backend().buffer(), name),
+            )
+            .unwrap();
+        };
+        // Scroll so the first line containing `needle` is `above` rows down.
+        let find = |app: &mut App, w: u16, needle: &str, above: usize| {
+            let at = app.journal.with_rendered(w - 6, |r| {
+                r.lines.iter().position(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+            });
+            app.journal
+                .scroll_to(at.expect(needle).saturating_sub(above));
+        };
+        let mut app = journal_app(&crate::tui::journal::default_dir());
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('j'));
+        app.flash = None;
+        let (w, h) = (160u16, 45u16);
+        shoot(&app, "1-newest-entry-top", w, h);
+        find(&mut app, w, "The plan", 1);
+        shoot(&app, "2-the-plan-tables", w, h);
+        // An older entry with a block quote and a numbered list, if any.
+        while app.journal.step_entry(-1) {
+            let has = |n: &str| app.journal.text.contains(n);
+            if has("\n> ") && has("\n1. ") {
+                app.flash = None;
+                let quote = app.journal.text.find("\n> ").unwrap_or(0);
+                let needle: String = app.journal.text[quote + 3..]
+                    .chars()
+                    .filter(|c| *c != '*')
+                    .take(12)
+                    .collect();
+                find(&mut app, w, &needle, 3);
+                shoot(&app, "3-block-quote", w, h);
+                find(&mut app, w, "1. ", 6);
+                shoot(&app, "3b-numbered-list", w, h);
+                break;
+            }
+        }
+        // A narrow terminal: tables wrap inside their columns.
+        let mut app = journal_app(&crate::tui::journal::default_dir());
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('j'));
+        app.flash = None;
+        let (w, h) = (100u16, 40u16);
+        find(&mut app, w, "The plan", 1);
+        shoot(&app, "4-narrow-table-wraps", w, h);
+        press(&mut app, KeyCode::Char('?'));
+        shoot(&app, "5-help", 100, 40);
     }
 
     /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_charts -- --ignored`

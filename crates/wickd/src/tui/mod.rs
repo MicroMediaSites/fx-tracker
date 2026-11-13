@@ -6,6 +6,8 @@
 //! - [`ui`]     — rendering
 //! - [`search`] — local symbol ranking over the cached asset list
 //! - [`inplay`] — the "in play today" list (movers, actives, rvol, news)
+//! - [`journal`] — the journal screen: markdown files from a folder
+//! - [`markdown`] — markdown → terminal lines
 //! - [`fx`]     — forex pairs: OANDA history and trading-day rules
 //! - [`live`]   — live forex ticks from the stream daemon (client only)
 //! - [`store`]  — watchlist + asset cache under `~/.wickd`
@@ -30,8 +32,10 @@ pub mod app;
 pub mod chart;
 pub mod fx;
 pub mod inplay;
+pub mod journal;
 pub mod keymap;
 pub mod live;
+pub mod markdown;
 pub mod reader;
 pub mod search;
 pub mod store;
@@ -461,6 +465,9 @@ fn run_loop(
     // modification time changes (checked every 2s).
     let mut lists_check = Every::new(Duration::from_secs(2));
     let mut lists_seen: Option<std::time::SystemTime> = None;
+    // Journal files are written by an editor or an agent while the TUI runs:
+    // re-read the folder and the open entry while that screen is up.
+    let mut journal_check = Every::new(Duration::from_secs(2));
     // Rebuild the in-play list every minute while it's on screen.
     let mut inplay_timer = Every::new(Duration::from_secs(60));
 
@@ -592,6 +599,14 @@ fn run_loop(
             }
         } else {
             inplay_timer.reset();
+        }
+
+        if app.mode == Mode::Journal {
+            if journal_check.due() {
+                app.journal.poll();
+            }
+        } else {
+            journal_check.reset();
         }
 
         // 3. Draw.
