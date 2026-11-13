@@ -64,7 +64,9 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 
   On a chart, `h`/`l` (or arrows) move a cursor candle by candle, `H`/`L` pan
   half a screen, `+`/`-` zoom, `0` returns to fit, `[`/`]` change range, and
-  `g g`/`g e` jump to the oldest or latest candle.
+  `g g`/`g e` jump to the oldest or latest candle. `j`/`k` move a horizontal
+  price line down and up in small round steps (`J`/`K` take steps five times
+  as big), `p` types an exact price for it, and `x` removes it.
 
   `esc` cancels a pending prefix, and `?` lists every key. The help screen,
   the footer and the panel are all generated from the one keymap table
@@ -159,6 +161,12 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
     as outlines. Zooming out merges 2, 4 or 8 bars per candle.
   - A readout line shows the cursor candle's time, OHLC, change and volume.
   - The price axis on the right has gridlines and a tag for the last price.
+  - The price line (`j`/`k`, or `p` to type a value) is a dashed horizontal
+    line with its price tagged on the axis. The readout shows the price and
+    how far it is from the last price. It starts at the cursor candle's
+    close, stays through range changes, and stretches the axis when it moves
+    past the top or bottom. A small step is a round number no bigger than
+    one chart row (never below a cent, or a tenth of a pip for pairs).
   - Volume sits underneath, scaled to the 95th percentile so one
     closing-auction bar doesn't flatten the rest.
   - Intraday ranges show regular hours (09:30–16:00 ET) unless you toggle

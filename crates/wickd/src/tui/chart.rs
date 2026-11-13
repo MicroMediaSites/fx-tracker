@@ -534,6 +534,12 @@ pub struct ChartView {
     pub fit: bool,
     /// Plot width in columns, as last measured by the renderer.
     pub plot_cols: Cell<usize>,
+    /// The price line: a horizontal cursor at an exact price (`j`/`k` step
+    /// it, `p` types a value). `None` = no line.
+    pub price: Option<f64>,
+    /// One small price-line step: a round number no bigger than one chart
+    /// row, as last measured by the renderer.
+    pub price_step: Cell<f64>,
 }
 
 impl Default for ChartView {
@@ -549,6 +555,8 @@ impl Default for ChartView {
             visible: Cell::new(60),
             fit: true,
             plot_cols: Cell::new(120),
+            price: None,
+            price_step: Cell::new(0.01),
         }
     }
 }
@@ -679,6 +687,28 @@ impl ChartView {
         self.settle(n);
     }
 
+    /// Step the price line `steps` small steps (negative = down). With no
+    /// line yet it starts from `from` (the cursor candle's close). The line
+    /// lands on a multiple of the step, so its values stay round.
+    pub fn move_price(&mut self, steps: i32, from: f64) {
+        let step = self.price_step.get();
+        if step <= 0.0 || !step.is_finite() {
+            return;
+        }
+        let base = self.price.unwrap_or(from);
+        // Snap toward the direction of travel first, so a typed off-grid
+        // value moves to the next round number rather than past it.
+        let units = base / step;
+        let snapped = if (units - units.round()).abs() < 1e-6 {
+            units.round() + f64::from(steps)
+        } else if steps > 0 {
+            units.floor() + f64::from(steps)
+        } else {
+            units.ceil() + f64::from(steps)
+        };
+        self.price = Some((snapped * step).max(0.0));
+    }
+
     pub fn jump_start(&mut self, n: usize) {
         if n == 0 {
             return;
@@ -726,6 +756,24 @@ pub fn half_row(p: f64, lo: f64, hi: f64, rows: u16) -> usize {
 }
 
 /// "Nice" tick step (1, 2, 2.5, 5 × 10ⁿ) giving about `target` ticks.
+/// The largest 1 / 2 / 5 × 10ⁿ value that is not above `raw` (never below
+/// `min`): the price line's small step.
+pub fn nice_floor(raw: f64, min: f64) -> f64 {
+    if raw <= 0.0 || !raw.is_finite() {
+        return min;
+    }
+    let mag = 10f64.powf(raw.log10().floor());
+    let norm = raw / mag;
+    let nice = if norm >= 5.0 {
+        5.0
+    } else if norm >= 2.0 {
+        2.0
+    } else {
+        1.0
+    };
+    (nice * mag).max(min)
+}
+
 pub fn nice_step(range: f64, target: usize) -> f64 {
     if range <= 0.0 || target == 0 {
         return 1.0;
@@ -909,6 +957,8 @@ pub struct ChartWidget<'a> {
     pub candles: &'a [Candle],
     pub view: &'a ChartView,
     pub style: Style2,
+    /// The smallest price-line step (a cent; a tenth of a pip for pairs).
+    pub price_tick: f64,
     /// Dim reference line (the 1D prior close).
     pub reference: Option<f64>,
     /// Price for the right-axis tag (live last), else the newest close.
@@ -1048,8 +1098,18 @@ impl Widget for ChartWidget<'_> {
                 hi = hi.max(*v);
             }
         }
+        // The price line is always on scale: stepping it past an edge
+        // stretches the axis.
+        if let Some(p) = self.view.price {
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
         let pad = ((hi - lo) * 0.04).max(hi.abs() * 0.0005);
         let (lo, hi) = (lo - pad, hi + pad);
+        self.view.price_step.set(nice_floor(
+            (hi - lo) / f64::from(price_rows.max(1)),
+            self.price_tick,
+        ));
         let row_of = |p: f64| (half_row(p, lo, hi, price_rows) / 2) as u16;
 
         // Gridlines + right-axis labels.
@@ -1205,6 +1265,18 @@ impl Widget for ChartWidget<'_> {
             }
         }
 
+        // Price line (behind the candles), crossing the cursor column.
+        let price_row = self.view.price.map(|p| row_of(p).min(price_rows - 1));
+        if let Some(r) = price_row {
+            let st = Style::default().fg(pal.dim);
+            let xc =
+                (cursor >= start && cursor < end).then(|| x_of(cursor - start) + (bw / 2) as u16);
+            for x in x0..x_axis {
+                let g = if Some(x) == xc { "┼" } else { "╌" };
+                buf.set_string(x, y0 + r, g, st);
+            }
+        }
+
         // Candles or line.
         let color_of = |c: &Candle| if c.up() { pal.up } else { pal.down };
         match self.style {
@@ -1341,6 +1413,19 @@ impl Widget for ChartWidget<'_> {
             );
         }
 
+        // Price-line tag on the axis (over the last-price tag if they meet).
+        if let (Some(p), Some(r)) = (self.view.price, price_row) {
+            buf.set_string(
+                x_axis,
+                y0 + r,
+                format!(" {} ", (self.fmt_price)(p)),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Gray)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+
         // Readout for the cursor candle.
         let c = &self.candles[cursor];
         let col = color_of(c);
@@ -1369,6 +1454,17 @@ impl Widget for ChartWidget<'_> {
             if let Some(v) = o.values.get(cursor).copied().flatten() {
                 put(format!("  {} ", o.label), dim);
                 put((self.fmt_price)(v), Style::default().fg(o.color));
+            }
+        }
+        if let Some(p) = self.view.price {
+            put("   line ".into(), dim);
+            put(
+                (self.fmt_price)(p),
+                Style::default().fg(pal.text).add_modifier(Modifier::BOLD),
+            );
+            if last > 0.0 {
+                let pct = (p - last) / last * 100.0;
+                put(format!(" ({pct:+.2}% from last)"), dim);
             }
         }
         if self.view.cursor.is_some() {
@@ -1448,6 +1544,18 @@ mod tests {
         assert_eq!((b.len(), ext), (1, true));
         // Daily ranges are never filtered.
         assert_eq!(session_bars(&bars, HistoryRange::Year1, false).0.len(), 2);
+    }
+
+    #[test]
+    fn price_step_is_a_round_number_within_one_row() {
+        // 30 of range over 40 rows = 0.75 a row → 0.5.
+        assert_eq!(nice_floor(0.75, 0.01), 0.5);
+        assert_eq!(nice_floor(2.4, 0.01), 2.0);
+        assert_eq!(nice_floor(9.9, 0.01), 5.0);
+        assert!((nice_floor(0.00037, 0.00001) - 0.0002).abs() < 1e-12);
+        // Never finer than the instrument's tick.
+        assert_eq!(nice_floor(0.004, 0.01), 0.01);
+        assert_eq!(nice_floor(0.0, 0.01), 0.01);
     }
 
     #[test]
@@ -1588,6 +1696,7 @@ mod tests {
             candles: &candles,
             view: &v,
             style: Style2::Candles,
+            price_tick: 0.01,
             reference: None,
             last_price: None,
             delayed: false,
@@ -1788,6 +1897,7 @@ mod tests {
             candles: &candles,
             view: &v,
             style: Style2::Candles,
+            price_tick: 0.01,
             reference: None,
             last_price: None,
             delayed: false,
@@ -1867,6 +1977,7 @@ mod tests {
             candles: &candles,
             view: &v,
             style: Style2::Candles,
+            price_tick: 0.01,
             reference: None,
             last_price: None,
             delayed: false,
@@ -1942,6 +2053,7 @@ mod tests {
             candles,
             view,
             style,
+            price_tick: 0.01,
             reference: Some(candles[0].open),
             last_price: None,
             delayed: false,
@@ -2047,6 +2159,7 @@ mod tests {
                 candles: &candles,
                 view: &v,
                 style: Style2::Candles,
+                price_tick: 0.01,
                 reference: None,
                 last_price: Some(candles[29].close + 2.0),
                 delayed,

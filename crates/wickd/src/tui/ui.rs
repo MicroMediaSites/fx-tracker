@@ -471,6 +471,17 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 /// The footer's hint line for a screen, generated from the keymap: the
 /// prefix categories first (they hold most commands), then the bare keys
 /// that aren't plain movement.
+/// The smallest price-line step for a symbol: a cent, or a tenth of a pip
+/// for a forex pair (OANDA's quote precision).
+pub(crate) fn price_tick(symbol: &str) -> f64 {
+    use rust_decimal::prelude::ToPrimitive;
+    if super::fx::is_fx(symbol) {
+        super::fx::pip_size(symbol).to_f64().unwrap_or(0.0001) / 10.0
+    } else {
+        0.01
+    }
+}
+
 fn footer_hints(ctx: Ctx) -> String {
     let mut parts: Vec<String> = keymap::prefixes_in(ctx)
         .into_iter()
@@ -501,6 +512,22 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                     "  {n} match{} · ↑↓ pick · enter jump · esc cancel",
                     if n == 1 { "" } else { "es" }
                 ),
+                Style::default().fg(DIM),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if let Some(q) = &app.price_input {
+        let line = Line::from(vec![
+            Span::styled(
+                "price ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(q.clone()),
+            Span::styled("▏", Style::default().fg(ACCENT)),
+            Span::styled(
+                "  enter puts the line there · empty removes it · esc cancels",
                 Style::default().fg(DIM),
             ),
         ]);
@@ -1858,7 +1885,7 @@ fn render_chart_view(
             " · MA: 6M/1Y only"
         });
     }
-    title.push_str(" · −/+ zoom  h/l cursor  H/L pan ");
+    title.push_str(" · −/+ zoom  h/l cursor  H/L pan  j/k price line  p type a price ");
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(GRID))
@@ -1872,6 +1899,7 @@ fn render_chart_view(
             candles: &candles,
             view: &d.chart,
             style,
+            price_tick: price_tick(&d.symbol),
             reference,
             last_price,
             delayed,
@@ -2828,6 +2856,47 @@ mod tests {
         shoot(&app, "4-narrow-table-wraps", w, h);
         press(&mut app, KeyCode::Char('?'));
         shoot(&app, "5-help", 100, 40);
+    }
+
+    /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_price_line -- --ignored`
+    /// writes HTML renders of the chart's price line for visual review.
+    #[test]
+    #[ignore]
+    fn snapshot_price_line() {
+        let dir = std::env::var("WICKD_TUI_SNAPSHOT_DIR").expect("set WICKD_TUI_SNAPSHOT_DIR");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (158u16, 50u16);
+        let shoot = |app: &App, name: &str| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, app)).unwrap(); // measure
+            term.draw(|f| render(f, app)).unwrap();
+            let html = to_html(term.backend().buffer(), name);
+            std::fs::write(format!("{dir}/{name}.html"), html).unwrap();
+        };
+        let mut app = sample_app();
+        press(&mut app, KeyCode::Enter); // SPY
+        press(&mut app, KeyCode::Char('5')); // 1Y daily
+        app.set_history("SPY", HistoryRange::Year1, Ok(daily_walk(250, 560.0, 5)));
+        shoot(&app, "0-before-no-line");
+        for _ in 0..12 {
+            press(&mut app, KeyCode::Char('h'));
+        }
+        press(&mut app, KeyCode::Char('k'));
+        shoot(&app, "1-k-starts-the-line-at-the-cursor-close");
+        press(&mut app, KeyCode::Char('K'));
+        press(&mut app, KeyCode::Char('K'));
+        press(&mut app, KeyCode::Char('k'));
+        shoot(&app, "2-after-K-K-k");
+        press(&mut app, KeyCode::Char('p'));
+        for c in "612.4".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        shoot(&app, "3-p-typing-a-price");
+        press(&mut app, KeyCode::Enter);
+        shoot(&app, "4-line-at-the-typed-price");
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('l'));
+        shoot(&app, "5-line-chart");
     }
 
     /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_charts -- --ignored`
