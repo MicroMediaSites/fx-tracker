@@ -22,6 +22,7 @@ pub enum Mode {
     Search,
     Detail,
     InPlay,
+    Journal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,6 +423,8 @@ pub struct App {
     pub pending: Option<Pending>,
     pub search: SearchState,
     pub detail: Option<DetailState>,
+    /// The journal screen (`g j`).
+    pub journal: super::journal::JournalState,
     /// Active `g f` filter on the watchlist / in-play list.
     pub find: Option<FindState>,
     pub inplay: InPlayState,
@@ -467,6 +470,7 @@ impl App {
             pending: None,
             search: SearchState::default(),
             detail: None,
+            journal: super::journal::JournalState::new(super::journal::default_dir()),
             find: None,
             inplay: InPlayState::default(),
             quotes_error: None,
@@ -848,6 +852,7 @@ impl App {
             Mode::Watchlist => Some(Ctx::Watchlist),
             Mode::Detail => Some(Ctx::Detail),
             Mode::InPlay => Some(Ctx::InPlay),
+            Mode::Journal => Some(Ctx::Journal),
             Mode::Search => None,
         }
     }
@@ -881,6 +886,7 @@ impl App {
                 Ctx::Watchlist => self.exec_watchlist(cmd, n),
                 Ctx::Detail => self.exec_detail(cmd),
                 Ctx::InPlay => self.exec_inplay(cmd),
+                Ctx::Journal => self.exec_journal(cmd),
             },
             Step::Pending | Step::Cancel | Step::None => vec![],
         }
@@ -910,6 +916,7 @@ impl App {
             Cmd::Search => self.open_search(),
             Cmd::Find => self.open_find(),
             Cmd::GoInPlay => return self.open_inplay(),
+            Cmd::GoJournal => self.open_journal(),
             Cmd::Info => {
                 let sym = self.selected_symbol().map(str::to_string);
                 return self.open_info(sym);
@@ -1016,6 +1023,65 @@ impl App {
                         return vec![Action::SaveWatchlist, Action::RefreshQuotes];
                     }
                 }
+            }
+            _ => {}
+        }
+        vec![]
+    }
+
+    /// `g j`: the journal, opened on its newest entry.
+    fn open_journal(&mut self) {
+        self.journal.back_to = self.mode;
+        self.journal.open();
+        self.mode = Mode::Journal;
+    }
+
+    fn exec_journal(&mut self, cmd: Cmd) -> Vec<Action> {
+        let page = self.journal.page.get().saturating_sub(2).max(1) as isize;
+        let j = &mut self.journal;
+        match cmd {
+            Cmd::Back => {
+                // Back to the chart only while it is still open.
+                self.mode = match j.back_to {
+                    Mode::Detail if self.detail.is_none() => Mode::Watchlist,
+                    Mode::Journal | Mode::Search => Mode::Watchlist,
+                    m => m,
+                };
+            }
+            Cmd::GoWatchlist => {
+                self.detail = None;
+                self.mode = Mode::Watchlist;
+            }
+            Cmd::GoInPlay => {
+                self.detail = None;
+                return self.open_inplay();
+            }
+            Cmd::Help => self.show_help = true,
+            Cmd::Down => j.scroll_by(1),
+            Cmd::Up => j.scroll_by(-1),
+            Cmd::PageDown => j.scroll_by(page),
+            Cmd::PageUp => j.scroll_by(-page),
+            Cmd::GoTop => j.scroll_to(0),
+            Cmd::GoEnd => j.scroll_to(usize::MAX),
+            Cmd::EntryOlder => {
+                if !j.step_entry(-1) && !j.entries.is_empty() {
+                    self.flash = Some("this is the oldest entry".into());
+                }
+            }
+            Cmd::EntryNewer => {
+                if !j.step_entry(1) && !j.entries.is_empty() {
+                    self.flash = Some("this is the newest entry".into());
+                }
+            }
+            Cmd::NextHeading => {
+                j.jump_heading(true);
+            }
+            Cmd::PrevHeading => {
+                j.jump_heading(false);
+            }
+            Cmd::Refresh => {
+                j.reload();
+                self.flash = Some("journal reloaded".into());
             }
             _ => {}
         }
@@ -1230,6 +1296,7 @@ impl App {
         match cmd {
             Cmd::Find => self.open_find(),
             Cmd::Back | Cmd::GoWatchlist => self.mode = Mode::Watchlist,
+            Cmd::GoJournal => self.open_journal(),
             Cmd::Help => self.show_help = true,
             Cmd::Info => {
                 let sym = self.inplay.selected_symbol();
@@ -1617,6 +1684,8 @@ impl App {
                 self.detail = None;
                 return self.open_inplay();
             }
+            // The chart stays open underneath: `esc` in the journal returns to it.
+            Cmd::GoJournal => self.open_journal(),
             Cmd::Help => self.show_help = true,
             Cmd::Info => return self.open_info(Some(sym)),
             Cmd::Range(r) => return self.set_range(r),

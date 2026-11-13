@@ -54,8 +54,8 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   back out (`esc`), search (`/`), refresh (`r`) and quit (`q`). A prefix letter
   opens a category, and a panel lists the next keys:
   - `g` go to: `g g` top, `g e` end, `g <n> g` row n, `g w` watchlist, `g i`
-    in play today, `g l` the open list (again: the next list), `g s` / `g x`
-    the stocks / forex section.
+    in play today, `g j` the journal, `g l` the open list (again: the next
+    list), `g s` / `g x` the stocks / forex section.
   - `w` watchlist: `w a` add, `w d` remove, `w u` undo, `w j`/`w k` move.
   - `t` time range: `t d`/`t w`/`t m`/`t 6`/`t y`/`t 5`/`t a` for
     1D/5D/1M/6M/1Y/5Y/MAX.
@@ -73,6 +73,20 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   Stocks show last, change vs the prior session close, day range, volume and a
   sparkline of today. Moves (`w j`/`w k`) stay inside a section, and a new
   symbol lands at the end of its own section.
+- **Journal** (`g j`, from any screen). Shows the markdown files in
+  `~/trading-journal` (set `WICKD_JOURNAL_DIR` to read another folder) as
+  formatted text, one entry at a time, opening on the newest by file name
+  (date-named files, so today's). Headings, bold / italic / struck text, inline
+  code, bullets and numbered lists (nested, with a hanging indent), block
+  quotes, code blocks, task boxes and tables are laid out for the terminal
+  width; wide tables wrap inside their columns, and nothing is cut off.
+  `j`/`k` scroll a line, `J`/`K` a page, `g g`/`g e` go to the top / end,
+  `h`/`l` (or arrows) open the older / newer entry, `[`/`]` jump to the
+  previous / next heading, `r` reloads, and `esc` goes back to where you were
+  (a chart stays open underneath). Files are read in place and re-read when
+  they change on disk, so edits from an editor or an agent appear within a
+  couple of seconds without losing your place. It is a viewer: nothing in the
+  TUI writes to the folder.
 - **Info** (`i`). On any row (lists, stocks, forex, in play) or a symbol
   screen, `i` opens a card saying what the symbol is: the Wikipedia summary
   (`o` opens the article in the reader window), the lists it's on with their
