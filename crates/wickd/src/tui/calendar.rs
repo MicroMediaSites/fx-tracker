@@ -966,7 +966,13 @@ impl CalendarState {
         let mut out: Vec<ReactionAsk> = Vec::new();
         for row in &self.rows {
             let Row::Earn(e) = row else { continue };
-            if !(e.slate || e.listed) || !e.past || !self.headlines_of(e).is_empty() {
+            // Wanted until the release's own figures are stored: a title
+            // alone says a report is out, not what it said.
+            let complete = self
+                .headlines
+                .get(&(e.symbol.clone(), e.date))
+                .is_some_and(|f| f.has_lede());
+            if !(e.slate || e.listed) || !e.past || complete {
                 continue;
             }
             let key = (e.symbol.clone(), e.date);
@@ -1020,6 +1026,9 @@ impl CalendarState {
             }
             if !self.headlines_of(e).is_empty() {
                 out.insert(format!("{} headlines", e.symbol));
+            }
+            if self.headlines_of(e).iter().any(|h| !h.lede.is_empty()) {
+                out.insert(format!("{} release", e.symbol));
             }
             if self.reported_of(e).is_some() {
                 out.insert(format!("{} figures", e.symbol));
@@ -1244,16 +1253,12 @@ pub async fn fetch_headlines(
     let mut failed = 0;
     let mut first: Option<String> = None;
     for (symbol, date, session) in asks {
-        let r = match earnings_headlines::window(date, session) {
-            Some((start, end)) => client
-                .news_window(std::slice::from_ref(&symbol), start, end.min(now), 50)
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|items| {
-                    earnings_headlines::store_fetch(dir, &symbol, date, &items, now).map(|_| ())
-                }),
-            None => Err(format!("no time window for {symbol} on {date}")),
-        };
+        let r = earnings_headlines::fetch_report(client, &symbol, date, session, now)
+            .await
+            .and_then(|f| {
+                earnings_headlines::store_fetch_with(dir, &symbol, date, &f.items, &f.ledes, now)
+                    .map(|_| ())
+            });
         if let Err(e) = r {
             failed += 1;
             first.get_or_insert(e);

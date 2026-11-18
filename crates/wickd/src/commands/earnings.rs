@@ -77,9 +77,10 @@ enum EarningsCommand {
     /// what is stored. The source is unofficial and can lag a report by a
     /// day.
     Results(ResultsArgs),
-    /// The news headlines that state a report's results, the same day:
-    /// fetches them from the broker's news feed, stores them, and prints
-    /// what was picked (`--all`: everything scanned too).
+    /// The news that states a report's results, the same day: fetches the
+    /// report's headlines and the opening of its press release from the
+    /// broker's news feed, stores them (the watch reads the same files),
+    /// and prints what was picked (`--all`: everything scanned too).
     Headlines(HeadlinesArgs),
 }
 
@@ -230,7 +231,7 @@ fn report_of(
 
 async fn headlines(args: HeadlinesArgs, out: Out) -> ! {
     use wickd_core::earnings_headlines as eh;
-    use wickd_core::equities::alpaca::{AlpacaClient, AlpacaError, QuoteFeed};
+    use wickd_core::equities::alpaca::{AlpacaClient, QuoteFeed};
     let Some(symbol) = results_symbol(&args.symbol) else {
         out.fail(
             exit::VALIDATION,
@@ -257,7 +258,11 @@ async fn headlines(args: HeadlinesArgs, out: Out) -> ! {
         );
     };
     let Some((start, end)) = eh::window(date, session) else {
-        out.fail(exit::VALIDATION, "earnings_bad_date", format!("{date} has no next day"));
+        out.fail(
+            exit::VALIDATION,
+            "earnings_bad_date",
+            format!("{date} has no next day"),
+        );
     };
     let creds = match crate::alpaca_creds::resolve() {
         Ok(Some((c, _))) => c,
@@ -269,19 +274,23 @@ async fn headlines(args: HeadlinesArgs, out: Out) -> ! {
         Err(e) => out.fail(exit::AUTH, "alpaca_keys_unreadable", format!("{e:#}")),
     };
     let client = AlpacaClient::new(creds, QuoteFeed::Iex);
-    let items = match client
-        .news_window(std::slice::from_ref(&symbol), start, end.min(now), 50)
-        .await
-    {
-        Ok(i) => i,
-        Err(AlpacaError::Auth(_)) => out.fail(
-            exit::AUTH,
-            "alpaca_auth",
-            "Alpaca rejected the keys — run `wickd alpaca login`",
+    let fetched = match eh::fetch_report(&client, &symbol, date, session, now).await {
+        Ok(f) => f,
+        Err(e) => out.fail(
+            exit::GENERIC,
+            "earnings_headlines_failed",
+            format!("{e} (if the keys were rejected, run `wickd alpaca login`)"),
         ),
-        Err(e) => out.fail(exit::GENERIC, "earnings_headlines_failed", format!("{e}")),
     };
-    let stored = match eh::store_fetch(&eh::headlines_dir(&earn_dir), &symbol, date, &items, now) {
+    let items = &fetched.items;
+    let stored = match eh::store_fetch_with(
+        &eh::headlines_dir(&earn_dir),
+        &symbol,
+        date,
+        items,
+        &fetched.ledes,
+        now,
+    ) {
         Ok(f) => f,
         Err(e) => out.fail(exit::GENERIC, "earnings_headlines_store_failed", e),
     };
@@ -289,9 +298,15 @@ async fn headlines(args: HeadlinesArgs, out: Out) -> ! {
         "symbol": symbol,
         "date": date.to_string(),
         "session": session,
-        "window": { "from": start, "to": end },
+        // What was actually read: the window, cut off at now.
+        "window": { "from": start, "to": end.min(now) },
         "scanned": items.len(),
         "picked": stored.picked,
+        // How much text the feed carried for the best item (characters of
+        // content and of summary); null when its body couldn't be read.
+        "best_body": fetched.body_chars.map(|(content, summary)| {
+            serde_json::json!({ "content_chars": content, "summary_chars": summary })
+        }),
     });
     if args.all {
         payload["all"] = items

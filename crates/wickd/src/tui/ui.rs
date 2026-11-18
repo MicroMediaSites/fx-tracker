@@ -623,6 +623,8 @@ fn calendar_box(app: &App) -> Option<(String, Vec<String>)> {
                     c.clock.local(h.time).format("%a %-I:%M %p"),
                     h.headline
                 ));
+                // The release's own opening figures, in the company's words.
+                text.extend(h.lede.iter().cloned());
             }
             match c.reported_of(e) {
                 Some(r) => text.push(reported_sentence(r)),
@@ -3601,6 +3603,33 @@ mod tests {
         .unwrap();
     }
 
+    /// Store a report's press release (its title and its text), the way a
+    /// headlines fetch that read the body would.
+    fn store_release(app: &App, symbol: &str, date: &str, title: (&str, &str), html: &str) {
+        use wickd_core::earnings_headlines::{headlines_dir, lede, store_fetch_with};
+        use wickd_core::equities::alpaca::NewsItem;
+        let item = NewsItem {
+            id: 7,
+            headline: title.1.to_string(),
+            summary: String::new(),
+            created_at: title.0.parse().unwrap(),
+            symbols: vec![symbol.to_string()],
+            source: "fiscal.ai".into(),
+            url: None,
+        };
+        let mut ledes = std::collections::HashMap::new();
+        ledes.insert(7, lede(html, ""));
+        store_fetch_with(
+            &headlines_dir(app.calendar.earn_dir.as_ref().unwrap()),
+            symbol,
+            date.parse().unwrap(),
+            &[item],
+            &ledes,
+            Utc::now(),
+        )
+        .unwrap();
+    }
+
     /// Store what a company reported, the way a results fetch would.
     fn store_reported(app: &App, symbol: &str, date: &str, eps: &str, consensus: &str, surprise: &str) {
         use wickd_core::earnings_results::{results_dir, write_results, ResultRow, ResultsFile};
@@ -4123,17 +4152,53 @@ mod tests {
         app.flash = None;
         let actions = press(&mut app, KeyCode::Char('r'));
         assert!(matches!(actions.first(), Some(Action::FetchEarnings(_))), "{actions:?}");
-        // TGT still has no headline, so it is asked about again despite
-        // having been asked a moment ago.
+        // TGT still has no headline, and NVDA has a title but not the
+        // release's figures: both are asked about again, despite having been
+        // asked a moment ago.
         assert!(
-            actions.iter().any(|a| matches!(a, Action::FetchHeadlines(h) if h.len() == 1 && h[0].0 == "TGT")),
+            actions.iter().any(|a| matches!(a, Action::FetchHeadlines(h) if h.len() == 2)),
             "{actions:?}"
         );
         app.set_earnings_fetch(Ok(vec![]));
-        app.set_headlines(Ok((1, 0, None)));
+        app.set_headlines(Ok((2, 0, None)));
         app.set_results(Ok(vec![]));
         give_reactions(&mut app);
         assert_eq!(app.flash.as_deref(), Some("Updated. Nothing new came in."));
+        // The next update brings the release's own figures for NVDA: that
+        // counts as something new, it shows under the title, and NVDA isn't
+        // asked about again.
+        press(&mut app, KeyCode::Char('r'));
+        app.set_earnings_fetch(Ok(vec![]));
+        store_release(
+            &app,
+            "NVDA",
+            "2026-11-17",
+            ("2026-11-17T21:21:00Z", "NVIDIA Reports Financial Results for Third Quarter Fiscal 2027"),
+            "<p>NVIDIA today reported revenue for the third quarter of $115.8 billion, up 103% from a year ago.</p>",
+        );
+        app.set_headlines(Ok((2, 0, None)));
+        app.set_results(Ok(vec![]));
+        give_reactions(&mut app);
+        assert_eq!(app.flash.as_deref(), Some("Updated. New for NVDA."));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        let rows = screen(&app, 130, 34);
+        let all = rows.join("\n");
+        let at = |needle: &str| {
+            rows.iter()
+                .position(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?} in\n{all}"))
+        };
+        assert_eq!(
+            at("NVIDIA today reported revenue for the third quarter of $115.8 billion") ,
+            at("Tue 2:21 PM  NVIDIA Reports Financial Results") + 1,
+            "the release's figures sit right under its title"
+        );
+        assert!(!all.contains("<p>"));
+        assert_eq!(
+            app.calendar.headlines_wanted(true).iter().map(|a| a.0.as_str()).collect::<Vec<_>>(),
+            ["TGT"]
+        );
         // A piece that fails is said along the bottom; the update still ends.
         press(&mut app, KeyCode::Char('r'));
         app.set_earnings_fetch(Ok(vec![]));
