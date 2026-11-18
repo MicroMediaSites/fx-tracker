@@ -6,6 +6,7 @@
 //! - [`ui`]     — rendering
 //! - [`search`] — local symbol ranking over the cached asset list
 //! - [`inplay`] — the "in play today" list (movers, actives, rvol, news)
+//! - [`calendar`] — the calendar screen: upcoming economic events and earnings
 //! - [`journal`] — the journal screen: markdown files from a folder
 //! - [`markdown`] — markdown → terminal lines
 //! - [`fx`]     — forex pairs: OANDA history and trading-day rules
@@ -32,6 +33,7 @@ pub mod app;
 pub mod chart;
 pub mod fx;
 pub mod inplay;
+pub mod calendar;
 pub mod journal;
 pub mod keymap;
 pub mod live;
@@ -76,6 +78,8 @@ enum Request {
     FxQuotes(Vec<String>),
     FxAssets,
     Info(String),
+    /// Fetch these days of the earnings calendar into this folder.
+    Earnings(std::path::PathBuf, Vec<chrono::NaiveDate>),
 }
 
 /// Results coming back to the run loop.
@@ -93,6 +97,7 @@ enum Reply {
     FxAssets(Result<Vec<Asset>, String>),
     Live(live::LiveEvent),
     Info(String, Result<crate::info::SymbolInfo, String>),
+    Earnings(Result<Vec<wickd_core::earnings_store::DayOutcome>, String>),
 }
 
 /// Headline lookback, shared by the list's NEWS column and the side pane so
@@ -215,6 +220,19 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                     }
                     Request::Sparks(syms) if stocks(syms.clone()).is_empty() => {
                         Reply::Sparks(Ok(HashMap::new()))
+                    }
+                    Request::Earnings(dir, dates) => {
+                        use wickd_core::earnings_store as es;
+                        Reply::Earnings(match es::http_client() {
+                            Ok(http) => Ok(es::sync_days(
+                                &http,
+                                es::NASDAQ_EARNINGS_URL,
+                                &dir,
+                                &dates,
+                            )
+                            .await),
+                            Err(e) => Err(e),
+                        })
                     }
                     Request::Info(sym) => {
                         let r = crate::info::fetch(&sym, false)
@@ -505,6 +523,7 @@ fn run_loop(
                     }
                 }
                 Reply::Info(sym, r) => app.set_info(&sym, r),
+                Reply::Earnings(r) => app.set_earnings_fetch(r),
                 Reply::Live(live::LiveEvent::Connected(up)) => app.fx_live = up,
                 Reply::Live(live::LiveEvent::Quote(q)) => app.apply_tick(q),
                 Reply::FxAssets(r) => match r {
@@ -656,6 +675,12 @@ fn run_loop(
                 Action::FetchHistory(s, r) => send(Request::History(s, r)),
                 Action::FetchInPlay => send(Request::InPlay(app.watchlist.clone())),
                 Action::FetchNews(s) => send(Request::News(s)),
+                Action::FetchEarnings(dates) => match app.calendar.earn_dir.clone() {
+                    Some(dir) => send(Request::Earnings(dir, dates)),
+                    None => app.set_earnings_fetch(Err(
+                        "couldn't find the wickd data folder".into(),
+                    )),
+                },
                 Action::SaveWatchlist => {
                     if let Err(e) = store::save_watchlist(&app.watchlist) {
                         app.flash = Some(format!("could not save watchlist: {e:#}"));

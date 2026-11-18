@@ -55,8 +55,8 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   back out (`esc`), search (`/`), refresh (`r`) and quit (`q`). A prefix letter
   opens a category, and a panel lists the next keys:
   - `g` go to: `g g` top, `g e` end, `g <n> g` row n, `g w` watchlist, `g i`
-    in play today, `g j` the journal, `g l` the open list (again: the next
-    list), `g s` / `g x` the stocks / forex section.
+    in play today, `g j` the journal, `g c` the calendar, `g l` the open
+    list (again: the next list), `g s` / `g x` the stocks / forex section.
   - `w` watchlist: `w a` add, `w d` remove, `w u` undo, `w j`/`w k` move.
   - `t` time range: `t d`/`t w`/`t m`/`t 6`/`t y`/`t 5`/`t a` for
     1D/5D/1M/6M/1Y/5Y/MAX.
@@ -90,6 +90,29 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   they change on disk, so edits from an editor or an agent appear within a
   couple of seconds without losing your place. It is a viewer: nothing in the
   TUI writes to the folder.
+- **Calendar** (`g c`, from any screen). What is coming that can move the
+  market: today and the six days after it, a heading per day. Under each day
+  come the US economic releases in time order (local time, impact, forecast,
+  previous), then the companies reporting earnings: before the open, after
+  the close, then those with no time given, largest first, with the expected
+  EPS, last year's EPS and market value.
+  - By default it shows releases of medium impact and up, and companies worth
+    $10 billion or more, plus every symbol on the watchlist or a `wickd list`
+    whatever its size (marked `★`). `a` switches to everything and back; a
+    line under each day says how many smaller companies are hidden.
+  - Releases and reports that are already out are dimmed, and the cursor
+    starts on the next one still to come. A before-the-open report counts as
+    out at the 9:30 Eastern open, an after-the-close one at 8:00 PM Eastern.
+  - `j`/`k` move between rows, `J`/`K` a page, `g g`/`g e` go to the top /
+    end, `enter` on a company opens its chart (`esc` there comes back), and
+    `esc` returns to where you were.
+  - Economic events are read from `~/.wickd/calendar/` (kept fresh by
+    `wickd calendar sync`; this screen never writes it). Earnings are read
+    from `~/.wickd/earnings/`: what is stored shows at once, and a background
+    fetch runs when a shown weekday has no file or the files are more than
+    six hours old. `r` fetches now. The header says how fresh each store is.
+    A failed fetch keeps the stored rows and says so along the bottom edge.
+    The earnings source is unofficial (see `wickd earnings`).
 - **Info** (`i`). On any row (lists, stocks, forex, in play) or a symbol
   screen, `i` opens a card saying what the symbol is: the Wikipedia summary
   (`o` opens the article in the reader window), the lists it's on with their
