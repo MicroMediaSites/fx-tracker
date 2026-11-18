@@ -307,140 +307,169 @@ fn fit_right(text: &str, width: usize) -> String {
     format!("{}{text}", " ".repeat(width - text.width()))
 }
 
-/// Column widths of the calendar screen for a body `w` columns wide. The
-/// last-year and previous columns are the first to go on a narrow terminal.
+/// Column widths of the calendar screen for a body `w` columns wide. Every
+/// row, economic or earnings, uses the same columns. On a narrow terminal
+/// PREVIOUS goes first, then SIZE/IMPACT, so the event keeps its room.
 struct CalCols {
-    /// Economic: event name.
     event: usize,
-    /// Economic: show the PREVIOUS column.
+    weight: bool,
     previous: bool,
-    /// Earnings: company name.
-    name: usize,
-    /// Earnings: show the LAST YR column.
-    last_year: bool,
 }
 
-const CAL_TIME: usize = 8;
-const CAL_IMPACT: usize = 7;
+const CAL_TIME: usize = 10;
+const CAL_TYPE: usize = 8;
+const CAL_WEIGHT: usize = 11;
 const CAL_NUM: usize = 10;
-const CAL_SYMBOL: usize = 7;
-const CAL_EPS: usize = 8;
-const CAL_CAP: usize = 9;
+const CAL_SYMBOL: usize = 6;
+/// The least the EVENT column is given before a secondary column is dropped.
+const CAL_EVENT_MIN: usize = 24;
 
 impl CalCols {
     fn new(w: usize) -> Self {
-        // "  TIME  IMPACT  EVENT  FORECAST  PREVIOUS"
-        let econ_fixed = 2 + CAL_TIME + 2 + CAL_IMPACT + 2 + (2 + CAL_NUM);
-        let previous = w >= econ_fixed + (2 + CAL_NUM) + 24;
-        let event = w.saturating_sub(econ_fixed + if previous { 2 + CAL_NUM } else { 0 });
-        // "  ★ SYMBOL NAME  EPS EST  LAST YR  MKT VALUE"
-        let earn_fixed = 2 + 2 + CAL_SYMBOL + 1 + (2 + CAL_EPS) + (2 + CAL_CAP);
-        let last_year = w >= earn_fixed + (2 + CAL_EPS) + 20;
-        let name = w.saturating_sub(earn_fixed + if last_year { 2 + CAL_EPS } else { 0 });
+        // "  TIME  TYPE  EVENT  SIZE/IMPACT  EXPECTED  PREVIOUS"
+        let fixed = 2 + CAL_TIME + 2 + CAL_TYPE + 2 + (2 + CAL_NUM);
+        let weight = w >= fixed + (2 + CAL_WEIGHT) + CAL_EVENT_MIN;
+        let previous = weight && w >= fixed + (2 + CAL_WEIGHT) + (2 + CAL_NUM) + CAL_EVENT_MIN;
+        let used = fixed
+            + if weight { 2 + CAL_WEIGHT } else { 0 }
+            + if previous { 2 + CAL_NUM } else { 0 };
         Self {
-            event,
+            event: w.saturating_sub(used),
+            weight,
             previous,
-            name,
-            last_year,
         }
     }
 }
 
+/// `EPS 2.05`, or a dash when the feed gave none.
 fn fmt_eps(v: Option<rust_decimal::Decimal>) -> String {
-    v.map_or("–".to_string(), |d| format!("{:.2}", d))
+    v.map_or("–".to_string(), |d| format!("EPS {:.2}", d))
 }
 
-/// One calendar row as a line exactly `w` columns wide.
+/// The column captions, pinned above the scrolling rows.
+fn calendar_header(w: usize) -> Line<'static> {
+    let cols = CalCols::new(w);
+    let mut s = format!(
+        "  {}  {}  {}",
+        fit_right("TIME", CAL_TIME),
+        fit("TYPE", CAL_TYPE),
+        fit("EVENT", cols.event)
+    );
+    if cols.weight {
+        s.push_str(&fit_right("SIZE/IMPACT", 2 + CAL_WEIGHT));
+    }
+    s.push_str(&fit_right("EXPECTED", 2 + CAL_NUM));
+    if cols.previous {
+        s.push_str(&fit_right("PREVIOUS", 2 + CAL_NUM));
+    }
+    Line::from(Span::styled(
+        fit(&s, w),
+        Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// One calendar row as a line exactly `w` columns wide. Economic releases
+/// and earnings share the same columns; TYPE says which one a row is.
 fn calendar_line(row: &super::calendar::Row, w: usize, selected: bool) -> Line<'static> {
     use super::calendar::Row as R;
-    use wickd_core::earnings_store::Session;
     let dim = Style::default().fg(DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
+    let plain = Style::default();
     let cols = CalCols::new(w);
+    // TIME and TYPE, the same for both kinds of row.
+    let lead = |time: &str, kind: &str, past: bool| -> Vec<Span<'static>> {
+        vec![
+            Span::styled(
+                format!("  {}  ", fit_right(time, CAL_TIME)),
+                if past { dim } else { plain },
+            ),
+            Span::styled(format!("{}  ", fit(kind, CAL_TYPE)), dim),
+        ]
+    };
     let spans: Vec<Span<'static>> = match row {
         R::Blank => vec![Span::raw(" ".repeat(w))],
         R::Day(label) => vec![Span::styled(fit(label, w), bold)],
         R::Note(text) => vec![Span::styled(fit(&format!("  {text}"), w), dim)],
-        R::EconHead => {
-            let left = 2 + CAL_TIME + 2 + CAL_IMPACT + 2 + cols.event;
-            let mut s = format!(
-                "{}{}",
-                fit("  Economic", left),
-                fit_right("FORECAST", 2 + CAL_NUM)
-            );
-            if cols.previous {
-                s.push_str(&fit_right("PREVIOUS", 2 + CAL_NUM));
-            }
-            vec![Span::styled(fit(&s, w), dim)]
-        }
         R::Econ(e) => {
-            let (impact_style, event_style) = match (e.past, e.impact.as_str()) {
+            let (weight_style, event_style) = match (e.past, e.impact.as_str()) {
                 (true, _) => (dim, dim),
                 (_, "high") => (
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                     bold,
                 ),
                 (_, "low") => (dim, dim),
-                _ => (Style::default(), Style::default()),
+                _ => (plain, plain),
             };
-            let num = if e.past { dim } else { Style::default() };
-            let mut v = vec![
-                Span::styled(format!("  {}  ", fit_right(&e.time, CAL_TIME)), num),
-                Span::styled(format!("{}  ", fit(&e.impact, CAL_IMPACT)), impact_style),
-                Span::styled(fit(&e.event, cols.event), event_style),
-                Span::styled(fit_right(&e.forecast, 2 + CAL_NUM), num),
-            ];
+            let num = if e.past { dim } else { plain };
+            let mut v = lead(&e.time, "economic", e.past);
+            // Two columns in from the edge, so titles line up with tickers
+            // (which keep that space for the list marker).
+            v.push(Span::styled(
+                fit(&format!("  {}", e.event), cols.event),
+                event_style,
+            ));
+            if cols.weight {
+                v.push(Span::styled(
+                    fit_right(&e.impact, 2 + CAL_WEIGHT),
+                    weight_style,
+                ));
+            }
+            v.push(Span::styled(fit_right(&e.forecast, 2 + CAL_NUM), num));
             if cols.previous {
                 v.push(Span::styled(fit_right(&e.previous, 2 + CAL_NUM), dim));
             }
             v
         }
-        R::EarnHead(session) => {
-            let label = match session {
-                Session::PreMarket => "  Earnings · before the open",
-                Session::AfterHours => "  Earnings · after the close",
-                Session::Unknown => "  Earnings · time not given",
-            };
-            let left = 2 + 2 + CAL_SYMBOL + 1 + cols.name;
-            let mut s = format!("{}{}", fit(label, left), fit_right("EPS EST", 2 + CAL_EPS));
-            if cols.last_year {
-                s.push_str(&fit_right("LAST YR", 2 + CAL_EPS));
-            }
-            s.push_str(&fit_right("MKT VALUE", 2 + CAL_CAP));
-            vec![Span::styled(fit(&s, w), dim)]
-        }
         R::Earn(e) => {
             // A report that is already out is dimmed, like a past release.
-            let plain = if e.past { dim } else { Style::default() };
-            let mut v = vec![
-                Span::styled(
-                    if e.listed { "  ★ " } else { "    " },
-                    if e.past { dim } else { Style::default().fg(ACCENT) },
-                ),
-                Span::styled(
-                    format!("{} ", fit(&e.symbol, CAL_SYMBOL)),
-                    match (e.past, e.listed) {
-                        (true, _) => dim,
-                        (false, true) => bold,
-                        (false, false) => Style::default(),
-                    },
-                ),
-                Span::styled(fit(&e.name, cols.name), plain),
-                Span::styled(fit_right(&fmt_eps(e.eps_forecast), 2 + CAL_EPS), plain),
-            ];
-            if cols.last_year {
+            let text = if e.past { dim } else { plain };
+            let mut v = lead(
+                super::calendar::session_text(e.session),
+                "earnings",
+                e.past,
+            );
+            v.push(Span::styled(
+                if e.listed { "★ " } else { "  " },
+                if e.past {
+                    dim
+                } else {
+                    Style::default().fg(ACCENT)
+                },
+            ));
+            v.push(Span::styled(
+                format!("{} ", fit(&e.symbol, CAL_SYMBOL)),
+                match (e.past, e.listed) {
+                    (true, _) => dim,
+                    (false, true) => bold,
+                    (false, false) => plain,
+                },
+            ));
+            v.push(Span::styled(
+                fit(&e.name, cols.event.saturating_sub(2 + CAL_SYMBOL + 1)),
+                text,
+            ));
+            if cols.weight {
                 v.push(Span::styled(
-                    fit_right(&fmt_eps(e.last_year_eps), 2 + CAL_EPS),
-                    dim,
+                    fit_right(
+                        &e.market_cap
+                            .map_or("–".to_string(), super::calendar::fmt_cap),
+                        2 + CAL_WEIGHT,
+                    ),
+                    text,
                 ));
             }
             v.push(Span::styled(
-                fit_right(
-                    &e.market_cap.map_or("–".to_string(), super::calendar::fmt_cap),
-                    2 + CAL_CAP,
-                ),
-                dim,
+                fit_right(&fmt_eps(e.eps_forecast), 2 + CAL_NUM),
+                text,
             ));
+            if cols.previous {
+                v.push(Span::styled(
+                    fit_right(&fmt_eps(e.last_year_eps), 2 + CAL_NUM),
+                    dim,
+                ));
+            }
             v
         }
     };
@@ -453,7 +482,7 @@ fn calendar_line(row: &super::calendar::Row, w: usize, selected: bool) -> Line<'
 }
 
 /// The calendar (`g c`): the next seven days of US economic releases and
-/// earnings, a heading per day, in local time.
+/// earnings, a heading per day and one row per event, in local time.
 fn render_calendar(frame: &mut Frame, area: Rect, app: &App) {
     use ratatui::widgets::Padding;
     let c = &app.calendar;
@@ -499,7 +528,6 @@ fn render_calendar(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let inner = block.inner(area);
-    let page = usize::from(inner.height);
     let w = usize::from(inner.width);
 
     if c.error.is_some() || c.rows.is_empty() {
@@ -523,6 +551,14 @@ fn render_calendar(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // The captions stay put; the rows scroll under them.
+    let head = Rect { height: 1.min(inner.height), ..inner };
+    let body = Rect {
+        y: inner.y + head.height,
+        height: inner.height.saturating_sub(head.height),
+        ..inner
+    };
+    let page = usize::from(body.height);
     let scroll = c.settle_scroll(page);
     let total = c.rows.len();
     let lines: Vec<Line> = c
@@ -546,7 +582,8 @@ fn render_calendar(frame: &mut Frame, area: Rect, app: &App) {
     };
     block = block.title_bottom(Line::from(Span::styled(place, dim)).alignment(Alignment::Right));
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(calendar_header(w)), head);
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// SEC's `MMDD` fiscal year end as `Jan 31` (unchanged if it isn't MMDD).
@@ -3241,7 +3278,7 @@ mod tests {
     }
 
     #[test]
-    fn calendar_screen_groups_the_week_in_local_time() {
+    fn calendar_screen_lists_each_day_as_one_table_in_local_time() {
         use crate::tui::app::Action;
         let tmp = tempfile::tempdir().unwrap();
         let mut app = calendar_app(tmp.path());
@@ -3269,26 +3306,46 @@ mod tests {
                 .unwrap_or_else(|| panic!("no line with {needle:?} in\n{all}"))
                 .clone()
         };
-        assert!(rows[2].contains("Today · Wed Nov 18"), "{}", rows[2]);
-        assert!(line("Economic").contains("FORECAST") && line("Economic").contains("PREVIOUS"));
+        // One caption row for the whole screen, then the first day.
+        for caption in ["TIME", "TYPE", "EVENT", "SIZE/IMPACT", "EXPECTED", "PREVIOUS"] {
+            assert!(rows[2].contains(caption), "{caption}: {}", rows[2]);
+        }
+        assert!(rows[3].contains("Today · Wed Nov 18"), "{}", rows[3]);
+        // No captions between the events of a day.
+        assert!(!all.contains("Earnings ·") && !all.contains("FORECAST"), "{all}");
+        assert!(!rows.iter().any(|r| r.trim_matches(|c| c == '│' || c == ' ') == "Economic"));
+        assert_eq!(all.matches("EXPECTED").count(), 1);
         // 19:00 UTC = noon; the low-impact 6:30 release is filtered out.
         let minutes = line("FOMC Meeting Minutes");
-        assert!(minutes.contains("12:00 PM") && minutes.contains("high"), "{minutes}");
-        assert!(!all.contains("Housing Starts"));
-        assert!(line("Earnings · before the open").contains("MKT VALUE"));
-        let tjx = line("TJX Companies");
         assert!(
-            tjx.contains("1.33") && tjx.contains("1.78") && tjx.contains("$144B"),
-            "{tjx}"
+            minutes.contains("12:00 PM") && minutes.contains("economic") && minutes.contains("high"),
+            "{minutes}"
         );
+        assert!(!all.contains("Housing Starts"));
+        let tjx = line("TJX Companies");
+        for part in ["pre-open", "earnings", "$144B", "EPS 1.33", "EPS 1.78"] {
+            assert!(tjx.contains(part), "{part}: {tjx}");
+        }
+        // The day reads in time order: morning reports, the noon release,
+        // then the evening report.
+        let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
+        assert!(at("TJX Companies") < at("FOMC Meeting Minutes"));
+        assert!(at("FOMC Meeting Minutes") < at("Palo Alto"));
         // On the watchlist: marked.
         assert!(line("Palo Alto").contains("★ PANW"), "{}", line("Palo Alto"));
+        assert!(line("Palo Alto").contains("post-close"));
         assert!(!line("Target Corporation").contains('★'));
         assert!(all.contains("+ 1 smaller company · a shows everything"));
         assert!(all.contains("Tomorrow · Thu Nov 19") && all.contains("6:30 AM"));
         assert!(all.contains("No earnings stored for this day yet. Press r to fetch."));
         // Every drawn body line is the same width: columns line up.
         assert!(rows[1..29].iter().all(|r| r.chars().count() == 120));
+        // Event titles and tickers start in the same column.
+        assert_eq!(
+            minutes.find("FOMC Meeting"),
+            tjx.find("TJX    TJX Companies"),
+            "{minutes}\n{tjx}"
+        );
 
         // a = everything: the low-impact release and the small company show.
         press(&mut app, KeyCode::Char('a'));
@@ -3308,22 +3365,24 @@ mod tests {
         press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Char('c'));
         app.set_earnings_fetch(Ok(vec![]));
-        // The cursor starts on the Fed minutes: not a company.
+        // The morning's reports are out, so the cursor starts on the Fed
+        // minutes: not a company.
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.mode, Mode::Calendar);
         assert_eq!(
             app.flash.as_deref(),
             Some("only a company's row opens a chart")
         );
-        press(&mut app, KeyCode::Char('j')); // TJX
-        press(&mut app, KeyCode::Char('j')); // TGT
+        press(&mut app, KeyCode::Char('j')); // PANW, after the close
         let actions = press(&mut app, KeyCode::Enter);
         assert_eq!(app.mode, Mode::Detail);
-        assert_eq!(app.detail.as_ref().map(|d| d.symbol.as_str()), Some("TGT"));
-        assert!(actions.iter().any(|a| matches!(a, Action::FetchHistory(s, _) if s == "TGT")));
+        assert_eq!(app.detail.as_ref().map(|d| d.symbol.as_str()), Some("PANW"));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::FetchHistory(s, _) if s == "PANW")));
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.mode, Mode::Calendar);
-        assert_eq!(app.calendar.selected_symbol(), Some("TGT"), "cursor kept");
+        assert_eq!(app.calendar.selected_symbol(), Some("PANW"), "cursor kept");
         // r asks for a fetch; a second r while it runs doesn't.
         let actions = press(&mut app, KeyCode::Char('r'));
         assert!(matches!(actions.as_slice(), [Action::FetchEarnings(_)]));
@@ -3332,7 +3391,11 @@ mod tests {
         // A failed fetch keeps the stored rows and says so along the bottom.
         app.set_earnings_fetch(Err("offline".into()));
         let rows = screen(&app, 120, 30);
-        assert!(rows[28].contains("couldn't fetch earnings: offline"), "{}", rows[28]);
+        assert!(
+            rows[28].contains("couldn't fetch earnings: offline"),
+            "{}",
+            rows[28]
+        );
         assert!(rows.join("\n").contains("Target Corporation"));
         // esc returns to where the calendar was opened from.
         press(&mut app, KeyCode::Esc);
@@ -3366,11 +3429,17 @@ mod tests {
         press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Char('c'));
         app.set_earnings_fetch(Ok(vec![]));
+        // 88 wide: PREVIOUS is the first column to go.
+        let all = screen(&app, 88, 24).join("\n");
+        assert!(all.contains("SIZE/IMPACT") && all.contains("EXPECTED"), "{all}");
+        assert!(!all.contains("PREVIOUS") && !all.contains("EPS 1.78"), "{all}");
+        assert!(all.contains("$144B") && all.contains("EPS 1.33"));
+        // 64 wide: SIZE/IMPACT goes too; time, type, event and expected stay.
         let rows = screen(&app, 64, 24);
         let all = rows.join("\n");
-        assert!(all.contains("FORECAST") && !all.contains("PREVIOUS"), "{all}");
-        assert!(all.contains("EPS EST") && !all.contains("LAST YR"), "{all}");
-        assert!(all.contains("MKT VALUE") && all.contains("$144B"));
+        assert!(all.contains("EXPECTED") && all.contains("EPS 1.33"), "{all}");
+        assert!(!all.contains("SIZE/IMPACT") && !all.contains("$144B"), "{all}");
+        assert!(all.contains("pre-open") && all.contains("earnings") && all.contains("economic"));
         // A long company name is cut with an ellipsis, not wrapped.
         assert!(all.contains('…'), "{all}");
         assert!(rows.iter().all(|r| r.chars().count() == 64));
@@ -3478,17 +3547,20 @@ mod tests {
         app.set_earnings_fetch(Ok(vec![]));
         // A short screen, so the week doesn't fit and the page scrolls.
         let (w, h) = (120u16, 10u16);
-        assert!(screen(&app, w, h)[2].contains("Today · Wed Nov 18"));
+        let rows = screen(&app, w, h);
+        assert!(rows[2].contains("TIME") && rows[3].contains("Today · Wed Nov 18"));
         press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Char('e'));
         let rows = screen(&app, w, h);
         assert!(!rows.join("\n").contains("Today"), "scrolled to the end");
+        // The captions stay put while the rows scroll.
+        assert!(rows[2].contains("TIME") && rows[2].contains("EXPECTED"), "{}", rows[2]);
         // Back to the top, then a different row set: the heading is back.
         press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Char('a'));
         let rows = screen(&app, w, h);
-        assert!(rows[2].contains("Today · Wed Nov 18"), "{}", rows.join("\n"));
+        assert!(rows[3].contains("Today · Wed Nov 18"), "{}", rows.join("\n"));
         assert!(rows[8].contains(" top "), "{}", rows[8]);
     }
 

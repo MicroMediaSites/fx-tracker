@@ -91,11 +91,18 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   couple of seconds without losing your place. It is a viewer: nothing in the
   TUI writes to the folder.
 - **Calendar** (`g c`, from any screen). What is coming that can move the
-  market: today and the six days after it, a heading per day. Under each day
-  come the US economic releases in time order (local time, impact, forecast,
-  previous), then the companies reporting earnings: before the open, after
-  the close, then those with no time given, largest first, with the expected
-  EPS, last year's EPS and market value.
+  market: today and the six days after it, a heading per day. Each day is one
+  list of events in time order, US economic releases and earnings reports
+  together, with nothing separating the two; the TYPE column says which a row
+  is. The columns are the same for both: TIME (local time for a release,
+  `pre-open` / `post-close` for a report), TYPE, EVENT (the release, or the
+  ticker and company), SIZE/IMPACT (the company's market value, or the
+  release's impact), EXPECTED (expected EPS, or the forecast) and PREVIOUS
+  (last year's EPS, or the prior reading). The captions stay put while the
+  rows scroll. Within a day: reports due before the open, releases up to the
+  4:00 PM Eastern close, reports due after the close, later releases, then
+  reports with no time given; companies in a session run largest first. On a
+  narrow terminal PREVIOUS drops first, then SIZE/IMPACT.
   - By default it shows releases of medium impact and up, and companies worth
     $10 billion or more, plus every symbol on the watchlist or a `wickd list`
     whatever its size (marked `★`). `a` switches to everything and back; a

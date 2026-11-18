@@ -11,6 +11,8 @@
 //!   when a shown weekday has no file or the files are more than six hours
 //!   old ([`CalendarState::needs_fetch`]), and `r` forces one.
 //!
+//! Each day is one list of events in time order: a row says whether it is
+//! an economic release or an earnings report, and nothing separates the two.
 //! [`build`] turns the two stores into display rows and is a pure function
 //! of its inputs (the clock and the time zone are passed in), so everything
 //! the screen shows is unit-tested without a terminal or a network.
@@ -68,6 +70,7 @@ pub struct EconRow {
 pub struct EarnRow {
     pub symbol: String,
     pub name: String,
+    pub session: Session,
     pub eps_forecast: Option<Decimal>,
     pub last_year_eps: Option<Decimal>,
     pub market_cap: Option<Decimal>,
@@ -82,10 +85,6 @@ pub struct EarnRow {
 pub enum Row {
     /// A day heading: `Today · Wed Nov 18`.
     Day(String),
-    /// The caption above a day's economic releases.
-    EconHead,
-    /// The caption above one session's earnings.
-    EarnHead(Session),
     Econ(EconRow),
     Earn(EarnRow),
     /// A plain sentence: nothing stored, nothing reports, how many are hidden.
@@ -120,13 +119,24 @@ pub fn session_passed(date: NaiveDate, session: Session, now: DateTime<Utc>) -> 
         Session::AfterHours => (20, 0),
         Session::Unknown => (23, 59),
     };
-    let Some(eastern) = date.and_hms_opt(hour, minute, 0) else {
-        return false;
-    };
+    eastern_instant(date, hour, minute).is_some_and(|t| now >= t)
+}
+
+/// `hour:minute` US/Eastern on `date`, as an instant.
+fn eastern_instant(date: NaiveDate, hour: u32, minute: u32) -> Option<DateTime<Utc>> {
     // Eastern wall time → UTC: take the offset in force around that moment.
-    let guess = eastern.and_utc();
-    let offset = wickd_core::equities::eastern_offset_hours(guess);
-    now >= guess - Duration::hours(offset)
+    let guess = date.and_hms_opt(hour, minute, 0)?.and_utc();
+    Some(guess - Duration::hours(wickd_core::equities::eastern_offset_hours(guess)))
+}
+
+/// What an earnings row shows in the TIME column: `pre-open`, `post-close`,
+/// or nothing when the feed gave no time.
+pub fn session_text(session: Session) -> &'static str {
+    match session {
+        Session::PreMarket => "pre-open",
+        Session::AfterHours => "post-close",
+        Session::Unknown => "",
+    }
 }
 
 /// The wall clock and time zone, replaceable in tests.
@@ -289,9 +299,14 @@ pub struct Inputs<'a> {
     pub show_all: bool,
 }
 
-/// The screen's rows: a heading per day, then that day's economic releases
-/// in time order, then its earnings by session (before the open, after the
-/// close, time not given), largest company first.
+/// The screen's rows: a heading per day, then everything on that day as one
+/// list in time order, economic releases and earnings together. Each row
+/// says which it is; there are no captions between them.
+///
+/// Order within a day: reports due before the open, then releases by time
+/// up to the 4:00 PM Eastern close, then reports due after the close, then
+/// any later releases, then reports with no time given. Companies in the
+/// same session run largest first.
 ///
 /// By default only US releases of medium impact and up are shown, and only
 /// companies worth [`large_cap`] or more, plus every listed symbol whatever
@@ -299,64 +314,109 @@ pub struct Inputs<'a> {
 pub fn build(inp: &Inputs) -> Vec<Row> {
     let now = inp.clock.now();
     let today = inp.clock.today();
-    // How far the economic store reaches (any currency): a day past it has
-    // "not published yet", not "nothing scheduled".
-    let econ_local: Vec<(NaiveDateTime, &CalendarEvent)> = inp
+    // Each economic row with its instant and local time. How far the store
+    // reaches (any currency) tells "not published yet" from "nothing
+    // scheduled".
+    let econ_all: Vec<(DateTime<Utc>, NaiveDateTime, &CalendarEvent)> = inp
         .econ
         .iter()
         .filter_map(|e| {
-            let t = DateTime::<Utc>::from_timestamp(e.time_unix()?, 0)?;
-            Some((inp.clock.local(t), e))
+            let at = DateTime::<Utc>::from_timestamp(e.time_unix()?, 0)?;
+            Some((at, inp.clock.local(at), e))
         })
         .collect();
-    let econ_through = econ_local.iter().map(|(t, _)| t.date()).max();
+    let econ_through = econ_all.iter().map(|(_, t, _)| t.date()).max();
 
     let mut rows = Vec::new();
     for i in 0..DAYS {
         let day = today + Duration::days(i);
-
-        let mut econ: Vec<(NaiveDateTime, &CalendarEvent)> = econ_local
+        let econ: Vec<&(DateTime<Utc>, NaiveDateTime, &CalendarEvent)> = econ_all
             .iter()
-            .filter(|(t, e)| {
+            .filter(|(_, t, e)| {
                 t.date() == day
                     && e.currency.eq_ignore_ascii_case(CURRENCY)
                     && (inp.show_all
                         || impact_rank(&e.impact) >= 2
                         || e.impact.eq_ignore_ascii_case("holiday"))
             })
-            .copied()
             .collect();
-        econ.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.event.cmp(&b.1.event)));
-
         let file = inp.earnings.iter().find(|d| d.date == day);
         let reporting = file.map_or(0, |f| f.rows.len());
         if is_weekend(day) && econ.is_empty() && reporting == 0 {
             continue;
         }
-
         rows.push(Row::Day(day_label(day, today)));
 
+        // (slot in the day, instant, size (largest first), name) → row.
+        type Key = (u8, i64, std::cmp::Reverse<Option<Decimal>>, String);
+        let mut items: Vec<(Key, Row)> = Vec::new();
+        let close = eastern_instant(day, 16, 0);
+        for (at, local, e) in &econ {
+            let slot = if close.is_some_and(|c| *at >= c) {
+                3
+            } else {
+                1
+            };
+            items.push((
+                (
+                    slot,
+                    at.timestamp(),
+                    std::cmp::Reverse(None),
+                    e.event.clone(),
+                ),
+                Row::Econ(EconRow {
+                    time: clock_text(*local),
+                    past: *at < now,
+                    impact: e.impact.to_lowercase(),
+                    event: clean_text(&e.event, 80),
+                    forecast: clean_text(&e.forecast, 12),
+                    previous: clean_text(&e.previous, 12),
+                }),
+            ));
+        }
+        let shown: Vec<&earnings_store::EarningsRow> = file
+            .map(|f| {
+                f.rows
+                    .iter()
+                    .filter(|r| {
+                        inp.show_all
+                            || inp.listed.contains(&r.symbol)
+                            || r.market_cap.is_some_and(|c| c >= large_cap())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for r in &shown {
+            let slot = match r.session {
+                Session::PreMarket => 0,
+                Session::AfterHours => 2,
+                Session::Unknown => 4,
+            };
+            items.push((
+                (slot, 0, std::cmp::Reverse(r.market_cap), r.symbol.clone()),
+                Row::Earn(EarnRow {
+                    symbol: r.symbol.clone(),
+                    name: r.name.clone(),
+                    session: r.session,
+                    eps_forecast: r.eps_forecast,
+                    last_year_eps: r.last_year_eps,
+                    market_cap: r.market_cap,
+                    listed: inp.listed.contains(&r.symbol),
+                    past: session_passed(day, r.session, now),
+                }),
+            ));
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.extend(items.into_iter().map(|(_, row)| row));
+
+        // What isn't there, said plainly under the day's events.
         if econ.is_empty() {
             rows.push(Row::Note(match econ_through {
                 Some(through) if day <= through => "No US economic releases.".into(),
                 _ => "Economic events for this day aren't published yet (the feed covers the current week).".into(),
             }));
-        } else {
-            rows.push(Row::EconHead);
-            for (t, e) in econ {
-                let at =
-                    DateTime::<Utc>::from_timestamp(e.time_unix().unwrap_or(0), 0).unwrap_or(now);
-                rows.push(Row::Econ(EconRow {
-                    time: clock_text(t),
-                    past: at < now,
-                    impact: e.impact.to_lowercase(),
-                    event: clean_text(&e.event, 80),
-                    forecast: clean_text(&e.forecast, 12),
-                    previous: clean_text(&e.previous, 12),
-                }));
-            }
         }
-
+        let plural = |n: usize| if n == 1 { "company" } else { "companies" };
         match file {
             None if is_weekend(day) => {}
             None => rows.push(Row::Note(
@@ -364,41 +424,7 @@ pub fn build(inp: &Inputs) -> Vec<Row> {
             )),
             Some(f) if f.rows.is_empty() => rows.push(Row::Note("No company reports.".into())),
             Some(f) => {
-                let shown: Vec<&earnings_store::EarningsRow> = f
-                    .rows
-                    .iter()
-                    .filter(|r| {
-                        inp.show_all
-                            || inp.listed.contains(&r.symbol)
-                            || r.market_cap.is_some_and(|c| c >= large_cap())
-                    })
-                    .collect();
-                for session in [Session::PreMarket, Session::AfterHours, Session::Unknown] {
-                    let mut of: Vec<&&earnings_store::EarningsRow> =
-                        shown.iter().filter(|r| r.session == session).collect();
-                    if of.is_empty() {
-                        continue;
-                    }
-                    of.sort_by(|a, b| {
-                        b.market_cap
-                            .cmp(&a.market_cap)
-                            .then(a.symbol.cmp(&b.symbol))
-                    });
-                    rows.push(Row::EarnHead(session));
-                    for r in of {
-                        rows.push(Row::Earn(EarnRow {
-                            symbol: r.symbol.clone(),
-                            name: r.name.clone(),
-                            eps_forecast: r.eps_forecast,
-                            last_year_eps: r.last_year_eps,
-                            market_cap: r.market_cap,
-                            listed: inp.listed.contains(&r.symbol),
-                            past: session_passed(day, r.session, now),
-                        }));
-                    }
-                }
                 let hidden = f.rows.len() - shown.len();
-                let plural = |n: usize| if n == 1 { "company" } else { "companies" };
                 if shown.is_empty() {
                     rows.push(Row::Note(format!(
                         "No large company reports. {hidden} smaller {} · a shows everything",
@@ -877,8 +903,6 @@ mod tests {
         rows.iter()
             .map(|r| match r {
                 Row::Day(l) => format!("# {l}"),
-                Row::EconHead => "econ".into(),
-                Row::EarnHead(s) => format!("earn {s:?}"),
                 Row::Econ(e) => format!(
                     "{} {} {}{}",
                     e.time,
@@ -887,7 +911,11 @@ mod tests {
                     if e.past { " (past)" } else { "" }
                 ),
                 Row::Earn(e) => format!(
-                    "{}{}{}",
+                    "{} {}{}{}",
+                    match session_text(e.session) {
+                        "" => "no-time",
+                        t => t,
+                    },
                     if e.listed { "*" } else { "" },
                     e.symbol,
                     if e.past { " (past)" } else { "" }
@@ -899,36 +927,32 @@ mod tests {
     }
 
     #[test]
-    fn days_group_local_times_and_sessions_with_the_default_filter() {
-        // 15:00 UTC Wednesday = 8:00 AM in Denver.
+    fn a_day_is_one_list_in_time_order_with_the_default_filter() {
+        // 15:00 UTC Wednesday = 8:00 AM in Denver, after the 9:30 Eastern open.
         let got = text(&built(false, &["MINE"]));
         assert_eq!(
             got,
             [
                 "# Today · Wed Nov 18",
-                "econ",
+                // Due before the open, largest first; already out.
+                "pre-open TJX (past)",
+                "pre-open TGT (past)",
                 // The low-impact 6:30 release and the EUR one are filtered out.
                 "12:00 PM high FOMC Meeting Minutes",
-                // Stored under the 19th in UTC; shown on the 18th, local time.
-                "6:00 PM medium FOMC Member Speaks",
-                // 8:00 AM Mountain is after the 9:30 Eastern open: the
-                // morning's reports are out.
-                "earn PreMarket",
-                "TJX (past)",
-                "TGT (past)",
-                "earn AfterHours",
-                "PANW",
+                // Due after the 4:00 PM Eastern close (2:00 PM here).
+                "post-close PANW",
                 // Tiny, but on a list: shown and marked.
-                "*MINE",
+                "post-close *MINE",
+                // Stored under the 19th in UTC; shown on the 18th, local
+                // time, after the close.
+                "6:00 PM medium FOMC Member Speaks",
                 "~ + 2 smaller companies · a shows everything",
                 "",
                 "# Tomorrow · Thu Nov 19",
-                "econ",
                 "6:30 AM medium Unemployment Claims",
                 "~ No large company reports. 1 smaller company · a shows everything",
                 "",
                 "# Fri Nov 20",
-                "econ",
                 "8:00 AM medium Revised UoM Consumer Sentiment",
                 "~ No company reports.",
                 "",
@@ -942,29 +966,33 @@ mod tests {
                 "~ No earnings stored for this day yet. Press r to fetch.",
             ]
         );
+        // No caption rows: every row is a day, an event, a note or a gap.
+        assert!(built(false, &[]).iter().all(|r| matches!(
+            r,
+            Row::Day(_) | Row::Econ(_) | Row::Earn(_) | Row::Note(_) | Row::Blank
+        )));
     }
 
     #[test]
     fn everything_shows_low_impact_and_small_companies_and_marks_past_releases() {
         let got = text(&built(true, &[]));
         assert_eq!(
-            &got[..12],
+            &got[..11],
             [
                 "# Today · Wed Nov 18",
-                "econ",
+                "pre-open TJX (past)",
+                "pre-open TGT (past)",
+                "pre-open SMOL (past)",
                 "6:30 AM low Housing Starts (past)",
                 "12:00 PM high FOMC Meeting Minutes",
+                "post-close PANW",
+                "post-close MINE",
                 "6:00 PM medium FOMC Member Speaks",
-                "earn PreMarket",
-                "TJX (past)",
-                "TGT (past)",
-                "SMOL (past)",
-                "earn AfterHours",
-                "PANW",
-                "MINE",
+                // No time given: last in the day.
+                "no-time NOTIME",
+                "",
             ]
         );
-        assert_eq!(&got[12..15], ["earn Unknown", "NOTIME", ""]);
         // Still US only.
         assert!(!got.iter().any(|l| l.contains("Final CPI")));
         assert!(
@@ -1011,27 +1039,29 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = state(tmp.path());
         // 6:30 PM Mountain on the 18th: the minutes, the 6:00 PM speaker,
-        // and all of today's reports are behind us.
+        // and all of today's timed reports are behind us.
         s.clock = mst("2026-11-19T01:30:00Z");
         s.show_all = true;
         s.reload(&HashSet::new());
         let got = text(&s.rows);
-        assert_eq!(got[2], "6:30 AM low Housing Starts (past)");
-        assert!(
-            got.contains(&"TJX (past)".to_string()) && got.contains(&"PANW (past)".to_string())
-        );
+        for past in [
+            "pre-open TJX (past)",
+            "6:30 AM low Housing Starts (past)",
+            "post-close PANW (past)",
+            "6:00 PM medium FOMC Member Speaks (past)",
+        ] {
+            assert!(got.contains(&past.to_string()), "{past} in {got:?}");
+        }
         // No time given: not counted as out until the day ends.
-        assert!(got.contains(&"NOTIME".to_string()));
+        assert!(got.contains(&"no-time NOTIME".to_string()));
         s.go_next_upcoming();
         assert_eq!(s.selected_symbol(), Some("NOTIME"));
-        // In the morning nothing has happened yet: the first row.
+        // Before the open nothing has happened yet: the first row.
         s.clock = mst("2026-11-18T12:00:00Z");
         s.reload(&HashSet::new());
         s.go_next_upcoming();
-        assert_eq!(
-            text(&s.rows[s.selected..=s.selected]),
-            ["6:30 AM low Housing Starts"]
-        );
+        assert_eq!(text(&s.rows[s.selected..=s.selected]), ["pre-open TJX"]);
+        assert_eq!(s.selected, 1);
         // An empty screen is fine.
         let mut e = CalendarState::new(None, None);
         e.go_next_upcoming();
@@ -1157,18 +1187,31 @@ mod tests {
             s.earnings_as_of,
             Some("2026-11-18T00:30:00Z".parse().unwrap())
         );
-        // The cursor starts on the first release, not on a heading.
+        // The cursor starts on the first event, not on the day heading.
+        assert_eq!(s.selected, 1);
+        assert_eq!(s.selected_symbol(), Some("TJX"));
+        s.step(2); // TGT, then the Fed minutes
         assert_eq!(
             text(&s.rows[s.selected..=s.selected]),
             ["12:00 PM high FOMC Meeting Minutes"]
         );
-        assert_eq!(s.selected_symbol(), None);
-        s.step(2); // 6:00 PM, then over the earnings caption to TJX
-        assert_eq!(s.selected_symbol(), Some("TJX"));
-        s.step(-1);
-        assert_eq!(s.selected_symbol(), None);
+        assert_eq!(s.selected_symbol(), None, "a release has no ticker");
+        s.step(1);
+        assert_eq!(s.selected_symbol(), Some("PANW"));
         s.step(-10);
-        assert_eq!(s.selected, 2, "stops at the first row");
+        assert_eq!(s.selected, 1, "stops at the first row");
+        // Down from the day's last event skips the note, the gap and the
+        // next heading.
+        s.step(4);
+        assert_eq!(
+            text(&s.rows[s.selected..=s.selected]),
+            ["6:00 PM medium FOMC Member Speaks"]
+        );
+        s.step(1);
+        assert_eq!(
+            text(&s.rows[s.selected..=s.selected]),
+            ["6:30 AM medium Unemployment Claims"]
+        );
         s.go_end();
         assert_eq!(
             text(&s.rows[s.selected..=s.selected]),
@@ -1180,7 +1223,7 @@ mod tests {
             "stops at the last row"
         );
         s.go_top();
-        assert_eq!(s.selected, 2);
+        assert_eq!(s.selected, 1);
     }
 
     #[test]
@@ -1188,7 +1231,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = state(tmp.path());
         s.reload(&HashSet::new());
-        s.step(4); // minutes → speaks → TJX → TGT → PANW
+        s.step(3); // TJX → TGT → minutes → PANW
         assert_eq!(s.selected_symbol(), Some("PANW"));
         s.show_all = true;
         s.reload(&HashSet::new());
