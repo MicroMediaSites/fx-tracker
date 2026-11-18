@@ -28,6 +28,7 @@ feature — meant to be followed together by you and an agent.
 | `tui` | Stock ticker TUI: watchlist, symbol search, price-history drill-down (US equities) |
 | `list` | Named symbol lists (agent-writable; TUI watchlist sections) |
 | `quote` | Daily stock prices: last bar, previous close, change (JSON) |
+| `earnings sync` / `upcoming` | Earnings calendar: who reports on a day, before or after the market, and the expected EPS (JSON) |
 | `alpaca login` / `status` / `logout` | Store / inspect / remove the Alpaca market-data keys `tui` uses |
 | `info` | What a stock or forex pair is: plain-language summary, facts, industry (JSON) |
 
@@ -278,6 +279,51 @@ Per symbol under `quotes`:
 Symbols with no data come back under `missing`. Prices are rounded to cents.
 Forex pairs aren't covered yet (use the TUI). Exit 2 means no or rejected
 Alpaca keys; exit 4 means an invalid symbol.
+
+## `wickd earnings` — who reports, and when
+
+Which companies report earnings on a day, whether it's before the open or
+after the close, and what is expected. Stored one file per day under
+`~/.wickd/earnings/` (honours `WICKD_HOME`).
+
+```sh
+wickd earnings sync                    # fetch today and the next 7 days
+wickd earnings sync --days 14          # further ahead (max 60)
+wickd earnings upcoming                # stored rows from today on (no network)
+wickd earnings upcoming --days 2 --min-cap 10000000000
+wickd earnings upcoming --lists        # only the watchlist and `wickd list` symbols
+wickd earnings upcoming --symbols NVDA,WMT
+```
+
+**The source is unofficial.** `sync` reads Nasdaq's public earnings calendar,
+one request per weekday, no key. Nothing promises it stays up or keeps its
+shape, so treat a date as "expected", and check the company's own
+announcement before relying on one:
+
+- A day whose fetch fails keeps the file it already has. The JSON lists every
+  day under `days` with `rows`, `written` and, for a failure, `error`. The
+  command exits 1 only when every day failed.
+- A fetch that comes back empty never replaces a stored day that has rows
+  (`kept_stored: true`).
+- The feed carries expectations only. There is no reported EPS or surprise.
+
+Days are US market dates (US/Eastern): "today" late in the evening is still
+the trading day that just closed.
+
+`upcoming` returns `rows` sorted by date, then session, then market value
+(largest first):
+
+- `date`, `symbol`, `name`
+- `session`: `pre_market`, `after_hours` or `unknown` (the feed gave no time)
+- `eps_forecast`, `estimates` (how many analysts), `last_year_eps`,
+  `market_cap` (dollars), `fiscal_quarter`: each left out when the feed had
+  no usable value. Money values are decimal strings.
+
+`stored` lists each weekday in the window with `fetched_at` and `rows`, and
+`fetched_at: null` for a day never fetched, so "nobody reports" and "not
+fetched yet" can be told apart. `--min-cap` leaves out companies with no
+market value; `--lists` and `--symbols` together keep the union. Exit 4
+means `--days` was over 60.
 
 ## `wickd info` — what is this symbol?
 

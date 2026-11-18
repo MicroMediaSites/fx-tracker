@@ -10,6 +10,7 @@ pub mod calendar;
 pub mod candles;
 pub mod client;
 pub mod dashboard;
+pub mod earnings;
 pub mod feed;
 pub mod info;
 pub mod instruments;
