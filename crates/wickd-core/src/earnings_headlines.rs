@@ -86,6 +86,13 @@ pub struct Headline {
     pub lede: Vec<String>,
 }
 
+impl Headline {
+    /// Whether it carries a link to open (the source article).
+    pub fn has_link(&self) -> bool {
+        self.url.as_deref().is_some_and(|u| !u.trim().is_empty())
+    }
+}
+
 /// The headlines stored for one report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadlinesFile {

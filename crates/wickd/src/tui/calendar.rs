@@ -1171,22 +1171,22 @@ impl CalendarState {
             .unwrap_or(0);
     }
 
-    /// The earnings row under the cursor.
     /// The source article for the selected report (`g a` / `g s`): the
     /// best stored headline that carries the release's figures and a link,
     /// else the best one with a link. Returns `(url, badge label)`.
     pub fn selected_source(&self) -> Option<(String, String)> {
         let e = self.selected_earn()?;
         let heads = self.headlines_of(e);
-        let linked = |h: &&Headline| h.url.as_deref().is_some_and(|u| !u.trim().is_empty());
         let best = heads
             .iter()
-            .filter(linked)
+            .filter(|h| h.has_link())
             .find(|h| !h.lede.is_empty())
-            .or_else(|| heads.iter().find(linked))?;
-        Some((best.url.clone()?, format!("{} · {}", e.symbol, best.headline)))
+            .or_else(|| heads.iter().find(|h| h.has_link()))?;
+        let url = best.url.clone().unwrap_or_default();
+        Some((url, format!("{} · {}", e.symbol, best.headline)))
     }
 
+    /// The earnings row under the cursor.
     pub fn selected_earn(&self) -> Option<&EarnRow> {
         match self.rows.get(self.selected) {
             Some(Row::Earn(e)) => Some(e),

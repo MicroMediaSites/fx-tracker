@@ -619,7 +619,7 @@ fn calendar_box(app: &App) -> Option<(String, Vec<String>)> {
             let heads = c.headlines_of(e);
             for h in heads {
                 // ↗: `g a` opens it in the reader window.
-                let link = if h.url.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+                let link = if h.has_link() {
                     "  ↗ g a"
                 } else {
                     ""
