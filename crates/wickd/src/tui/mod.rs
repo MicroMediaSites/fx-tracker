@@ -700,8 +700,11 @@ fn run_loop(
             }
         }
 
-        // 5. Side effects from replies and keys.
-        for action in actions {
+        // 5. Side effects from replies and keys. A queue, because carrying
+        // out one action can ask for more (a slate change asks for the new
+        // company's reaction and reported figures).
+        let mut queue: std::collections::VecDeque<Action> = actions.into();
+        while let Some(action) = queue.pop_front() {
             match action {
                 Action::Quit => {
                     if app.inplay.reader_open {
@@ -747,25 +750,11 @@ fn run_loop(
                     session,
                 } => {
                     let r = app.calendar.slate_add(&symbol, date, session);
-                    let more = app.slate_written(r.map(|()| format!("{symbol} is on the slate")));
-                    for a in more {
-                        match a {
-                            Action::FetchReactions(asks) => send(Request::Reactions(asks)),
-                            Action::FetchResults(symbols) => {
-                                if let Some(dir) = app.calendar.earn_dir.as_deref() {
-                                    send(Request::Results(
-                                        wickd_core::earnings_results::results_dir(dir),
-                                        symbols,
-                                    ));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                    queue.extend(app.slate_written(r.map(|()| format!("{symbol} is on the slate"))));
                 }
                 Action::SlateRemove(symbol) => {
                     let r = app.calendar.slate_remove(&symbol);
-                    app.slate_written(r.map(|()| format!("{symbol} is off the slate")));
+                    queue.extend(app.slate_written(r.map(|()| format!("{symbol} is off the slate"))));
                 }
                 Action::FetchEarnings(dates) => match app.calendar.earn_dir.clone() {
                     Some(dir) => send(Request::Earnings(dir, dates)),

@@ -89,15 +89,15 @@ struct Fields {
     /// Read the expectation from a file (`-` = stdin), for several lines.
     #[arg(long, value_name = "PATH|-")]
     expect_file: Option<String>,
-    /// The report's date, when the earnings store doesn't have it (or has
-    /// it wrong).
     /// What was reported and what mattered, written after the report: free
     /// text.
     #[arg(long, conflicts_with = "result_file")]
     result: Option<String>,
     /// Read the result from a file (`-` = stdin), for several lines.
-    #[arg(long, value_name = "PATH|-", conflicts_with = "expect_file")]
+    #[arg(long, value_name = "PATH|-")]
     result_file: Option<String>,
+    /// The report's date, when the earnings store doesn't have it (or has
+    /// it wrong).
     #[arg(long, value_name = "YYYY-MM-DD")]
     date: Option<NaiveDate>,
     /// When in the day it reports.
@@ -477,10 +477,10 @@ mod tests {
             Some(rust_decimal_macros::dec!(3.74))
         );
         assert!(listed[1].reported.is_none() && listed[2].reported.is_none());
+        // The JSON carries the entry's own fields at the top level, with
+        // the reported figures and the reaction beside them.
         let json = serde_json::to_value(&listed[0]).unwrap();
         assert_eq!(json["reported"]["consensus"], "3.86");
-        // The JSON carries the entry's own fields at the top level.
-        let json = serde_json::to_value(&listed[0]).unwrap();
         assert_eq!(json["symbol"], "HD");
         assert_eq!(json["session"], "pre_market");
         assert!(json["reaction"]["gap_pct"].is_number());
@@ -506,6 +506,51 @@ mod tests {
         );
         // An empty slate asks from about six weeks back, not from the epoch.
         assert!((now - bars_start(&[], now)).num_days() < 60);
+    }
+
+    #[test]
+    fn the_text_flags_parse_and_only_a_field_and_its_own_file_conflict() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct Cli {
+            #[command(flatten)]
+            fields: Fields,
+        }
+        let parse = |args: &[&str]| Cli::try_parse_from([&["slate"], args].concat());
+        // Different fields from different files: fine.
+        let ok = parse(&["--expect-file", "e.txt", "--result-file", "r.txt"]).unwrap();
+        assert_eq!(
+            (
+                ok.fields.expect_file.as_deref(),
+                ok.fields.result_file.as_deref()
+            ),
+            (Some("e.txt"), Some("r.txt"))
+        );
+        assert!(parse(&["--expect", "x", "--result", "y", "--date", "2026-11-19"]).is_ok());
+        // The same field given twice over is refused.
+        assert!(parse(&["--result", "x", "--result-file", "r.txt"]).is_err());
+        assert!(parse(&["--expect", "x", "--expect-file", "e.txt"]).is_err());
+        // Each flag's help is its own.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let help = |name: &str| {
+            cmd.get_arguments()
+                .find(|a| a.get_long() == Some(name))
+                .and_then(|a| a.get_help())
+                .map(|h| h.to_string())
+                .unwrap_or_default()
+        };
+        assert!(
+            help("date").starts_with("The report's date"),
+            "{}",
+            help("date")
+        );
+        assert!(
+            help("result").starts_with("What was reported"),
+            "{}",
+            help("result")
+        );
+        assert!(!help("result").contains("date"), "{}", help("result"));
     }
 
     #[test]

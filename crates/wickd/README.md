@@ -462,6 +462,9 @@ wickd earnings results sync --slate     # every company on the slate
 wickd earnings results show NVDA        # what is stored (no network)
 ```
 
+`show` returns each symbol under `results`; a symbol with nothing stored is
+`null` (run `results sync` for it).
+
 - Each stored row has `fiscal_quarter`, `reported` (the date), `eps`,
   `consensus` and `surprise_pct` (decimal strings; a missing figure is left
   out), newest first.
