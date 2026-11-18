@@ -55,8 +55,8 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   back out (`esc`), search (`/`), refresh (`r`) and quit (`q`). A prefix letter
   opens a category, and a panel lists the next keys:
   - `g` go to: `g g` top, `g e` end, `g <n> g` row n, `g w` watchlist, `g i`
-    in play today, `g j` the journal, `g l` the open list (again: the next
-    list), `g s` / `g x` the stocks / forex section.
+    in play today, `g j` the journal, `g c` the calendar, `g l` the open
+    list (again: the next list), `g s` / `g x` the stocks / forex section.
   - `w` watchlist: `w a` add, `w d` remove, `w u` undo, `w j`/`w k` move.
   - `t` time range: `t d`/`t w`/`t m`/`t 6`/`t y`/`t 5`/`t a` for
     1D/5D/1M/6M/1Y/5Y/MAX.
@@ -90,6 +90,63 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   they change on disk, so edits from an editor or an agent appear within a
   couple of seconds without losing your place. It is a viewer: nothing in the
   TUI writes to the folder.
+- **Calendar** (`g c`, from any screen): the earnings watch. The play is
+  post-earnings drift, which trades the stock's reaction to a report, so this
+  is not a market calendar. By default it shows only what was picked:
+  companies on the slate (`wickd earnings slate`, marked `◆`, with the
+  slate's one-line why), any watchlist or list symbol that reports (`★`), and
+  high-impact US economic releases. Nothing is shown because of a company's
+  size. Watch, then react: nothing here places a trade.
+  - **Layout.** A heading per day, then that day as one list in time order,
+    releases and reports together, with nothing separating the two; the TYPE
+    column says which a row is. The columns are the same for both: TIME
+    (local time for a release, `pre-open` / `post-close` for a report), TYPE,
+    EVENT, REACTION, SIZE/IMPACT (market value, or the release's impact),
+    EXPECTED (expected EPS, or the forecast) and PREVIOUS (last year's EPS,
+    or the prior reading). The captions stay put while the rows scroll. On a
+    narrow terminal PREVIOUS drops first, then SIZE/IMPACT, then REACTION.
+  - **Window.** Three weekdays back, so a report and the reaction to it stay
+    in view, and today plus six days ahead. Days with nothing watched are
+    left out (today always shows). The cursor starts on the next thing still
+    to come.
+  - **Reaction.** Once a watched company's first trading day after its
+    report has come, REACTION shows that day's change against the prior
+    close (`…` while the session is still open). Fetched in the background
+    from Alpaca daily bars, re-asked every minute while the screen is open.
+  - **The box.** With the cursor on a company, a box under the list shows
+    its expectation as written (slate entries) and its reaction as a
+    sentence: the gap at the open, the day's change, where it closed in the
+    day's range, and volume against its 20-session average.
+  - **Everything** (`a`). From today on, every company that reports and
+    every US release, watched companies first in each session, then largest
+    first. This is where you browse to add to the slate. `a` again returns
+    to the watch.
+  - **Keys.** `s` puts the company under the cursor on the slate for that
+    report, or takes it off; an entry with a why or an expectation written
+    on it takes a second `s`. Expectations are written with
+    `wickd earnings slate set` (usually by an agent, before the report);
+    the screen picks up changes to the slate within a couple of seconds.
+    `j`/`k` move between rows, `J`/`K` a page, `g g`/`g e` go to the top /
+    end, `enter` on a company opens its chart (`esc` there comes back), `r`
+    fetches earnings now, and `esc` returns to where you were.
+  - **Data.** Economic events are read from `~/.wickd/calendar/` (kept
+    fresh by `wickd calendar sync`; this screen never writes it), earnings
+    from `~/.wickd/earnings/`. What is stored shows at once, and a
+    background fetch runs when a shown weekday has no file or the coming
+    days' files are more than six hours old. The header says how fresh each
+    store is. A failed fetch keeps the stored rows and says so along the
+    bottom edge, and the watch says when coming weekdays aren't stored, since
+    a watched company could be missing. The earnings source is unofficial
+    (see `wickd earnings`).
+- **Earnings markers.** A stock that reports today or on the next weekday
+  says so where you'd otherwise miss it: an `EARNINGS` column on the open
+  list and on the watchlist's stocks (`today pre-open`, `Thu post-close`;
+  today's in yellow), and `reports today after the close` in the chart's
+  header. The column only appears when a row on that table reports soon and
+  the terminal is wide enough to fit it without squeezing the other columns
+  (about 102 columns for a list, 127 for the watchlist). It reads the
+  earnings store only, re-checked every minute. Market holidays aren't
+  known, so "next weekday" can be a day the market is shut.
 - **Info** (`i`). On any row (lists, stocks, forex, in play) or a symbol
   screen, `i` opens a card saying what the symbol is: the Wikipedia summary
   (`o` opens the article in the reader window), the lists it's on with their
@@ -373,7 +430,8 @@ after the report has come, from one batched Alpaca daily-bars request
 
 `no_bars` lists symbols Alpaca returned nothing for. Exit 2 means no or
 rejected Alpaca keys (only with `--reactions`); exit 4 means a bad symbol,
-over-long text, or a symbol that isn't on the slate.
+over-long text, or `set` on a symbol that isn't on the slate (`rm` exits 0
+and lists it under `not_on_slate`). `ls` always carries `as_of`.
 
 ## `wickd info` — what is this symbol?
 

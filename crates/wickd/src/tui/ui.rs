@@ -155,6 +155,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::Search => render_search(frame, chunks[1], app),
         Mode::InPlay => render_inplay(frame, chunks[1], app),
         Mode::Journal => render_journal(frame, chunks[1], app),
+        Mode::Calendar => render_calendar(frame, chunks[1], app),
         Mode::Detail => match &app.detail {
             Some(d) => render_detail(frame, chunks[1], app, d),
             None => render_watchlist(frame, chunks[1], app),
@@ -271,6 +272,484 @@ fn render_journal(frame: &mut Frame, area: Rect, app: &App) {
     block = block.title_bottom(Line::from(Span::styled(place, dim)).alignment(Alignment::Right));
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// `text` cut to `width` columns (ending in `…` when cut) and padded to
+/// exactly `width`.
+fn fit(text: &str, width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if text.width() <= width {
+        return format!("{text}{}", " ".repeat(width - text.width()));
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    if width > 0 {
+        out.push('…');
+        used += 1;
+    }
+    format!("{out}{}", " ".repeat(width.saturating_sub(used)))
+}
+
+/// `text` right-aligned in `width` columns (cut from the right if longer).
+fn fit_right(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if text.width() >= width {
+        return fit(text, width);
+    }
+    format!("{}{text}", " ".repeat(width - text.width()))
+}
+
+/// Column widths of the calendar screen for a body `w` columns wide. Every
+/// row, economic or earnings, uses the same columns. On a narrow terminal
+/// PREVIOUS goes first, then SIZE/IMPACT, then REACTION, so the event keeps
+/// its room.
+struct CalCols {
+    event: usize,
+    reaction: bool,
+    weight: bool,
+    previous: bool,
+}
+
+const CAL_TIME: usize = 10;
+const CAL_TYPE: usize = 8;
+const CAL_REACTION: usize = 9;
+const CAL_WEIGHT: usize = 11;
+const CAL_NUM: usize = 10;
+const CAL_SYMBOL: usize = 6;
+/// The least the EVENT column is given before a secondary column is dropped.
+const CAL_EVENT_MIN: usize = 24;
+
+impl CalCols {
+    fn new(w: usize) -> Self {
+        // "  TIME  TYPE  EVENT  REACTION  SIZE/IMPACT  EXPECTED  PREVIOUS"
+        let fixed = 2 + CAL_TIME + 2 + CAL_TYPE + 2 + (2 + CAL_NUM);
+        let (r, wt, p) = (2 + CAL_REACTION, 2 + CAL_WEIGHT, 2 + CAL_NUM);
+        let reaction = w >= fixed + r + CAL_EVENT_MIN;
+        let weight = reaction && w >= fixed + r + wt + CAL_EVENT_MIN;
+        let previous = weight && w >= fixed + r + wt + p + CAL_EVENT_MIN;
+        let used = fixed
+            + if reaction { r } else { 0 }
+            + if weight { wt } else { 0 }
+            + if previous { p } else { 0 };
+        Self {
+            event: w.saturating_sub(used),
+            reaction,
+            weight,
+            previous,
+        }
+    }
+}
+
+/// `EPS 2.05`, or a dash when the feed gave none.
+fn fmt_eps(v: Option<rust_decimal::Decimal>) -> String {
+    v.map_or("–".to_string(), |d| format!("EPS {:.2}", d))
+}
+
+/// The column captions, pinned above the scrolling rows.
+fn calendar_header(w: usize) -> Line<'static> {
+    let cols = CalCols::new(w);
+    let mut s = format!(
+        "  {}  {}  {}",
+        fit_right("TIME", CAL_TIME),
+        fit("TYPE", CAL_TYPE),
+        fit("EVENT", cols.event)
+    );
+    if cols.reaction {
+        s.push_str(&fit_right("REACTION", 2 + CAL_REACTION));
+    }
+    if cols.weight {
+        s.push_str(&fit_right("SIZE/IMPACT", 2 + CAL_WEIGHT));
+    }
+    s.push_str(&fit_right("EXPECTED", 2 + CAL_NUM));
+    if cols.previous {
+        s.push_str(&fit_right("PREVIOUS", 2 + CAL_NUM));
+    }
+    Line::from(Span::styled(
+        fit(&s, w),
+        Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// One calendar row as a line exactly `w` columns wide. Economic releases
+/// and earnings share the same columns; TYPE says which one a row is.
+/// `reaction` is how the row's stock moved on its first day after the
+/// report, when known.
+fn calendar_line(
+    row: &super::calendar::Row,
+    reaction: Option<&wickd_core::earnings_reaction::Reaction>,
+    w: usize,
+    selected: bool,
+) -> Line<'static> {
+    use super::calendar::Row as R;
+    use unicode_width::UnicodeWidthStr;
+    let dim = Style::default().fg(DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let plain = Style::default();
+    let cols = CalCols::new(w);
+    // TIME and TYPE, the same for both kinds of row.
+    let lead = |time: &str, kind: &str, faded: bool| -> Vec<Span<'static>> {
+        vec![
+            Span::styled(
+                format!("  {}  ", fit_right(time, CAL_TIME)),
+                if faded { dim } else { plain },
+            ),
+            Span::styled(format!("{}  ", fit(kind, CAL_TYPE)), dim),
+        ]
+    };
+    let spans: Vec<Span<'static>> = match row {
+        R::Blank => vec![Span::raw(" ".repeat(w))],
+        R::Day(label) => vec![Span::styled(fit(label, w), bold)],
+        R::Note(text) => vec![Span::styled(fit(&format!("  {text}"), w), dim)],
+        R::Econ(e) => {
+            let (weight_style, event_style) = match (e.past, e.impact.as_str()) {
+                (true, _) => (dim, dim),
+                (_, "high") => (
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                    bold,
+                ),
+                (_, "low") => (dim, dim),
+                _ => (plain, plain),
+            };
+            let num = if e.past { dim } else { plain };
+            let mut v = lead(&e.time, "economic", e.past);
+            // Two columns in from the edge, so titles line up with tickers
+            // (which keep that space for the slate / list marker).
+            v.push(Span::styled(
+                fit(&format!("  {}", e.event), cols.event),
+                event_style,
+            ));
+            if cols.reaction {
+                v.push(Span::raw(" ".repeat(2 + CAL_REACTION)));
+            }
+            if cols.weight {
+                v.push(Span::styled(
+                    fit_right(&e.impact, 2 + CAL_WEIGHT),
+                    weight_style,
+                ));
+            }
+            v.push(Span::styled(fit_right(&e.forecast, 2 + CAL_NUM), num));
+            if cols.previous {
+                v.push(Span::styled(fit_right(&e.previous, 2 + CAL_NUM), dim));
+            }
+            v
+        }
+        R::Earn(e) => {
+            // A report that is out is dimmed like a past release, unless it
+            // is one being watched: then its reaction is the point.
+            let watched = e.slate || e.listed;
+            let faded = e.past && !watched;
+            let text = if faded { dim } else { plain };
+            let mut v = lead(super::calendar::session_text(e.session), "earnings", faded);
+            v.push(Span::styled(
+                match (e.slate, e.listed) {
+                    (true, _) => "◆ ",
+                    (false, true) => "★ ",
+                    _ => "  ",
+                },
+                Style::default().fg(ACCENT),
+            ));
+            v.push(Span::styled(
+                format!("{} ", fit(&e.symbol, CAL_SYMBOL)),
+                match (faded, watched) {
+                    (true, _) => dim,
+                    (false, true) => bold,
+                    (false, false) => plain,
+                },
+            ));
+            // The company, then the slate's one-line why in what room is left.
+            let room = cols.event.saturating_sub(2 + CAL_SYMBOL + 1);
+            let why = e.why.as_deref().filter(|_| e.slate);
+            match why {
+                Some(why) if e.name.width() + 4 < room => {
+                    let lead_text = if e.name.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{} · ", e.name)
+                    };
+                    let rest = room - lead_text.width();
+                    v.push(Span::styled(lead_text, text));
+                    v.push(Span::styled(fit(why, rest), dim));
+                }
+                _ => v.push(Span::styled(fit(&e.name, room), text)),
+            }
+            if cols.reaction {
+                v.push(match reaction {
+                    Some(r) => Span::styled(
+                        fit_right(
+                            &format!(
+                                "{:+.1}%{}",
+                                r.change_pct,
+                                if r.complete { "" } else { "…" }
+                            ),
+                            2 + CAL_REACTION,
+                        ),
+                        Style::default()
+                            .fg(change_color(Some(r.change_pct)))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    None => Span::raw(" ".repeat(2 + CAL_REACTION)),
+                });
+            }
+            if cols.weight {
+                v.push(Span::styled(
+                    fit_right(
+                        &e.market_cap
+                            .map_or("–".to_string(), super::calendar::fmt_cap),
+                        2 + CAL_WEIGHT,
+                    ),
+                    text,
+                ));
+            }
+            v.push(Span::styled(
+                fit_right(&fmt_eps(e.eps_forecast), 2 + CAL_NUM),
+                text,
+            ));
+            if cols.previous {
+                v.push(Span::styled(
+                    fit_right(&fmt_eps(e.last_year_eps), 2 + CAL_NUM),
+                    dim,
+                ));
+            }
+            v
+        }
+    };
+    let line = Line::from(spans);
+    if selected {
+        line.patch_style(selected_row())
+    } else {
+        line
+    }
+}
+
+/// A reaction as a sentence: what the stock did on its first trading day
+/// after the report.
+fn reaction_sentence(r: &wickd_core::earnings_reaction::Reaction) -> String {
+    let day = r.day.format("%a %b %-d");
+    let mut s = if r.complete {
+        format!(
+            "Reaction on {day}: opened {:+.1}%, closed {:+.1}%",
+            r.gap_pct, r.change_pct
+        )
+    } else {
+        format!(
+            "Reaction so far ({day}): opened {:+.1}%, now {:+.1}%",
+            r.gap_pct, r.change_pct
+        )
+    };
+    if let Some(p) = r.close_in_range {
+        s.push_str(&format!(", {p:.0}% of the way up the day's range"));
+    }
+    if let Some(v) = r.rel_volume {
+        s.push_str(&format!(
+            ", on {v:.1}× its usual volume{}",
+            if r.complete { "" } else { " so far" }
+        ));
+    }
+    s.push('.');
+    s
+}
+
+/// What the box under the list says for the company under the cursor: its
+/// expectation as written, then its reaction. `None` when there is neither.
+fn calendar_box(app: &App) -> Option<(String, Vec<String>)> {
+    let c = &app.calendar;
+    let e = c.selected_earn()?;
+    let expect = e.expect.as_deref().filter(|_| e.slate);
+    let reaction = c.reaction_of(e);
+    if expect.is_none() && reaction.is_none() {
+        return None;
+    }
+    let mut lines: Vec<String> = expect
+        .map(|t| t.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    if let Some(r) = reaction {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(reaction_sentence(r));
+    }
+    let title = match (expect.is_some(), reaction.is_some()) {
+        (true, true) => "expectation and reaction",
+        (true, false) => "expectation",
+        _ => "reaction",
+    };
+    Some((format!(" {} · {title} ", e.symbol), lines))
+}
+
+/// The calendar (`g c`): the earnings watch. A heading per day and one row
+/// per event, in local time, with the selected company's expectation and
+/// reaction in a box underneath.
+fn render_calendar(frame: &mut Frame, area: Rect, app: &App) {
+    use ratatui::widgets::Padding;
+    let c = &app.calendar;
+    let dim = Style::default().fg(DIM);
+
+    // The box takes what its text needs, up to a third of the screen.
+    let boxed = calendar_box(app);
+    let box_h: u16 = boxed.as_ref().map_or(0, |(_, lines)| {
+        let inner = usize::from(area.width.saturating_sub(4)).max(1);
+        let need: usize = lines
+            .iter()
+            .map(|l| l.chars().count().max(1).div_ceil(inner))
+            .sum();
+        (need as u16 + 2).min((area.height / 3).max(3))
+    });
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(box_h)])
+        .split(area);
+    let area = parts[0];
+    if let Some((title, lines)) = boxed {
+        let text: Vec<Line> = lines
+            .into_iter()
+            .map(|l| {
+                if l.trim().is_empty() {
+                    Line::default()
+                } else {
+                    Line::from(format!(" {l}"))
+                }
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(ACCENT))
+                        .title(Span::styled(
+                            title,
+                            Style::default().add_modifier(Modifier::BOLD),
+                        )),
+                ),
+            parts[1],
+        );
+    }
+
+    let mut title = vec![
+        Span::styled(" Calendar ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            if c.show_all {
+                "· everything that reports "
+            } else {
+                "· your earnings watch "
+            },
+            dim,
+        ),
+    ];
+    if !c.show_all {
+        title.push(Span::styled("◆ slate  ★ list ", dim));
+    }
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .padding(Padding::horizontal(2))
+        .title(Line::from(title));
+
+    // Top right: how fresh each store is, or that a fetch is running.
+    let stamp = |t: DateTime<Utc>| c.clock.local(t).format("%a %-I:%M %p").to_string();
+    let status = if c.loading {
+        Some("fetching earnings…".to_string())
+    } else {
+        let parts: Vec<String> = [
+            c.earnings_as_of.map(|t| format!("earnings as of {}", stamp(t))),
+            c.econ_as_of
+                .map(|t| format!("economic as of {}", stamp(DateTime::<Utc>::from(t)))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    };
+    if let Some(s) = status {
+        block = block
+            .title(Line::from(Span::styled(format!(" {s} "), dim)).alignment(Alignment::Right));
+    }
+    // Bottom left: what went wrong fetching, earnings first.
+    if let Some(e) = c.fetch_error.as_ref().or(c.reactions_error.as_ref()) {
+        let room = usize::from(area.width).saturating_sub(14);
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(" {} ", fit(e, room).trim_end()),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    let inner = block.inner(area);
+    let w = usize::from(inner.width);
+
+    if c.error.is_some() || c.rows.is_empty() {
+        frame.render_widget(block, area);
+        let lines = match &c.error {
+            Some(e) => vec![Line::from(Span::styled(
+                format!("couldn't read the calendar: {e}"),
+                Style::default().fg(Color::Yellow),
+            ))],
+            None => vec![Line::from("Nothing stored yet. Press r to fetch.")],
+        };
+        let body = Rect {
+            y: inner.y + 1.min(inner.height),
+            height: inner.height.saturating_sub(1),
+            ..inner
+        };
+        frame.render_widget(
+            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+            body,
+        );
+        return;
+    }
+
+    // The captions stay put; the rows scroll under them.
+    let head = Rect {
+        height: 1.min(inner.height),
+        ..inner
+    };
+    let body = Rect {
+        y: inner.y + head.height,
+        height: inner.height.saturating_sub(head.height),
+        ..inner
+    };
+    let page = usize::from(body.height);
+    let scroll = c.settle_scroll(page);
+    let total = c.rows.len();
+    let lines: Vec<Line> = c
+        .rows
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(page)
+        .map(|(i, r)| {
+            let reaction = match r {
+                super::calendar::Row::Earn(e) => c.reaction_of(e),
+                _ => None,
+            };
+            calendar_line(r, reaction, w, i == c.selected && r.selectable())
+        })
+        .collect();
+    // Where the page is in the week, bottom right.
+    let end = (scroll + page).min(total);
+    let place = if total <= page {
+        " all ".to_string()
+    } else if end == total {
+        " end ".to_string()
+    } else if scroll == 0 {
+        " top ".to_string()
+    } else {
+        format!(" {}% ", end * 100 / total.max(1))
+    };
+    block = block.title_bottom(Line::from(Span::styled(place, dim)).alignment(Alignment::Right));
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(calendar_header(w)), head);
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// SEC's `MMDD` fiscal year end as `Jan 31` (unchanged if it isn't MMDD).
@@ -629,6 +1108,41 @@ fn header_row(left: &[&str], right: &[&str], trailing: &[&str]) -> Row<'static> 
     Row::new(cells).style(Style::default().fg(DIM).add_modifier(Modifier::BOLD))
 }
 
+/// Width of the EARNINGS column (`today post-close`).
+const REPORTS_W: u16 = 16;
+
+/// A report today stands out; one on the next weekday is quieter.
+fn reports_style(today: bool) -> Style {
+    if today {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
+}
+
+/// The EARNINGS cell for a symbol: when it reports, if that is today or the
+/// next weekday; empty otherwise.
+fn reports_cell(app: &App, sym: &str) -> Cell<'static> {
+    let today = app.calendar.clock.today();
+    match app.reports_soon.get(sym) {
+        Some(soon) => Cell::from(soon.short(today)).style(reports_style(soon.date == today)),
+        None => Cell::from(""),
+    }
+}
+
+/// Whether a table `width` columns wide shows the EARNINGS column: only
+/// when one of its symbols reports soon, and only when there is room for it
+/// without taking space from the columns already there (`needed` is the
+/// table's width without it).
+fn shows_reports<'a>(
+    app: &App,
+    width: u16,
+    needed: u16,
+    mut symbols: impl Iterator<Item = &'a str>,
+) -> bool {
+    width >= needed + REPORTS_W + 2 && symbols.any(|s| app.reports_soon.contains_key(s))
+}
+
 // ── watchlist ───────────────────────────────────────────────────────────────
 
 fn quote_cells(snap: Option<&Snapshot>) -> (String, String, String, Color) {
@@ -828,7 +1342,19 @@ fn render_list_table(
     sel: Option<usize>,
     title: String,
 ) {
-    let header = header_row(&["SYMBOL", "NAME", "NOTE"], &["LAST", "CHG%"], &[]);
+    // SYMBOL 8 + NAME 28 + NOTE's minimum 20 + LAST 10 + CHG% 8, four gaps
+    // of 2 and the border.
+    let reports = shows_reports(
+        app,
+        area.width,
+        8 + 28 + 20 + 10 + 8 + 4 * 2 + 2,
+        rows.iter().filter_map(|&r| app.row_symbol(r)),
+    );
+    let header = if reports {
+        header_row(&["SYMBOL", "NAME", "EARNINGS", "NOTE"], &["LAST", "CHG%"], &[])
+    } else {
+        header_row(&["SYMBOL", "NAME", "NOTE"], &["LAST", "CHG%"], &[])
+    };
     let body = rows.iter().filter_map(|&r| {
         let sym = app.row_symbol(r)?.to_string();
         let note = app.row_note(r).unwrap_or_default().to_string();
@@ -852,22 +1378,30 @@ fn render_list_table(
             let (last, _, pct, color) = quote_cells(app.snapshots.get(&sym));
             (last, pct, color, format!("{sym}:last"))
         };
-        Some(Row::new(vec![
+        let mut cells = vec![
             Cell::from(sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
             Cell::from(name),
+        ];
+        if reports {
+            cells.push(reports_cell(app, &sym));
+        }
+        cells.extend([
             Cell::from(note).style(Style::default().fg(Color::Gray)),
             Cell::from(Line::from(last).alignment(Alignment::Right)).style(tick_style(app, &key)),
             Cell::from(Line::from(pct).alignment(Alignment::Right))
                 .style(Style::default().fg(color)),
-        ]))
+        ]);
+        Some(Row::new(cells))
     });
-    let widths = [
-        Constraint::Length(8),
-        Constraint::Length(28),
+    let mut widths = vec![Constraint::Length(8), Constraint::Length(28)];
+    if reports {
+        widths.push(Constraint::Length(REPORTS_W));
+    }
+    widths.extend([
         Constraint::Min(20),
         Constraint::Length(10),
         Constraint::Length(8),
-    ];
+    ]);
     let table = Table::new(body, widths)
         .header(header)
         .block(
@@ -891,11 +1425,27 @@ fn render_stock_table(
     title: String,
 ) {
     let spark_w: usize = 24;
-    let header = header_row(
-        &["SYMBOL", "NAME"],
-        &["LAST", "CHG", "CHG%", "DAY RANGE", "VOLUME"],
-        &["TODAY"],
+    // SYMBOL 7 + NAME's minimum 12 + LAST 10 + CHG 9 + CHG% 8 + DAY RANGE 19
+    // + VOLUME 8 + the sparkline, seven gaps of 2 and the border.
+    let reports = shows_reports(
+        app,
+        area.width,
+        7 + 12 + 10 + 9 + 8 + 19 + 8 + spark_w as u16 + 7 * 2 + 2,
+        rows.iter().map(|&i| app.watchlist[i].as_str()),
     );
+    let header = if reports {
+        header_row(
+            &["SYMBOL", "NAME", "EARNINGS"],
+            &["LAST", "CHG", "CHG%", "DAY RANGE", "VOLUME"],
+            &["TODAY"],
+        )
+    } else {
+        header_row(
+            &["SYMBOL", "NAME"],
+            &["LAST", "CHG", "CHG%", "DAY RANGE", "VOLUME"],
+            &["TODAY"],
+        )
+    };
     let rows = rows.iter().map(|&i| {
         let sym = &app.watchlist[i];
         let snap = app.snapshots.get(sym);
@@ -917,9 +1467,14 @@ fn render_stock_table(
             .get(sym)
             .map(|v| sparkline(v, spark_w))
             .unwrap_or_default();
-        Row::new(vec![
+        let mut cells = vec![
             Cell::from(sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
             Cell::from(name),
+        ];
+        if reports {
+            cells.push(reports_cell(app, sym));
+        }
+        cells.extend([
             Cell::from(Line::from(last).alignment(Alignment::Right))
                 .style(tick_style(app, &format!("{sym}:last"))),
             Cell::from(Line::from(chg).alignment(Alignment::Right))
@@ -929,18 +1484,21 @@ fn render_stock_table(
             Cell::from(Line::from(range).alignment(Alignment::Right)),
             Cell::from(Line::from(vol).alignment(Alignment::Right)),
             Cell::from(spark).style(Style::default().fg(color)),
-        ])
+        ]);
+        Row::new(cells)
     });
-    let widths = [
-        Constraint::Length(7),
-        Constraint::Min(12),
+    let mut widths = vec![Constraint::Length(7), Constraint::Min(12)];
+    if reports {
+        widths.push(Constraint::Length(REPORTS_W));
+    }
+    widths.extend([
         Constraint::Length(10),
         Constraint::Length(9),
         Constraint::Length(8),
         Constraint::Length(19),
         Constraint::Length(8),
         Constraint::Length(spark_w as u16),
-    ];
+    ]);
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -1442,6 +2000,13 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, d: &DetailState) {
     }
     if app.in_watchlist(&d.symbol) {
         title.push(Span::styled("  ★ watchlist", Style::default().fg(ACCENT)));
+    }
+    if let Some(soon) = app.reports_soon.get(&d.symbol) {
+        let today = app.calendar.clock.today();
+        title.push(Span::styled(
+            format!("  {}", soon.long(today)),
+            reports_style(soon.date == today),
+        ));
     }
     let fxq = app.fx_quotes.get(&d.symbol);
     let (price_line, stats_line) = if fx::is_fx(&d.symbol) {
@@ -2008,10 +2573,15 @@ fn help_section(title: &str, ctx: Ctx) -> Vec<Line<'static>> {
 }
 
 fn render_help(frame: &mut Frame, area: Rect, mode: Mode) {
-    // The journal has its own short card (the full one is already a
-    // screenful, and none of it applies there).
-    if mode == Mode::Journal {
-        let mut lines = help_section("journal", Ctx::Journal);
+    // The journal and the calendar have their own short cards (the full
+    // one is already a screenful, and none of it applies there).
+    let short = match mode {
+        Mode::Journal => Some(("journal", Ctx::Journal)),
+        Mode::Calendar => Some(("calendar", Ctx::Calendar)),
+        _ => None,
+    };
+    if let Some((name, ctx)) = short {
+        let mut lines = help_section(name, ctx);
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "any key closes",
@@ -2787,6 +3357,864 @@ mod tests {
         assert!(all.contains("No journal entries yet."));
         assert!(all.contains("missing"), "{all}");
         assert!(all.contains("WICKD_JOURNAL_DIR"));
+    }
+
+    /// An app whose calendar reads temp stores and a temp slate, at 8:00 AM
+    /// Mountain on Wed Nov 18, 2026. Slate: NVDA (reported Tuesday after the
+    /// close) and TGT (this morning). Watchlist: PANW.
+    fn calendar_app(tmp: &std::path::Path) -> App {
+        use rust_decimal_macros::dec;
+        use wickd_core::calendar_store::{merge_into_store, CalendarEvent};
+        use wickd_core::earnings_store::{write_day, DayFile, EarningsRow, Session};
+        let ev = |date: &str, time: &str, event: &str, impact: &str, forecast: &str| CalendarEvent {
+            date: date.into(),
+            time: time.into(),
+            currency: "USD".into(),
+            event: event.into(),
+            impact: impact.into(),
+            actual: String::new(),
+            forecast: forecast.into(),
+            previous: "1.40M".into(),
+        };
+        let econ_dir = tmp.join("calendar");
+        std::fs::create_dir_all(&econ_dir).unwrap();
+        merge_into_store(
+            &econ_dir,
+            vec![
+                ev("2026-11-18", "13:30", "Housing Starts", "low", "1.25M"),
+                ev("2026-11-18", "19:00", "FOMC Meeting Minutes", "high", ""),
+                ev("2026-11-19", "13:30", "Unemployment Claims", "medium", "198K"),
+            ],
+        )
+        .unwrap();
+        let row = |date: &str, symbol: &str, name: &str, session, cap, eps| EarningsRow {
+            date: date.parse().unwrap(),
+            symbol: symbol.into(),
+            name: name.into(),
+            session,
+            eps_forecast: Some(eps),
+            estimates: Some(9),
+            market_cap: Some(cap),
+            last_year_eps: Some(dec!(1.78)),
+            fiscal_quarter: "Oct/2026".into(),
+        };
+        let earn_dir = tmp.join("earnings");
+        let file = |date: &str, rows: Vec<EarningsRow>| DayFile {
+            date: date.parse().unwrap(),
+            fetched_at: "2026-11-18T00:30:00Z".parse().unwrap(),
+            source: "nasdaq".into(),
+            rows,
+        };
+        write_day(
+            &earn_dir,
+            &file(
+                "2026-11-17",
+                vec![row(
+                    "2026-11-17",
+                    "NVDA",
+                    "NVIDIA Corporation",
+                    Session::AfterHours,
+                    dec!(3762974100000),
+                    dec!(2.49),
+                )],
+            ),
+        )
+        .unwrap();
+        write_day(
+            &earn_dir,
+            &file(
+                "2026-11-18",
+                vec![
+                    row(
+                        "2026-11-18",
+                        "TJX",
+                        "TJX Companies, Inc. (The)",
+                        Session::PreMarket,
+                        dec!(144195600000),
+                        dec!(1.33),
+                    ),
+                    row(
+                        "2026-11-18",
+                        "TGT",
+                        "Target Corporation",
+                        Session::PreMarket,
+                        dec!(72832852000),
+                        dec!(2.05),
+                    ),
+                    row(
+                        "2026-11-18",
+                        "HUYA",
+                        "HUYA Inc.",
+                        Session::PreMarket,
+                        dec!(475001472),
+                        dec!(0.02),
+                    ),
+                    row(
+                        "2026-11-18",
+                        "PANW",
+                        "Palo Alto Networks, Inc.",
+                        Session::AfterHours,
+                        dec!(258701689000),
+                        dec!(0.52),
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+        let pick = |symbol: &str, date: &str, session, why: &str, expect: Option<&str>| crate::slate::Entry {
+            symbol: symbol.into(),
+            date: date.parse().unwrap(),
+            session,
+            why: Some(why.into()),
+            expect: expect.map(str::to_string),
+            added: "2026-11-15T03:00:00Z".parse().unwrap(),
+        };
+        let slate_path = tmp.join("slate.json");
+        let slate = crate::slate::SlateFile {
+            version: 1,
+            entries: vec![
+                pick(
+                    "NVDA",
+                    "2026-11-17",
+                    Session::AfterHours,
+                    "sets the tone for AI",
+                    Some("Beat and raise: +5%.\nA cut to the outlook: -10%."),
+                ),
+                pick("TGT", "2026-11-18", Session::PreMarket, "consumer read", None),
+            ],
+        };
+        std::fs::write(&slate_path, serde_json::to_vec_pretty(&slate).unwrap()).unwrap();
+        let mut app = App::new(vec!["PANW".into()], "iex");
+        app.calendar =
+            crate::tui::calendar::CalendarState::new(Some(econ_dir), Some(earn_dir), Some(slate_path));
+        app.calendar.clock = crate::tui::calendar::Clock::mst("2026-11-18T15:00:00Z");
+        app
+    }
+
+    /// `g c`, with the opening fetches answered (no reactions yet).
+    fn open_calendar(app: &mut App) {
+        press(app, KeyCode::Char('g'));
+        press(app, KeyCode::Char('c'));
+        app.set_earnings_fetch(Ok(vec![]));
+        app.set_reactions(Ok(vec![]));
+        app.flash = None;
+    }
+
+    fn reacted(day: &str, gap: f64, change: f64, complete: bool) -> wickd_core::earnings_reaction::Reaction {
+        wickd_core::earnings_reaction::Reaction {
+            day: day.parse().unwrap(),
+            complete,
+            prior_close: 100.0,
+            open: 100.0 + gap,
+            close: 100.0 + change,
+            gap_pct: gap,
+            change_pct: change,
+            close_in_range: Some(80.0),
+            rel_volume: Some(2.5),
+        }
+    }
+
+    /// NVDA's finished reaction and TGT's so far.
+    fn give_reactions(app: &mut App) {
+        use wickd_core::earnings_store::Session;
+        app.set_reactions(Ok(vec![
+            (
+                ("NVDA".into(), "2026-11-17".parse().unwrap(), Session::AfterHours),
+                reacted("2026-11-18", 2.1, 4.2, true),
+            ),
+            (
+                ("TGT".into(), "2026-11-18".parse().unwrap(), Session::PreMarket),
+                reacted("2026-11-18", -1.5, -3.1, false),
+            ),
+        ]));
+    }
+
+    #[test]
+    fn calendar_watch_shows_the_slate_the_lists_and_the_big_releases() {
+        use crate::tui::app::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        press(&mut app, KeyCode::Char('g'));
+        // Days are missing from the store, and two watched reports are out:
+        // opening asks for both.
+        let actions = press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.mode, Mode::Calendar);
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::FetchEarnings(d), Action::FetchReactions(r)] if d.len() == 8 && r.len() == 2
+            ),
+            "{actions:?}"
+        );
+        let rows = screen(&app, 130, 30);
+        assert!(rows[1].contains("Calendar · your earnings watch"), "{}", rows[1]);
+        assert!(rows[1].contains("fetching earnings…"), "{}", rows[1]);
+        app.set_earnings_fetch(Ok(vec![]));
+        let rows = screen(&app, 130, 30);
+        // 00:30 UTC on the 18th is Tuesday 5:30 PM in Denver.
+        assert!(rows[1].contains("earnings as of Tue 5:30 PM"), "{}", rows[1]);
+        let all = rows.join("\n");
+        let line = |needle: &str| {
+            rows.iter()
+                .find(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?} in\n{all}"))
+                .clone()
+        };
+        // One caption row for the whole screen.
+        for caption in ["TIME", "TYPE", "EVENT", "REACTION", "SIZE/IMPACT", "EXPECTED", "PREVIOUS"] {
+            assert!(rows[2].contains(caption), "{caption}: {}", rows[2]);
+        }
+        assert_eq!(all.matches("EXPECTED").count(), 1);
+        assert!(!all.contains("Earnings ·"), "no captions between events: {all}");
+        // Yesterday stays for the reaction, then today.
+        assert!(rows[3].contains("Yesterday · Tue Nov 17"), "{}", rows[3]);
+        let nvda = line("NVIDIA Corporation");
+        for part in ["post-close", "earnings", "◆ NVDA", "· sets the tone for AI", "$3.76T", "EPS 2.49"] {
+            assert!(nvda.contains(part), "{part}: {nvda}");
+        }
+        assert!(all.contains("Today · Wed Nov 18"));
+        let tgt = line("Target Corporation");
+        assert!(tgt.contains("◆ TGT") && tgt.contains("· consumer read") && tgt.contains("pre-open"), "{tgt}");
+        // The one high-impact release; the low and medium ones aren't on the watch.
+        let minutes = line("FOMC Meeting Minutes");
+        assert!(
+            minutes.contains("12:00 PM") && minutes.contains("economic") && minutes.contains("high"),
+            "{minutes}"
+        );
+        assert!(!all.contains("Housing Starts") && !all.contains("Unemployment Claims"));
+        // On the watchlist: shown and marked differently from the slate.
+        assert!(line("Palo Alto").contains("★ PANW"), "{}", line("Palo Alto"));
+        // Bigger than anything shown, and not picked: not here.
+        assert!(!all.contains("TJX Companies") && !all.contains("HUYA"));
+        assert!(all.contains("2 other companies report · a shows everything"));
+        // Event titles and tickers start in the same column.
+        let column = |line: &str, needle: &str| line[..line.find(needle).unwrap()].chars().count();
+        assert_eq!(
+            column(&minutes, "FOMC Meeting"),
+            column(&tgt, "TGT    Target"),
+            "{minutes}\n{tgt}"
+        );
+        // Every drawn line is the same width: columns line up.
+        assert!(rows[1..29].iter().all(|r| r.chars().count() == 130));
+
+        // The reactions land: a figure on each watched row that has one.
+        give_reactions(&mut app);
+        let rows = screen(&app, 130, 30);
+        let find = |needle: &str| rows.iter().find(|r| r.contains(needle)).unwrap().clone();
+        assert!(find("NVIDIA Corporation").contains("+4.2%"), "{}", find("NVIDIA Corporation"));
+        // Today's session is still open: marked as so far.
+        assert!(find("Target Corporation").contains("-3.1%…"), "{}", find("Target Corporation"));
+        assert!(!find("Palo Alto").contains('%'), "it hasn't reported yet");
+    }
+
+    #[test]
+    fn calendar_box_shows_the_expectation_and_the_reaction_of_the_selected_company() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        open_calendar(&mut app);
+        // The cursor opens on the Fed minutes: nothing to say about a release.
+        let all = screen(&app, 130, 30).join("\n");
+        assert!(!all.contains("· expectation") && !all.contains("· reaction"), "{all}");
+        // NVDA: its expectation as written.
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.calendar.selected_symbol(), Some("NVDA"));
+        let all = screen(&app, 130, 30).join("\n");
+        assert!(all.contains(" NVDA · expectation "), "{all}");
+        assert!(all.contains("Beat and raise: +5%.") && all.contains("A cut to the outlook: -10%."));
+        assert!(!all.contains("Reaction"));
+        // With its reaction in, both, the reaction as a sentence.
+        give_reactions(&mut app);
+        let all = screen(&app, 130, 30).join("\n");
+        assert!(all.contains(" NVDA · expectation and reaction "), "{all}");
+        assert!(
+            all.contains(
+                "Reaction on Wed Nov 18: opened +2.1%, closed +4.2%, 80% of the way up the day's range, on 2.5× its usual volume."
+            ),
+            "{all}"
+        );
+        // The list is still there above the box, captions and all.
+        assert!(all.contains("TIME") && all.contains("Today · Wed Nov 18"));
+        // TGT has no expectation written; its unfinished day is "so far".
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.calendar.selected_symbol(), Some("TGT"));
+        let all = screen(&app, 130, 30).join("\n");
+        assert!(all.contains(" TGT · reaction "), "{all}");
+        assert!(
+            all.contains(
+                "Reaction so far (Wed Nov 18): opened -1.5%, now -3.1%, 80% of the way up the day's range, on 2.5× its usual volume so far."
+            ),
+            "{all}"
+        );
+        // A failed reaction fetch says so along the bottom and keeps the figures.
+        app.set_reactions(Err("rate limited".into()));
+        let all = screen(&app, 130, 30).join("\n");
+        assert!(all.contains("couldn't fetch reactions: rate limited"), "{all}");
+        assert!(all.contains("-3.1%…"));
+    }
+
+    #[test]
+    fn calendar_s_puts_a_company_on_the_slate_and_takes_it_off() {
+        use crate::tui::app::Action;
+        use wickd_core::earnings_store::Session;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        open_calendar(&mut app);
+        // On the Fed minutes: not a company.
+        assert!(press(&mut app, KeyCode::Char('s')).is_empty());
+        assert_eq!(app.flash.as_deref(), Some("only a company's row goes on the slate"));
+        // PANW is on the watchlist, not the slate: s adds it for this report.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.calendar.selected_symbol(), Some("PANW"));
+        let actions = press(&mut app, KeyCode::Char('s'));
+        let [Action::SlateAdd { symbol, date, session }] = actions.as_slice() else {
+            panic!("{actions:?}");
+        };
+        assert_eq!(
+            (symbol.as_str(), date.to_string().as_str(), *session),
+            ("PANW", "2026-11-18", Session::AfterHours)
+        );
+        // What the event loop does with it.
+        let r = app.calendar.slate_add(symbol, *date, *session);
+        app.slate_written(r.map(|()| "PANW is on the slate".to_string()));
+        assert_eq!(app.flash.as_deref(), Some("PANW is on the slate"));
+        assert_eq!(app.calendar.selected_symbol(), Some("PANW"), "cursor kept");
+        assert!(screen(&app, 130, 30).join("\n").contains("◆ PANW"));
+        let path = app.calendar.slate_path.clone().unwrap();
+        let stored = crate::slate::load_at(&path).unwrap();
+        assert_eq!(stored.entries.len(), 3);
+        assert_eq!(stored.entries[0].why.as_deref(), Some("sets the tone for AI"), "the others are untouched");
+        // No notes on it: one s takes it straight off.
+        let actions = press(&mut app, KeyCode::Char('s'));
+        assert!(matches!(actions.as_slice(), [Action::SlateRemove(s)] if s == "PANW"), "{actions:?}");
+        let r = app.calendar.slate_remove("PANW");
+        app.slate_written(r.map(|()| "PANW is off the slate".to_string()));
+        assert!(screen(&app, 130, 30).join("\n").contains("★ PANW"), "back to a list row");
+
+        // NVDA has notes: the first s only warns, and any other key cancels.
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        assert!(press(&mut app, KeyCode::Char('s')).is_empty());
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("NVDA has notes on the slate; press s again to remove it and them")
+        );
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('k'));
+        assert!(press(&mut app, KeyCode::Char('s')).is_empty(), "the warning starts over");
+        let actions = press(&mut app, KeyCode::Char('s'));
+        assert!(matches!(actions.as_slice(), [Action::SlateRemove(s)] if s == "NVDA"), "{actions:?}");
+        let r = app.calendar.slate_remove("NVDA");
+        app.slate_written(r.map(|()| "NVDA is off the slate".to_string()));
+        assert_eq!(crate::slate::load_at(&path).unwrap().entries.len(), 1);
+        // Off the slate and on no list, yesterday's report leaves the watch.
+        assert!(!screen(&app, 130, 30).join("\n").contains("NVIDIA"));
+    }
+
+    #[test]
+    fn calendar_everything_browses_the_full_feed_to_add_from() {
+        use crate::tui::app::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        open_calendar(&mut app);
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.flash.as_deref(), Some("showing everything that reports"));
+        app.flash = None;
+        let rows = screen(&app, 130, 34);
+        let all = rows.join("\n");
+        assert!(rows[1].contains("Calendar · everything that reports"), "{}", rows[1]);
+        assert!(all.contains("TJX Companies") && all.contains("HUYA Inc.") && all.contains("Housing Starts"));
+        assert!(all.contains("Tomorrow · Thu Nov 19") && all.contains("Unemployment Claims"));
+        assert!(all.contains("No earnings stored for this day yet. Press r to fetch."));
+        // The day reads in time order: morning reports, the noon release,
+        // then the evening report.
+        let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
+        assert!(at("TJX Companies") < at("FOMC Meeting Minutes"));
+        assert!(at("FOMC Meeting Minutes") < at("Palo Alto"));
+        // A company nobody picked that has already reported is dimmed text,
+        // but can still be added: s on TJX.
+        while app.calendar.selected_symbol() != Some("TJX") {
+            press(&mut app, KeyCode::Char('k'));
+        }
+        let actions = press(&mut app, KeyCode::Char('s'));
+        assert!(
+            matches!(actions.as_slice(), [Action::SlateAdd { symbol, .. }] if symbol == "TJX"),
+            "{actions:?}"
+        );
+        let r = app.calendar.slate_add("TJX", "2026-11-18".parse().unwrap(), wickd_core::earnings_store::Session::PreMarket);
+        let more = app.slate_written(r.map(|()| "TJX is on the slate".to_string()));
+        // It reported this morning, so its reaction is asked for at once.
+        assert!(
+            matches!(more.as_slice(), [Action::FetchReactions(r)] if r.iter().any(|a| a.0 == "TJX")),
+            "{more:?}"
+        );
+        // Back on the watch, it is there.
+        press(&mut app, KeyCode::Char('a'));
+        let all = screen(&app, 130, 30).join("\n");
+        assert!(all.contains("◆ TJX") && !all.contains("HUYA"), "{all}");
+    }
+
+    #[test]
+    fn calendar_rows_open_charts_and_esc_comes_back() {
+        use crate::tui::app::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        open_calendar(&mut app);
+        // The cursor starts on the next thing to come, the Fed minutes: not
+        // a company.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Calendar);
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("only a company's row opens a chart")
+        );
+        press(&mut app, KeyCode::Char('j')); // PANW, after the close
+        let actions = press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Detail);
+        assert_eq!(app.detail.as_ref().map(|d| d.symbol.as_str()), Some("PANW"));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::FetchHistory(s, _) if s == "PANW")));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Calendar);
+        assert_eq!(app.calendar.selected_symbol(), Some("PANW"), "cursor kept");
+        // r asks for a fetch; a second r while it runs doesn't.
+        let actions = press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(actions.first(), Some(Action::FetchEarnings(_))), "{actions:?}");
+        assert!(press(&mut app, KeyCode::Char('r')).is_empty());
+        assert_eq!(app.flash.as_deref(), Some("already fetching"));
+        // A failed fetch keeps the stored rows and says so along the bottom.
+        app.set_earnings_fetch(Err("offline".into()));
+        let rows = screen(&app, 130, 30);
+        assert!(
+            rows[28].contains("couldn't fetch earnings: offline"),
+            "{}",
+            rows[28]
+        );
+        assert!(rows.join("\n").contains("Target Corporation"));
+        // esc returns to where the calendar was opened from.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Watchlist);
+    }
+
+    #[test]
+    fn calendar_and_journal_are_never_each_others_way_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        app.journal = crate::tui::journal::JournalState::new(tmp.path().join("journal"));
+        for keys in [['g', 'c'], ['g', 'j'], ['g', 'c'], ['g', 'j'], ['g', 'c']] {
+            for k in keys {
+                press(&mut app, KeyCode::Char(k));
+            }
+        }
+        assert_eq!(app.mode, Mode::Calendar);
+        // However many times the two were swapped, esc leaves in two steps
+        // at most.
+        press(&mut app, KeyCode::Esc);
+        if app.mode != Mode::Watchlist {
+            press(&mut app, KeyCode::Esc);
+        }
+        assert_eq!(app.mode, Mode::Watchlist);
+    }
+
+    #[test]
+    fn calendar_narrow_terminal_drops_the_secondary_columns_and_help_lists_its_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        open_calendar(&mut app);
+        give_reactions(&mut app);
+        // 100 wide: PREVIOUS is the first column to go.
+        let all = screen(&app, 100, 24).join("\n");
+        assert!(all.contains("REACTION") && all.contains("SIZE/IMPACT") && all.contains("EXPECTED"), "{all}");
+        assert!(!all.contains("PREVIOUS") && !all.contains("EPS 1.78"), "{all}");
+        // 82 wide: SIZE/IMPACT goes too; the reaction stays.
+        let all = screen(&app, 82, 24).join("\n");
+        assert!(all.contains("REACTION") && all.contains("+4.2%") && all.contains("EPS 2.49"), "{all}");
+        assert!(!all.contains("SIZE/IMPACT") && !all.contains("$3.76T"), "{all}");
+        // 64 wide: time, type, event and expected.
+        let rows = screen(&app, 64, 24);
+        let all = rows.join("\n");
+        assert!(all.contains("EXPECTED") && all.contains("EPS 2.49"), "{all}");
+        assert!(!all.contains("REACTION") && !all.contains("+4.2%"), "{all}");
+        assert!(all.contains("post-close") && all.contains("earnings") && all.contains("economic"));
+        // A long name is cut with an ellipsis, not wrapped.
+        assert!(all.contains('…'), "{all}");
+        assert!(rows.iter().all(|r| r.chars().count() == 64));
+        press(&mut app, KeyCode::Char('?'));
+        let help = screen(&app, 100, 30).join("\n");
+        assert!(help.contains("calendar"), "{help}");
+        for key in [
+            "fetch earnings now",
+            "your watch ↔ everything",
+            "slate: add / remove",
+            "open the company's chart",
+        ] {
+            assert!(help.contains(key), "{key}: {help}");
+        }
+    }
+
+    #[test]
+    fn calendar_top_shows_the_day_heading_after_scrolling_and_toggling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        open_calendar(&mut app);
+        // A short screen, so the week doesn't fit and the page scrolls.
+        let (w, h) = (130u16, 10u16);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        // NVDA is selected, so its box takes the bottom; the list keeps its
+        // captions and first heading.
+        let rows = screen(&app, w, h);
+        assert!(rows[2].contains("TIME") && rows[3].contains("Yesterday · Tue Nov 17"), "{}", rows.join("\n"));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('e'));
+        let rows = screen(&app, w, h);
+        assert!(!rows.join("\n").contains("Yesterday"), "scrolled to the end");
+        // The captions stay put while the rows scroll.
+        assert!(rows[2].contains("TIME") && rows[2].contains("EXPECTED"), "{}", rows[2]);
+        // Back to the top, then a different row set: the heading is back.
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('a'));
+        let rows = screen(&app, w, h);
+        assert!(rows[3].contains("Yesterday · Tue Nov 17"), "{}", rows.join("\n"));
+    }
+
+    #[test]
+    fn calendar_empty_and_unreadable_stores_say_so_plainly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(vec!["AAPL".into()], "iex");
+        app.calendar = crate::tui::calendar::CalendarState::new(
+            Some(tmp.path().join("no-calendar")),
+            Some(tmp.path().join("no-earnings")),
+            Some(tmp.path().join("no-slate.json")),
+        );
+        app.calendar.clock = crate::tui::calendar::Clock::mst("2026-11-18T15:00:00Z");
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('c'));
+        app.set_earnings_fetch(Err("offline".into()));
+        let all = screen(&app, 130, 30).join("\n");
+        assert!(all.contains("Your slate is empty. Press a to browse who reports and s to add a company"), "{all}");
+        assert!(all.contains("Nothing you're watching."));
+        assert!(all.contains("Earnings aren't stored for 5 of the coming weekdays"), "{all}");
+        // A day file that isn't one: the error names it.
+        let earn = tmp.path().join("no-earnings");
+        std::fs::create_dir_all(&earn).unwrap();
+        std::fs::write(earn.join("2026-11-18.json"), b"not json").unwrap();
+        press(&mut app, KeyCode::Char('a'));
+        let all = screen(&app, 130, 30).join("\n");
+        assert!(all.contains("couldn't read the calendar"), "{all}");
+        assert!(all.contains("2026-11-18.json"), "{all}");
+    }
+
+    /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_calendar -- --ignored`
+    /// writes HTML renders of the calendar screen from the real stores,
+    /// slate, watchlist and lists under the wickd data home (`WICKD_HOME`).
+    /// Reactions are worked out from the daily bars in the JSON file named
+    /// by `WICKD_SNAPSHOT_BARS` (`{"SYM": [bars]}`), when given: the test
+    /// itself fetches nothing.
+    #[test]
+    #[ignore]
+    fn snapshot_calendar() {
+        let dir = std::env::var("WICKD_TUI_SNAPSHOT_DIR").expect("set WICKD_TUI_SNAPSHOT_DIR");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shoot = |app: &App, name: &str, w: u16, h: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, app)).unwrap();
+            std::fs::write(
+                format!("{dir}/{name}.html"),
+                to_html(term.backend().buffer(), name),
+            )
+            .unwrap();
+        };
+        let mut app = App::new(
+            crate::tui::store::load_watchlist().unwrap_or_default(),
+            "iex",
+        );
+        if let Ok(f) = crate::lists::lists_path().and_then(|p| crate::lists::load_at(&p)) {
+            app.set_lists(f);
+        }
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('c'));
+        app.flash = None;
+        let (w, h) = (160u16, 45u16);
+        // Stored data shows at once while a fetch runs (forced here: a
+        // fresh store wouldn't start one).
+        app.calendar.loading = true;
+        shoot(&app, "1-opening-fetch-in-flight", w, h);
+        app.set_earnings_fetch(Ok(vec![]));
+        app.calendar.reactions_loading = false;
+        shoot(&app, "2-watch-before-reactions", w, h);
+        // Real reactions from real bars, when a bars file is given.
+        if let Ok(path) = std::env::var("WICKD_SNAPSHOT_BARS") {
+            let bars: std::collections::HashMap<String, Vec<wickd_core::equities::Bar>> =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let now = app.calendar.clock.now();
+            let got = app
+                .calendar
+                .reactions_wanted()
+                .into_iter()
+                .filter_map(|ask| {
+                    let r = wickd_core::earnings_reaction::reaction(bars.get(&ask.0)?, ask.1, ask.2, now)?;
+                    Some((ask, r))
+                })
+                .collect();
+            app.set_reactions(Ok(got));
+        }
+        shoot(&app, "3-watch-with-reactions", w, h);
+        // Each slate company in turn: its expectation and reaction box.
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        let mut n = 0;
+        for _ in 0..60 {
+            if app.calendar.selected_earn().is_some_and(|e| e.slate) && n < 3 {
+                n += 1;
+                shoot(&app, &format!("4-{n}-slate-company-box"), w, h);
+            }
+            let before = app.calendar.selected;
+            press(&mut app, KeyCode::Char('j'));
+            if app.calendar.selected == before {
+                break;
+            }
+        }
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('a'));
+        app.flash = None;
+        shoot(&app, "5-everything", w, h);
+        press(&mut app, KeyCode::Char('a'));
+        app.calendar.go_next_upcoming();
+        app.flash = None;
+        shoot(&app, "6-narrow-100", 100, 40);
+        shoot(&app, "6-narrow-80", 80, 40);
+        app.set_earnings_fetch(Err("error sending request".into()));
+        shoot(&app, "7-fetch-failed", w, h);
+        press(&mut app, KeyCode::Char('?'));
+        shoot(&app, "8-help", w, h);
+    }
+
+    /// `sample_app` (watchlist SPY, NVDA, XYZ) with a day list, at 8:00 AM
+    /// Mountain on Wed Nov 18, 2026: NVDA reports today after the close and
+    /// TGT tomorrow before the open.
+    fn reports_app() -> App {
+        use crate::tui::calendar::{Clock, Soon};
+        use wickd_core::earnings_store::Session;
+        let mut app = sample_app();
+        let mut lists = crate::lists::ListsFile::default();
+        for (sym, note) in [
+            ("NVDA", "No trade (day one after its report)"),
+            ("TGT", "No trade, watch only; reports about 4:30 a.m."),
+            ("SPY", "No trade; above 739.76 = buyers in control"),
+        ] {
+            crate::lists::add(
+                &mut lists,
+                "wed-11-18",
+                &[sym.to_string()],
+                &crate::lists::Fields::note(note),
+                Utc::now(),
+            );
+        }
+        app.set_lists(lists);
+        app.selected = 0;
+        app.calendar.clock = Clock::mst("2026-11-18T15:00:00Z");
+        app.reports_soon.insert(
+            "NVDA".into(),
+            Soon {
+                date: "2026-11-18".parse().unwrap(),
+                session: Session::AfterHours,
+            },
+        );
+        app.reports_soon.insert(
+            "TGT".into(),
+            Soon {
+                date: "2026-11-19".parse().unwrap(),
+                session: Session::PreMarket,
+            },
+        );
+        app
+    }
+
+    #[test]
+    fn rows_say_when_a_stock_reports_today_or_next() {
+        let app = reports_app();
+        let rows = screen(&app, 140, 30);
+        let all = rows.join("\n");
+        let line = |needle: &str| {
+            rows.iter()
+                .find(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?} in\n{all}"))
+                .clone()
+        };
+        // Both tables are wide enough: the list and the watchlist.
+        assert_eq!(all.matches("EARNINGS").count(), 2, "{all}");
+        let nvda = line("No trade (day one");
+        assert!(nvda.contains("NVDA") && nvda.contains("today post-close"), "{nvda}");
+        let tgt = line("reports about 4:30");
+        assert!(tgt.contains("Thu pre-open"), "{tgt}");
+        // SPY doesn't report: an empty cell, and its note is where the others' are.
+        let spy = line("buyers in control");
+        assert!(!spy.contains("today") && !spy.contains("Thu"), "{spy}");
+        assert_eq!(
+            spy.find("No trade; above"),
+            nvda.find("No trade (day one"),
+            "notes share a column"
+        );
+        // The watchlist's own NVDA row carries it too.
+        let watch_nvda = rows
+            .iter()
+            .filter(|r| r.contains("NVDA") && r.contains("today post-close"))
+            .count();
+        assert_eq!(watch_nvda, 2, "{all}");
+    }
+
+    #[test]
+    fn the_earnings_column_gives_way_on_a_narrow_terminal_and_hides_when_empty() {
+        let mut app = reports_app();
+        // 120 wide: room in the list (needs 102), not in the watchlist (127).
+        let all = screen(&app, 120, 30).join("\n");
+        assert_eq!(all.matches("EARNINGS").count(), 1, "{all}");
+        assert!(all.contains("today post-close"));
+        // 100 wide: neither, and the notes are untouched.
+        let all = screen(&app, 100, 30).join("\n");
+        assert!(!all.contains("EARNINGS") && !all.contains("post-close"), "{all}");
+        assert!(all.contains("No trade (day one after its report)"), "{all}");
+        // Exactly at the list's threshold the column is there; one short, not.
+        assert!(screen(&app, 102, 30).join("\n").contains("EARNINGS"));
+        assert!(!screen(&app, 101, 30).join("\n").contains("EARNINGS"));
+        // Nobody reports soon: no column at any width.
+        app.reports_soon.clear();
+        let all = screen(&app, 160, 30).join("\n");
+        assert!(!all.contains("EARNINGS"), "{all}");
+    }
+
+    #[test]
+    fn the_chart_header_says_when_the_stock_reports() {
+        let mut app = reports_app();
+        press(&mut app, KeyCode::Enter); // the list's first row: NVDA
+        assert_eq!(app.mode, Mode::Detail);
+        let rows = screen(&app, 140, 30);
+        assert!(
+            rows[1].contains("NVDA") && rows[1].contains("reports today after the close"),
+            "{}",
+            rows[1]
+        );
+        // A stock that doesn't report soon says nothing.
+        app.reports_soon.clear();
+        assert!(!screen(&app, 140, 30).join("\n").contains("reports"));
+    }
+
+    #[test]
+    fn report_markers_come_from_the_store_and_follow_a_fetch() {
+        use wickd_core::earnings_store::{write_day, DayFile, EarningsRow, Session};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        // calendar_app stores Wed Nov 18 with PANW after the close.
+        app.refresh_reports_soon();
+        let today = app.calendar.clock.today();
+        assert_eq!(app.reports_soon["PANW"].short(today), "today post-close");
+        assert_eq!(app.reports_soon["TGT"].short(today), "today pre-open");
+        assert_eq!(app.reports_soon.len(), 4);
+        // A fetch lands with tomorrow's file: the markers pick it up.
+        write_day(
+            app.calendar.earn_dir.as_ref().unwrap(),
+            &DayFile {
+                date: "2026-11-19".parse().unwrap(),
+                fetched_at: Utc::now(),
+                source: "nasdaq".into(),
+                rows: vec![EarningsRow {
+                    date: "2026-11-19".parse().unwrap(),
+                    symbol: "WMT".into(),
+                    name: "Walmart Inc.".into(),
+                    session: Session::PreMarket,
+                    eps_forecast: None,
+                    estimates: None,
+                    market_cap: None,
+                    last_year_eps: None,
+                    fiscal_quarter: String::new(),
+                }],
+            },
+        )
+        .unwrap();
+        app.set_earnings_fetch(Ok(vec![]));
+        assert_eq!(app.reports_soon["WMT"].short(today), "Thu pre-open");
+        // No data folder: no markers, no panic.
+        app.calendar.earn_dir = None;
+        app.refresh_reports_soon();
+        assert!(app.reports_soon.is_empty());
+    }
+
+    /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_reports_soon -- --ignored`
+    /// writes HTML renders of the EARNINGS column and the chart header from
+    /// the real lists, watchlist and earnings store under the wickd data
+    /// home (`WICKD_HOME`). Company names come from the earnings store; no
+    /// quotes are fetched, so prices show as `…`.
+    #[test]
+    #[ignore]
+    fn snapshot_reports_soon() {
+        let dir = std::env::var("WICKD_TUI_SNAPSHOT_DIR").expect("set WICKD_TUI_SNAPSHOT_DIR");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shoot = |app: &App, name: &str, w: u16, h: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, app)).unwrap();
+            std::fs::write(
+                format!("{dir}/{name}.html"),
+                to_html(term.backend().buffer(), name),
+            )
+            .unwrap();
+        };
+        let mut app = App::new(
+            crate::tui::store::load_watchlist().unwrap_or_default(),
+            "iex",
+        );
+        if let Ok(f) = crate::lists::lists_path().and_then(|p| crate::lists::load_at(&p)) {
+            app.set_lists(f);
+        }
+        app.refresh_reports_soon();
+        // Names for the rows that report, from the store itself.
+        let today = app.calendar.clock.today();
+        let names: Vec<Asset> = app
+            .calendar
+            .earn_dir
+            .as_ref()
+            .and_then(|d| {
+                wickd_core::earnings_store::read_days(
+                    d,
+                    today,
+                    crate::tui::calendar::next_weekday(today),
+                )
+                .ok()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|d| d.rows)
+            .map(|r| Asset {
+                symbol: r.symbol,
+                name: r.name,
+                exchange: "NASDAQ".into(),
+                tradable: true,
+            })
+            .collect();
+        app.set_assets(names);
+        // Open the newest day list.
+        app.expanded = app.lists.len().saturating_sub(1);
+        app.selected = 0;
+        app.flash = None;
+        shoot(&app, "1-list-and-watchlist-wide", 160, 45);
+        shoot(&app, "2-list-only-at-120", 120, 45);
+        shoot(&app, "3-narrow-no-column", 100, 45);
+        // A chart of the first stock on the list that reports soon.
+        let sym = app
+            .lists
+            .get(app.expanded)
+            .and_then(|(_, e)| e.iter().find(|e| app.reports_soon.contains_key(&e.symbol)))
+            .map(|e| e.symbol.clone());
+        if let Some(sym) = sym {
+            if let Some(i) = (0..app.total_rows()).find(|i| app.row_symbol(*i) == Some(sym.as_str())) {
+                app.selected = i;
+                press(&mut app, KeyCode::Enter);
+                shoot(&app, "4-chart-header", 160, 20);
+            }
+        }
     }
 
     /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_journal -- --ignored`

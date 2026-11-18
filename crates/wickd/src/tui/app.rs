@@ -23,6 +23,7 @@ pub enum Mode {
     Detail,
     InPlay,
     Journal,
+    Calendar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,18 @@ pub enum Action {
     ReaderNotice(String),
     /// Fetch recent headlines for one symbol.
     FetchNews(String),
+    /// Fetch the earnings calendar for these days into the store.
+    FetchEarnings(Vec<chrono::NaiveDate>),
+    /// Fetch how these watched stocks reacted to their reports.
+    FetchReactions(Vec<super::calendar::ReactionAsk>),
+    /// Put a company on the slate for the report on this date.
+    SlateAdd {
+        symbol: String,
+        date: chrono::NaiveDate,
+        session: wickd_core::earnings_store::Session,
+    },
+    /// Take a company off the slate.
+    SlateRemove(String),
     Quit,
 }
 
@@ -430,6 +443,11 @@ pub struct App {
     pub detail: Option<DetailState>,
     /// The journal screen (`g j`).
     pub journal: super::journal::JournalState,
+    /// The calendar screen (`g c`).
+    pub calendar: super::calendar::CalendarState,
+    /// Stocks that report earnings today or on the next weekday, from the
+    /// earnings store (rows and the chart header flag them).
+    pub reports_soon: HashMap<String, super::calendar::Soon>,
     /// Active `g f` filter on the watchlist / in-play list.
     pub find: Option<FindState>,
     /// The chart's `p` prompt: digits typed so far for the price line.
@@ -478,6 +496,8 @@ impl App {
             search: SearchState::default(),
             detail: None,
             journal: super::journal::JournalState::new(super::journal::default_dir()),
+            calendar: super::calendar::CalendarState::at_data_home(),
+            reports_soon: HashMap::new(),
             find: None,
             price_input: None,
             inplay: InPlayState::default(),
@@ -875,6 +895,7 @@ impl App {
             Mode::Detail => Some(Ctx::Detail),
             Mode::InPlay => Some(Ctx::InPlay),
             Mode::Journal => Some(Ctx::Journal),
+            Mode::Calendar => Some(Ctx::Calendar),
             Mode::Search => None,
         }
     }
@@ -913,6 +934,7 @@ impl App {
                 Ctx::Detail => self.exec_detail(cmd),
                 Ctx::InPlay => self.exec_inplay(cmd),
                 Ctx::Journal => self.exec_journal(cmd),
+                Ctx::Calendar => self.exec_calendar(cmd),
             },
             Step::Pending | Step::Cancel | Step::None => vec![],
         }
@@ -943,6 +965,7 @@ impl App {
             Cmd::Find => self.open_find(),
             Cmd::GoInPlay => return self.open_inplay(),
             Cmd::GoJournal => self.open_journal(),
+            Cmd::GoCalendar => return self.open_calendar(),
             Cmd::Info => {
                 let sym = self.selected_symbol().map(str::to_string);
                 return self.open_info(sym);
@@ -1057,7 +1080,11 @@ impl App {
 
     /// `g j`: the journal, opened on its newest entry.
     fn open_journal(&mut self) {
-        self.journal.back_to = self.mode;
+        // See `open_calendar`: never each other's way back.
+        let bounce = self.mode == Mode::Calendar && self.calendar.back_to == Mode::Journal;
+        if !bounce {
+            self.journal.back_to = self.mode;
+        }
         self.journal.open();
         self.mode = Mode::Journal;
     }
@@ -1071,6 +1098,11 @@ impl App {
                 self.mode = match j.back_to {
                     Mode::Detail if self.detail.is_none() => Mode::Watchlist,
                     Mode::Journal | Mode::Search => Mode::Watchlist,
+                    // The calendar may be showing yesterday's read by now.
+                    Mode::Calendar => {
+                        self.reload_calendar();
+                        Mode::Calendar
+                    }
                     m => m,
                 };
             }
@@ -1082,6 +1114,7 @@ impl App {
                 self.detail = None;
                 return self.open_inplay();
             }
+            Cmd::GoCalendar => return self.open_calendar(),
             Cmd::Help => self.show_help = true,
             Cmd::Down => j.scroll_by(1),
             Cmd::Up => j.scroll_by(-1),
@@ -1108,6 +1141,210 @@ impl App {
             Cmd::Refresh => {
                 j.reload();
                 self.flash = Some("journal reloaded".into());
+            }
+            _ => {}
+        }
+        vec![]
+    }
+
+    /// Every symbol on the watchlist or in a `wickd list`: the ones the
+    /// calendar marks and always shows.
+    pub fn listed_symbols(&self) -> std::collections::HashSet<String> {
+        self.watchlist
+            .iter()
+            .cloned()
+            .chain(
+                self.lists
+                    .iter()
+                    .flat_map(|(_, entries)| entries.iter().map(|e| e.symbol.clone())),
+            )
+            .collect()
+    }
+
+    pub fn reload_calendar(&mut self) {
+        let listed = self.listed_symbols();
+        self.calendar.reload(&listed);
+    }
+
+    /// Ask how the watched stocks reacted, when any report's reaction day
+    /// has come and no such request is already out.
+    pub fn reactions_action(&mut self) -> Option<Action> {
+        if self.calendar.reactions_loading {
+            return None;
+        }
+        let wanted = self.calendar.reactions_wanted();
+        if wanted.is_empty() {
+            return None;
+        }
+        self.calendar.reactions_loading = true;
+        Some(Action::FetchReactions(wanted))
+    }
+
+    /// A reaction fetch finished.
+    pub fn set_reactions(
+        &mut self,
+        result: Result<
+            Vec<(
+                super::calendar::ReactionAsk,
+                wickd_core::earnings_reaction::Reaction,
+            )>,
+            String,
+        >,
+    ) {
+        self.calendar.reactions_finished(result);
+    }
+
+    /// A slate add or remove was written (or failed): say so and re-read.
+    pub fn slate_written(&mut self, result: Result<String, String>) -> Vec<Action> {
+        self.flash = Some(match result {
+            Ok(done) => done,
+            Err(e) => format!("couldn't update the slate: {e}"),
+        });
+        self.reload_calendar();
+        self.reactions_action().into_iter().collect()
+    }
+
+    /// `s`: put the company under the cursor on the slate, or take it off.
+    /// An entry with a why or an expectation written on it takes a second
+    /// `s` to remove: that text can't be brought back.
+    fn toggle_slate(&mut self) -> Vec<Action> {
+        let Some(e) = self.calendar.selected_earn().cloned() else {
+            self.calendar.pending_remove = None;
+            if !self.calendar.rows.is_empty() {
+                self.flash = Some("only a company's row goes on the slate".into());
+            }
+            return vec![];
+        };
+        if !e.slate {
+            self.calendar.pending_remove = None;
+            return vec![Action::SlateAdd {
+                symbol: e.symbol,
+                date: e.date,
+                session: e.session,
+            }];
+        }
+        let has_text = e.why.is_some() || e.expect.is_some();
+        if has_text && self.calendar.pending_remove.as_deref() != Some(e.symbol.as_str()) {
+            self.flash = Some(format!(
+                "{} has notes on the slate; press s again to remove it and them",
+                e.symbol
+            ));
+            self.calendar.pending_remove = Some(e.symbol);
+            return vec![];
+        }
+        self.calendar.pending_remove = None;
+        vec![Action::SlateRemove(e.symbol)]
+    }
+
+    /// `g c`: the calendar. Shows what is stored at once, and starts a
+    /// background earnings fetch when a day is missing or the data is old.
+    fn open_calendar(&mut self) -> Vec<Action> {
+        // Coming from a journal that was itself opened from here, `esc`
+        // keeps pointing where it did: two screens must never be each
+        // other's way back.
+        let bounce = self.mode == Mode::Journal && self.journal.back_to == Mode::Calendar;
+        if self.mode != Mode::Calendar && !bounce {
+            self.calendar.back_to = self.mode;
+        }
+        let arriving = self.mode != Mode::Calendar;
+        self.mode = Mode::Calendar;
+        self.reload_calendar();
+        if arriving {
+            self.calendar.go_next_upcoming();
+        }
+        let mut actions = Vec::new();
+        if self.calendar.needs_fetch() {
+            self.calendar.fetch_started(true);
+            actions.push(Action::FetchEarnings(self.calendar.fetch_dates()));
+        }
+        actions.extend(self.reactions_action());
+        actions
+    }
+
+    /// A background earnings fetch finished. New reports may have come into
+    /// view, so their reactions are asked for.
+    pub fn set_earnings_fetch(
+        &mut self,
+        result: Result<Vec<wickd_core::earnings_store::DayOutcome>, String>,
+    ) -> Vec<Action> {
+        let listed = self.listed_symbols();
+        self.calendar.fetch_finished(result, &listed);
+        self.refresh_reports_soon();
+        self.reactions_action().into_iter().collect()
+    }
+
+    /// Re-read which stocks report today or on the next weekday (disk only).
+    pub fn refresh_reports_soon(&mut self) {
+        self.reports_soon = match &self.calendar.earn_dir {
+            Some(dir) => super::calendar::reports_soon(dir, self.calendar.clock.today()),
+            None => HashMap::new(),
+        };
+    }
+
+    fn exec_calendar(&mut self, cmd: Cmd) -> Vec<Action> {
+        let page = self.calendar.page.get().saturating_sub(2).max(1) as isize;
+        if cmd != Cmd::ToggleSlate {
+            // Any other key cancels a pending slate removal.
+            self.calendar.pending_remove = None;
+        }
+        match cmd {
+            Cmd::ToggleSlate => return self.toggle_slate(),
+            Cmd::Back => {
+                // Back to the chart only while it is still open.
+                self.mode = match self.calendar.back_to {
+                    Mode::Detail if self.detail.is_none() => Mode::Watchlist,
+                    Mode::Calendar | Mode::Search => Mode::Watchlist,
+                    m => m,
+                };
+            }
+            Cmd::GoWatchlist => {
+                self.detail = None;
+                self.mode = Mode::Watchlist;
+            }
+            Cmd::GoInPlay => {
+                self.detail = None;
+                return self.open_inplay();
+            }
+            Cmd::GoJournal => self.open_journal(),
+            Cmd::Help => self.show_help = true,
+            Cmd::Down => self.calendar.step(1),
+            Cmd::Up => self.calendar.step(-1),
+            Cmd::PageDown => self.calendar.step(page),
+            Cmd::PageUp => self.calendar.step(-page),
+            Cmd::GoTop => self.calendar.go_top(),
+            Cmd::GoEnd => self.calendar.go_end(),
+            Cmd::ToggleAll => {
+                self.calendar.show_all = !self.calendar.show_all;
+                self.reload_calendar();
+                self.flash = Some(
+                    if self.calendar.show_all {
+                        "showing everything that reports"
+                    } else {
+                        "showing your watch"
+                    }
+                    .into(),
+                );
+            }
+            Cmd::Open => match self.calendar.selected_symbol().map(str::to_string) {
+                Some(sym) => return self.open_detail(sym, Mode::Calendar),
+                None => {
+                    if !self.calendar.rows.is_empty() {
+                        self.flash = Some("only a company's row opens a chart".into());
+                    }
+                }
+            },
+            Cmd::Refresh => {
+                if self.calendar.loading {
+                    self.flash = Some("already fetching".into());
+                } else if self.calendar.earn_dir.is_none() {
+                    self.flash = Some("couldn't find the wickd data folder".into());
+                } else {
+                    self.reload_calendar();
+                    self.calendar.fetch_started(false);
+                    let mut actions = vec![Action::FetchEarnings(self.calendar.fetch_dates())];
+                    actions.extend(self.reactions_action());
+                    return actions;
+                }
             }
             _ => {}
         }
@@ -1323,6 +1560,7 @@ impl App {
             Cmd::Find => self.open_find(),
             Cmd::Back | Cmd::GoWatchlist => self.mode = Mode::Watchlist,
             Cmd::GoJournal => self.open_journal(),
+            Cmd::GoCalendar => return self.open_calendar(),
             Cmd::Help => self.show_help = true,
             Cmd::Info => {
                 let sym = self.inplay.selected_symbol();
@@ -1744,6 +1982,7 @@ impl App {
             }
             // The chart stays open underneath: `esc` in the journal returns to it.
             Cmd::GoJournal => self.open_journal(),
+            Cmd::GoCalendar => return self.open_calendar(),
             Cmd::Help => self.show_help = true,
             Cmd::Info => return self.open_info(Some(sym)),
             Cmd::Range(r) => return self.set_range(r),
