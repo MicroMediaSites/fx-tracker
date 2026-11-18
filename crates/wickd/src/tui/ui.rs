@@ -612,11 +612,29 @@ fn calendar_box(app: &App) -> Option<(String, Vec<String>)> {
     if out || note.is_some() {
         let mut text = Vec::new();
         if out {
-            text.push(match c.reported_of(e) {
-                Some(r) => reported_sentence(r),
-                None if c.results_loading => "Reported: fetching the figures…".into(),
-                None => "Reported: the figures aren't in the feed yet (it can lag a report by a day). Press r to check again.".into(),
-            });
+            // The headlines first: they are out within minutes of a report.
+            // The reported-figures table follows when it has caught up (it
+            // runs a day or so behind), and "nothing yet" is only said when
+            // there is neither.
+            let heads = c.headlines_of(e);
+            for h in heads {
+                text.push(format!(
+                    "{}  {}",
+                    c.clock.local(h.time).format("%a %-I:%M %p"),
+                    h.headline
+                ));
+            }
+            match c.reported_of(e) {
+                Some(r) => text.push(reported_sentence(r)),
+                None if !heads.is_empty() => {}
+                None if c.headlines_loading || c.results_loading => {
+                    text.push("Fetching the results…".into())
+                }
+                None => text.push(
+                    "No results in yet: no headline from the news feed and no reported figures. Press r to update."
+                        .into(),
+                ),
+            }
         }
         if let Some(n) = note {
             text.extend(n.lines().map(str::to_string));
@@ -637,7 +655,9 @@ fn render_calendar(frame: &mut Frame, area: Rect, app: &App) {
     let c = &app.calendar;
     let dim = Style::default().fg(DIM);
 
-    // The box takes what its text needs, up to a third of the screen.
+    // The box takes what its text needs, up to half the screen: an
+    // expectation, headlines, a note and a reaction together run to a dozen
+    // lines, and the reaction at the end is the part that mustn't be cut.
     let boxed = calendar_box(app);
     let box_h: u16 = boxed.as_ref().map_or(0, |(_, lines)| {
         let inner = usize::from(area.width.saturating_sub(4)).max(1);
@@ -645,7 +665,7 @@ fn render_calendar(frame: &mut Frame, area: Rect, app: &App) {
             .iter()
             .map(|l| l.chars().count().max(1).div_ceil(inner))
             .sum();
-        (need as u16 + 2).min((area.height / 3).max(3))
+        (need as u16 + 2).min((area.height / 2).max(3))
     });
     let parts = Layout::default()
         .direction(Direction::Vertical)
@@ -701,7 +721,9 @@ fn render_calendar(frame: &mut Frame, area: Rect, app: &App) {
 
     // Top right: how fresh each store is, or that a fetch is running.
     let stamp = |t: DateTime<Utc>| c.clock.local(t).format("%a %-I:%M %p").to_string();
-    let status = if c.loading {
+    let status = if c.updating.is_some() {
+        Some("updating everything…".to_string())
+    } else if c.loading {
         Some("fetching earnings…".to_string())
     } else {
         let parts: Vec<String> = [
@@ -723,6 +745,7 @@ fn render_calendar(frame: &mut Frame, area: Rect, app: &App) {
         .fetch_error
         .as_ref()
         .or(c.reactions_error.as_ref())
+        .or(c.headlines_error.as_ref())
         .or(c.results_error.as_ref())
     {
         let room = usize::from(area.width).saturating_sub(14);
@@ -3546,8 +3569,36 @@ mod tests {
         press(app, KeyCode::Char('c'));
         app.set_earnings_fetch(Ok(vec![]));
         app.set_reactions(Ok(vec![]));
+        app.set_headlines(Ok((0, 0, None)));
         app.set_results(Ok(vec![]));
         app.flash = None;
+    }
+
+    /// Store a report's results headlines, the way a headlines fetch would.
+    fn store_headlines(app: &App, symbol: &str, date: &str, items: &[(&str, &str)]) {
+        use wickd_core::earnings_headlines::{headlines_dir, store_fetch};
+        use wickd_core::equities::alpaca::NewsItem;
+        let items: Vec<NewsItem> = items
+            .iter()
+            .enumerate()
+            .map(|(i, (time, headline))| NewsItem {
+                id: i as i64,
+                headline: headline.to_string(),
+                summary: String::new(),
+                created_at: time.parse().unwrap(),
+                symbols: vec![symbol.to_string()],
+                source: "benzinga".into(),
+                url: None,
+            })
+            .collect();
+        store_fetch(
+            &headlines_dir(app.calendar.earn_dir.as_ref().unwrap()),
+            symbol,
+            date.parse().unwrap(),
+            &items,
+            Utc::now(),
+        )
+        .unwrap();
     }
 
     /// Store what a company reported, the way a results fetch would.
@@ -3617,14 +3668,15 @@ mod tests {
         let mut app = calendar_app(tmp.path());
         press(&mut app, KeyCode::Char('g'));
         // Days are missing from the store, and two watched reports are out:
-        // opening asks for the days, their reactions and what they reported.
+        // opening asks for the days, their reactions, their results headlines
+        // and the reported figures.
         let actions = press(&mut app, KeyCode::Char('c'));
         assert_eq!(app.mode, Mode::Calendar);
         assert!(
             matches!(
                 actions.as_slice(),
-                [Action::FetchEarnings(d), Action::FetchReactions(r), Action::FetchResults(f)]
-                    if d.len() == 8 && r.len() == 2 && f == &["NVDA", "TGT"]
+                [Action::FetchEarnings(d), Action::FetchReactions(r), Action::FetchHeadlines(h), Action::FetchResults(f)]
+                    if d.len() == 8 && r.len() == 2 && h.len() == 2 && f == &["NVDA", "TGT"]
             ),
             "{actions:?}"
         );
@@ -3706,23 +3758,57 @@ mod tests {
         assert!(all.contains(" NVDA · expectation · result "), "{all}");
         assert!(all.contains("Beat and raise: +5%.") && all.contains("A cut to the outlook: -10%."));
         assert!(
-            all.contains("Reported: the figures aren't in the feed yet (it can lag a report by a day). Press r to check again."),
+            all.contains("No results in yet: no headline from the news feed and no reported figures. Press r to update."),
             "{all}"
         );
         assert!(!all.contains("Reaction"));
         // While a fetch for them is out, it says that instead.
-        app.calendar.results_loading = true;
-        assert!(screen(&app, 130, 30).join("\n").contains("Reported: fetching the figures…"));
-        // The figures arrive: a sentence, matched to this report (not last
+        app.calendar.headlines_loading = true;
+        assert!(screen(&app, 130, 30).join("\n").contains("Fetching the results…"));
+        // The headlines arrive, the same evening: shown as published with
+        // their local time (21:21 UTC = 2:21 PM in Denver), the results line
+        // first, and the "nothing yet" line is gone. Chatter isn't shown.
+        store_headlines(
+            &app,
+            "NVDA",
+            "2026-11-17",
+            &[
+                ("2026-11-17T21:05:00Z", "Why NVIDIA Shares Are Rising After Hours"),
+                ("2026-11-17T21:22:00Z", "NVIDIA Sees Q4 Sales $130.00B +/- 3% vs $125.30B Est"),
+                (
+                    "2026-11-17T21:21:00Z",
+                    "NVIDIA Q3 Adj. EPS $2.68 Beats $2.47 Estimate, Sales $115.80B Beat $109.15B Estimate",
+                ),
+            ],
+        );
+        app.set_headlines(Ok((1, 0, None)));
+        let rows = screen(&app, 130, 30);
+        let all = rows.join("\n");
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?} in\n{all}"))
+        };
+        assert!(
+            rows[row_of("NVIDIA Q3 Adj. EPS $2.68 Beats")].contains("Tue 2:21 PM"),
+            "{all}"
+        );
+        assert!(row_of("NVIDIA Q3 Adj. EPS $2.68 Beats") < row_of("Tue 2:22 PM  NVIDIA Sees Q4 Sales"));
+        assert!(!all.contains("No results in yet") && !all.contains("Why NVIDIA"), "{all}");
+        // The slower reported-figures table catches up later: its sentence
+        // goes under the headlines, matched to this report (not last
         // quarter's row).
         store_reported(&app, "NVDA", "2026-11-17", "2.68", "2.49", "7.63");
         app.set_results(Ok(vec![]));
-        let all = screen(&app, 130, 30).join("\n");
+        let rows = screen(&app, 130, 32);
+        let all = rows.join("\n");
         assert!(
             all.contains("Reported: EPS 2.68 against 2.49 expected, a beat of 7.6%."),
             "{all}"
         );
         assert!(!all.contains("9.99"));
+        let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
+        assert!(row_of("NVIDIA Sees Q4 Sales") < row_of("Reported: EPS 2.68"));
         // The note written after the report sits under the figures.
         let path = app.calendar.slate_path.clone().unwrap();
         crate::slate::update_at(&path, |f| {
@@ -3935,13 +4021,13 @@ mod tests {
         );
         let r = app.calendar.slate_add("TJX", "2026-11-18".parse().unwrap(), wickd_core::earnings_store::Session::PreMarket);
         let more = app.slate_written(r.map(|()| "TJX is on the slate".to_string()));
-        // It reported this morning, so its reaction and what it reported are
-        // asked for at once.
+        // It reported this morning, so its reaction, its headlines and what
+        // it reported are asked for at once.
         assert!(
             matches!(
                 more.as_slice(),
-                [Action::FetchReactions(r), Action::FetchResults(f)]
-                    if r.iter().any(|a| a.0 == "TJX") && f == &["TJX"]
+                [Action::FetchReactions(r), Action::FetchHeadlines(h), Action::FetchResults(f)]
+                    if r.iter().any(|a| a.0 == "TJX") && h.len() == 1 && h[0].0 == "TJX" && f == &["TJX"]
             ),
             "{more:?}"
         );
@@ -3979,7 +4065,7 @@ mod tests {
         let actions = press(&mut app, KeyCode::Char('r'));
         assert!(matches!(actions.first(), Some(Action::FetchEarnings(_))), "{actions:?}");
         assert!(press(&mut app, KeyCode::Char('r')).is_empty());
-        assert_eq!(app.flash.as_deref(), Some("already fetching"));
+        assert_eq!(app.flash.as_deref(), Some("already updating"));
         // A failed fetch keeps the stored rows and says so along the bottom.
         app.set_earnings_fetch(Err("offline".into()));
         let rows = screen(&app, 130, 30);
@@ -3992,6 +4078,71 @@ mod tests {
         // esc returns to where the calendar was opened from.
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.mode, Mode::Watchlist);
+    }
+
+    #[test]
+    fn calendar_r_updates_everything_and_says_what_came_in() {
+        use crate::tui::app::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        open_calendar(&mut app);
+        // The evening: one key asks for all of it, whatever was asked when.
+        let actions = press(&mut app, KeyCode::Char('r'));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::FetchEarnings(_), Action::FetchReactions(r), Action::FetchHeadlines(h), Action::FetchResults(f)]
+                    if r.len() == 2 && h.len() == 2 && f.len() == 2
+            ),
+            "{actions:?}"
+        );
+        assert_eq!(app.flash.as_deref(), Some("updating everything on your watch…"));
+        assert!(screen(&app, 130, 30)[1].contains("updating everything…"));
+        // A second r while it runs doesn't start another.
+        assert!(press(&mut app, KeyCode::Char('r')).is_empty());
+        assert_eq!(app.flash.as_deref(), Some("already updating"));
+        // The pieces come back one by one; nothing is announced until the
+        // last of them is in.
+        app.set_earnings_fetch(Ok(vec![]));
+        store_headlines(
+            &app,
+            "NVDA",
+            "2026-11-17",
+            &[("2026-11-17T21:21:00Z", "NVIDIA Q3 Adj. EPS $2.68 Beats $2.47 Estimate")],
+        );
+        app.set_headlines(Ok((2, 0, None)));
+        app.set_results(Ok(vec![]));
+        assert!(app.calendar.updating.is_some(), "the reactions are still out");
+        give_reactions(&mut app);
+        assert!(app.calendar.updating.is_none());
+        // NVDA got headlines and a reaction, TGT a reaction: both are new,
+        // in screen order.
+        assert_eq!(app.flash.as_deref(), Some("Updated. New for NVDA, TGT."));
+        assert!(!screen(&app, 130, 30)[1].contains("updating"));
+        // Straight away again: everything is asked for again, and nothing new comes back.
+        app.flash = None;
+        let actions = press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(actions.first(), Some(Action::FetchEarnings(_))), "{actions:?}");
+        // TGT still has no headline, so it is asked about again despite
+        // having been asked a moment ago.
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::FetchHeadlines(h) if h.len() == 1 && h[0].0 == "TGT")),
+            "{actions:?}"
+        );
+        app.set_earnings_fetch(Ok(vec![]));
+        app.set_headlines(Ok((1, 0, None)));
+        app.set_results(Ok(vec![]));
+        give_reactions(&mut app);
+        assert_eq!(app.flash.as_deref(), Some("Updated. Nothing new came in."));
+        // A piece that fails is said along the bottom; the update still ends.
+        press(&mut app, KeyCode::Char('r'));
+        app.set_earnings_fetch(Ok(vec![]));
+        app.set_headlines(Ok((1, 1, Some("HTTP 429".into()))));
+        app.set_results(Ok(vec![]));
+        give_reactions(&mut app);
+        assert!(app.calendar.updating.is_none());
+        let all = screen(&app, 130, 30).join("\n");
+        assert!(all.contains("couldn't fetch headlines for 1 of 1 reports (HTTP 429)"), "{all}");
     }
 
     #[test]
@@ -4041,7 +4192,7 @@ mod tests {
         let help = screen(&app, 100, 30).join("\n");
         assert!(help.contains("calendar"), "{help}");
         for key in [
-            "fetch earnings now",
+            "update everything",
             "your watch ↔ everything",
             "slate: add / remove",
             "open the company's chart",
@@ -4141,7 +4292,8 @@ mod tests {
         shoot(&app, "1-opening-fetch-in-flight", w, h);
         app.set_earnings_fetch(Ok(vec![]));
         app.calendar.reactions_loading = false;
-        // The reported figures are whatever the results store holds.
+        // The headlines and reported figures are whatever the stores hold.
+        app.set_headlines(Ok((0, 0, None)));
         app.set_results(Ok(vec![]));
         shoot(&app, "2-watch-before-reactions", w, h);
         // Real reactions from real bars, when a bars file is given.

@@ -26,6 +26,13 @@
 //! Reported figures come from a second unofficial Nasdaq table, one request
 //! per company, and can lag a report by a day (see
 //! `wickd_core::earnings_results`).
+//!
+//!   wickd earnings headlines NVDA            # the results headlines, same day
+//!   wickd earnings headlines NVDA --all      # + everything scanned, scored
+//!
+//! Headlines are the same-day source: the broker's news feed (the same
+//! keys as `wickd quote`), read from the moment the report could be out
+//! (see `wickd_core::earnings_headlines`).
 
 use std::collections::HashSet;
 
@@ -38,7 +45,7 @@ use wickd_core::earnings_results::{
 };
 use wickd_core::earnings_store::{
     earnings_dir, http_client, market_date, read_days, sort_rows, sync_days, weekdays_from,
-    DayFile, EarningsRow, NASDAQ_EARNINGS_URL, SOURCE,
+    DayFile, EarningsRow, Session, NASDAQ_EARNINGS_URL, SOURCE,
 };
 
 use crate::output::{exit, Out};
@@ -70,6 +77,31 @@ enum EarningsCommand {
     /// what is stored. The source is unofficial and can lag a report by a
     /// day.
     Results(ResultsArgs),
+    /// The news headlines that state a report's results, the same day:
+    /// fetches them from the broker's news feed, stores them, and prints
+    /// what was picked (`--all`: everything scanned too).
+    Headlines(HeadlinesArgs),
+}
+
+#[derive(Args, Debug)]
+struct HeadlinesArgs {
+    /// The stock ticker.
+    symbol: String,
+
+    /// The report's date. Default: the slate entry's, else the latest
+    /// stored report on or before today.
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    date: Option<NaiveDate>,
+
+    /// When in the day it reported: `pre`, `post` or `unknown`. Default:
+    /// the slate entry's or the earnings store's.
+    #[arg(long, value_enum)]
+    session: Option<super::slate::SessionArg>,
+
+    /// Also print every headline in the window with its score, so the
+    /// picking can be checked.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Args, Debug)]
@@ -146,11 +178,136 @@ pub async fn run(args: EarningsArgs, out: Out) -> ! {
         EarningsCommand::Sync(a) => sync(a, out).await,
         EarningsCommand::Upcoming(a) => upcoming(a, out),
         EarningsCommand::Slate(a) => super::slate::run(a, out).await,
+        EarningsCommand::Headlines(a) => headlines(a, out).await,
         EarningsCommand::Results(a) => match a.command {
             ResultsCommand::Sync(a) => results_sync(a, out).await,
             ResultsCommand::Show(a) => results_show(a, out),
         },
     }
+}
+
+/// The report a headlines lookup is about: the date and session given,
+/// else the slate entry's, else the latest stored report on or before
+/// `today` (within two weeks).
+fn report_of(
+    symbol: &str,
+    date: Option<NaiveDate>,
+    session: Option<Session>,
+    earn_dir: &std::path::Path,
+    today: NaiveDate,
+) -> Option<(NaiveDate, Session)> {
+    let on_slate = crate::slate::slate_path()
+        .and_then(|p| crate::slate::load_at(&p))
+        .ok()
+        .and_then(|f| f.entries.into_iter().find(|e| e.symbol == symbol))
+        .map(|e| (e.date, e.session));
+    let stored = || {
+        read_days(earn_dir, today - Duration::days(14), today)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find_map(|d| {
+                d.rows
+                    .iter()
+                    .find(|r| r.symbol == symbol)
+                    .map(|r| (d.date, r.session))
+            })
+    };
+    let found = match date {
+        // A date given by hand takes its session from whichever source
+        // agrees on the date.
+        Some(d) => Some((
+            d,
+            on_slate
+                .filter(|s| s.0 == d)
+                .or_else(|| stored().filter(|s| s.0 == d))
+                .map_or(Session::Unknown, |s| s.1),
+        )),
+        None => on_slate.or_else(stored),
+    };
+    found.map(|(d, s)| (d, session.unwrap_or(s)))
+}
+
+async fn headlines(args: HeadlinesArgs, out: Out) -> ! {
+    use wickd_core::earnings_headlines as eh;
+    use wickd_core::equities::alpaca::{AlpacaClient, AlpacaError, QuoteFeed};
+    let Some(symbol) = results_symbol(&args.symbol) else {
+        out.fail(
+            exit::VALIDATION,
+            "earnings_bad_symbol",
+            format!("'{}' is not a stock ticker", args.symbol),
+        );
+    };
+    let earn_dir = match earnings_dir() {
+        Ok(d) => d,
+        Err(e) => out.fail(exit::GENERIC, "earnings_dir_failed", e),
+    };
+    let now = Utc::now();
+    let Some((date, session)) = report_of(
+        &symbol,
+        args.date,
+        args.session.map(Session::from),
+        &earn_dir,
+        market_date(now),
+    ) else {
+        out.fail(
+            exit::VALIDATION,
+            "earnings_no_report",
+            format!("no recent report found for {symbol} on the slate or in the earnings store: give --date YYYY-MM-DD (and --session pre|post)"),
+        );
+    };
+    let Some((start, end)) = eh::window(date, session) else {
+        out.fail(exit::VALIDATION, "earnings_bad_date", format!("{date} has no next day"));
+    };
+    let creds = match crate::alpaca_creds::resolve() {
+        Ok(Some((c, _))) => c,
+        Ok(None) => out.fail(
+            exit::AUTH,
+            "no_alpaca_keys",
+            "no Alpaca keys configured — run `wickd alpaca login`",
+        ),
+        Err(e) => out.fail(exit::AUTH, "alpaca_keys_unreadable", format!("{e:#}")),
+    };
+    let client = AlpacaClient::new(creds, QuoteFeed::Iex);
+    let items = match client
+        .news_window(std::slice::from_ref(&symbol), start, end.min(now), 50)
+        .await
+    {
+        Ok(i) => i,
+        Err(AlpacaError::Auth(_)) => out.fail(
+            exit::AUTH,
+            "alpaca_auth",
+            "Alpaca rejected the keys — run `wickd alpaca login`",
+        ),
+        Err(e) => out.fail(exit::GENERIC, "earnings_headlines_failed", format!("{e}")),
+    };
+    let stored = match eh::store_fetch(&eh::headlines_dir(&earn_dir), &symbol, date, &items, now) {
+        Ok(f) => f,
+        Err(e) => out.fail(exit::GENERIC, "earnings_headlines_store_failed", e),
+    };
+    let mut payload = serde_json::json!({
+        "symbol": symbol,
+        "date": date.to_string(),
+        "session": session,
+        "window": { "from": start, "to": end },
+        "scanned": items.len(),
+        "picked": stored.picked,
+    });
+    if args.all {
+        payload["all"] = items
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "time": n.created_at,
+                    "score": eh::score(&n.headline),
+                    "headline": wickd_core::earnings_store::clean_text(&n.headline, 240),
+                    "source": wickd_core::earnings_store::clean_text(&n.source, 40),
+                })
+            })
+            .collect();
+    }
+    out.ok(&payload);
+    std::process::exit(exit::OK);
 }
 
 /// The tickers typed on the command line: split on commas, checked,

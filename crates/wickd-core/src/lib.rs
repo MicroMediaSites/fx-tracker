@@ -12,6 +12,7 @@ pub mod backtest;
 pub mod calendar_store;
 pub mod config;
 pub mod crypto;
+pub mod earnings_headlines;
 pub mod earnings_reaction;
 pub mod earnings_results;
 pub mod earnings_store;
