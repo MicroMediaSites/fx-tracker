@@ -69,6 +69,7 @@ use commands::audit::AuditArgs;
 use commands::backtest::BacktestArgs;
 use commands::books::BooksArgs;
 use commands::calendar::CalendarArgs;
+use commands::earnings::EarningsArgs;
 use commands::candles::CandlesArgs;
 use commands::dashboard::DashboardArgs;
 use commands::feed::FeedArgs;
@@ -137,6 +138,8 @@ enum Command {
     Books(BooksArgs),
     /// Economic-calendar store: `sync` the ForexFactory weekly feed into ~/.wickd/calendar/, or list `upcoming` events → JSON.
     Calendar(CalendarArgs),
+    /// Earnings-calendar store: `sync` Nasdaq's public earnings calendar into ~/.wickd/earnings/, or list `upcoming` reports → JSON.
+    Earnings(EarningsArgs),
     /// AI market-awareness feed: `tick` runs one analysis into ~/.wickd/feed.ndjson, `list` reads it → JSON.
     Feed(FeedArgs),
     /// Open an on-demand ui-leaf view (FX ticket or live signal watcher); headless otherwise.
@@ -190,6 +193,7 @@ async fn main() {
         Command::Backtest(args) => commands::backtest::run(args, out).await,
         Command::Books(args) => commands::books::run(args, out).await,
         Command::Calendar(args) => commands::calendar::run(args, out).await,
+        Command::Earnings(args) => commands::earnings::run(args, out).await,
         Command::Feed(args) => commands::feed::run(args, out).await,
         Command::View(args) => commands::view::run(args, out).await,
         Command::Watch(args) => commands::watch::run(args, out).await,
