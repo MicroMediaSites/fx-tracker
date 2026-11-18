@@ -15,6 +15,9 @@
 //!
 //! Days are US market dates (US/Eastern), so "today" late in the evening is
 //! still the trading day that just closed.
+//!
+//! `wickd earnings slate …` (see [`super::slate`]) is the watch list built on
+//! top of this store.
 
 use std::collections::HashSet;
 
@@ -47,6 +50,10 @@ enum EarningsCommand {
     Sync(SyncArgs),
     /// List stored earnings from today on → JSON (no network).
     Upcoming(UpcomingArgs),
+    /// The slate: companies watched through their reports, each with why and
+    /// what is expected: add | set | rm | ls (`ls --reactions` adds how the
+    /// stock reacted).
+    Slate(super::slate::SlateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -85,6 +92,7 @@ pub async fn run(args: EarningsArgs, out: Out) -> ! {
     match args.command {
         EarningsCommand::Sync(a) => sync(a, out).await,
         EarningsCommand::Upcoming(a) => upcoming(a, out),
+        EarningsCommand::Slate(a) => super::slate::run(a, out).await,
     }
 }
 

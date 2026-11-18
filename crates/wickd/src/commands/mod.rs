@@ -20,6 +20,7 @@ pub mod login;
 pub mod pending;
 pub mod queue;
 pub mod scripted;
+pub mod slate;
 pub mod strategy;
 pub mod stream;
 pub mod trade;
