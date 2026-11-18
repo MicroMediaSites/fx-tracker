@@ -113,10 +113,18 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
     report has come, REACTION shows that day's change against the prior
     close (`…` while the session is still open). Fetched in the background
     from Alpaca daily bars, re-asked every minute while the screen is open.
-  - **The box.** With the cursor on a company, a box under the list shows
-    its expectation as written (slate entries) and its reaction as a
-    sentence: the gap at the open, the day's change, where it closed in the
-    day's range, and volume against its 20-session average.
+  - **The box.** With the cursor on a company, a box under the list reads
+    in the order things happened. The **expectation**, as written before
+    the report (slate entries). The **result**, once the report is out: the
+    reported EPS against the consensus as a sentence ("a beat of 7.6%"),
+    then the note written afterwards with `slate set --result`. The
+    **reaction**: the gap at the open, the day's change, where it closed in
+    the day's range, and volume against its 20-session average.
+  - **Reported figures** are fetched in the background, only for watched
+    companies whose report is out, when the screen opens and on `r`, and no
+    more than once every half hour per company otherwise. The feed can lag
+    a report by a day; until it catches up the box says the figures aren't
+    in yet.
   - **Everything** (`a`). From today on, every company that reports and
     every US release, watched companies first in each session, then largest
     first. This is where you browse to add to the slate. `a` again returns
@@ -395,6 +403,7 @@ wickd earnings slate add WMT --why "reads the consumer" --expect "EPS 0.64 expec
 wickd earnings slate add INTU ROST                    # date and session from the earnings store
 wickd earnings slate add XYZ --date 2026-12-02 --session post
 wickd earnings slate set WMT --expect-file notes.txt  # `-` reads stdin; line breaks kept
+wickd earnings slate set WMT --result "Beat and raised the year; margins the worry."  # after it reports
 wickd earnings slate rm ROST
 wickd earnings slate ls                               # soonest report first (no network)
 wickd earnings slate ls --reactions                   # + how each stock reacted
@@ -404,11 +413,19 @@ wickd earnings slate ls --reactions                   # + how each stock reacted
   next stored report from today on). A symbol with no stored report is
   refused unless you give `--date`; run `wickd earnings sync` first. Re-adding
   a symbol keeps its place and replaces only the fields you give.
-- `set` changes `--why`, `--expect`, `--date` or `--session`
+- `set` changes `--why`, `--expect`, `--result`, `--date` or `--session`
   (`pre` | `post` | `unknown`) on one entry. What you don't give is kept; an
-  empty `--why ""` or `--expect ""` clears it.
-- `why` is one line (max 200 characters); `expect` is free text (max 4,000).
+  empty `--why ""`, `--expect ""` or `--result ""` clears it.
+- `why` is one line (max 200 characters); `expect` and `result` are free
+  text (max 4,000 each; `--expect-file` / `--result-file` read a file).
   Longer text is refused, not cut.
+- The three texts are written at different times on purpose. `why` and
+  `expect` go on before the report and are left alone afterwards, so the
+  expectation can be compared with what happened. `result` is written after
+  the report: what was reported and the one thing that mattered.
+- `ls` adds `reported` to an entry once its report's figures are stored
+  (see `wickd earnings results`): reported EPS, the consensus and the
+  surprise. No network.
 - `ls` leaves out entries whose report is more than 14 days past unless
   `--all`. Nothing is deleted without `rm`.
 
@@ -432,6 +449,30 @@ after the report has come, from one batched Alpaca daily-bars request
 rejected Alpaca keys (only with `--reactions`); exit 4 means a bad symbol,
 over-long text, or `set` on a symbol that isn't on the slate (`rm` exits 0
 and lists it under `not_on_slate`). `ls` always carries `as_of`.
+
+### `wickd earnings results` — what was actually reported
+
+The earnings calendar only carries what is expected. This is the other half:
+reported EPS against the consensus, quarter by quarter, stored per company
+under `~/.wickd/earnings/results/`.
+
+```sh
+wickd earnings results sync NVDA HD     # fetch and store (one request per company)
+wickd earnings results sync --slate     # every company on the slate
+wickd earnings results show NVDA        # what is stored (no network)
+```
+
+- Each stored row has `fiscal_quarter`, `reported` (the date), `eps`,
+  `consensus` and `surprise_pct` (decimal strings; a missing figure is left
+  out), newest first.
+- **The source is unofficial and it lags.** It is Nasdaq's per-company
+  earnings-surprise table, no key, and a company that reported today can
+  still show last quarter as its newest row for a day or so. `sync` prints
+  `newest` per company so you can see whether it has caught up. A result is
+  only ever matched to a report by its date, never by being the newest row.
+- A fetch that fails or comes back empty keeps what is stored. `sync` exits
+  1 only when every company failed; exit 4 means a symbol that isn't a plain
+  ticker, or no symbol given.
 
 ## `wickd info` — what is this symbol?
 

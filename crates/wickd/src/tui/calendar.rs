@@ -47,6 +47,7 @@ use rust_decimal::Decimal;
 use wickd_core::backtest::surprise::impact_rank;
 use wickd_core::calendar_store::{self, CalendarEvent};
 use wickd_core::earnings_reaction::{earliest_reaction_day, Reaction};
+use wickd_core::earnings_results::{self, ResultOutcome, ResultRow, ResultsFile};
 use wickd_core::earnings_store::{self, clean_text, DayFile, DayOutcome, Session};
 
 use super::app::Mode;
@@ -61,6 +62,11 @@ pub const LOOKBACK_WEEKDAYS: usize = 3;
 
 /// Earnings files older than this are fetched again when the screen opens.
 const STALE_HOURS: i64 = 6;
+
+/// How long before a company's reported figures are asked for again when
+/// the feed didn't have them: it can lag a report by a day, so there is no
+/// point asking every minute.
+const RESULTS_RETRY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// How long after an automatic fetch before another may start, so a feed
 /// that is down isn't asked again on every visit.
@@ -106,6 +112,8 @@ pub struct EarnRow {
     pub why: Option<String>,
     /// The slate's expectation, written before the report.
     pub expect: Option<String>,
+    /// The slate's note on the result, written after the report.
+    pub result: Option<String>,
     /// The report is already out ([`session_passed`]).
     pub past: bool,
 }
@@ -477,6 +485,7 @@ pub fn build(inp: &Inputs) -> Vec<Row> {
                     slate: pick.is_some(),
                     why: pick.and_then(|p| p.why.clone()),
                     expect: pick.and_then(|p| p.expect.clone()),
+                    result: pick.and_then(|p| p.result.clone()),
                     past: session_passed(this, session, now),
                 }),
             ));
@@ -602,6 +611,15 @@ pub struct CalendarState {
     pub reactions_loading: bool,
     /// Why the last reaction fetch failed (rows simply show no figures).
     pub reactions_error: Option<String>,
+    /// What each watched company that has reported actually reported, as
+    /// stored (by symbol).
+    pub reported: HashMap<String, ResultsFile>,
+    /// A fetch of reported figures is in flight.
+    pub results_loading: bool,
+    /// Why the last fetch of reported figures fell short.
+    pub results_error: Option<String>,
+    /// When each company's figures were last asked for.
+    results_tried: HashMap<String, Instant>,
     /// A slate entry with text on it that `s` was pressed on once: a second
     /// `s` removes it.
     pub pending_remove: Option<String>,
@@ -641,6 +659,10 @@ impl CalendarState {
             reactions: HashMap::new(),
             reactions_loading: false,
             reactions_error: None,
+            reported: HashMap::new(),
+            results_loading: false,
+            results_error: None,
+            results_tried: HashMap::new(),
             pending_remove: None,
             back_to: Mode::Watchlist,
             last_auto: None,
@@ -746,6 +768,19 @@ impl CalendarState {
         });
         // Reactions for reports that have left the screen are dropped.
         self.reactions.retain(|(_, date), _| *date >= start);
+        // What the watched companies that have reported did report (disk).
+        self.reported.clear();
+        if let Some(dir) = self.earn_dir.as_deref().map(earnings_results::results_dir) {
+            for row in &self.rows {
+                let Row::Earn(e) = row else { continue };
+                if !(e.slate || e.listed) || !e.past || self.reported.contains_key(&e.symbol) {
+                    continue;
+                }
+                if let Ok(Some(file)) = earnings_results::read_results(&dir, &e.symbol) {
+                    self.reported.insert(e.symbol.clone(), file);
+                }
+            }
+        }
         self.selected = keep
             .and_then(|k| self.rows.iter().position(|r| row_key(r) == k))
             .or_else(|| {
@@ -877,6 +912,68 @@ impl CalendarState {
         crate::slate::update_at(path, |f| Ok(crate::slate::remove(f, &[symbol.to_string()])))
             .map(|_| ())
             .map_err(|e| format!("{e:#}"))
+    }
+
+    /// The watched companies whose report is out and whose reported figures
+    /// aren't stored: the ones worth asking the results feed about. Unless
+    /// `force`d (the `r` key), a company asked about in the last half hour
+    /// is left alone, since the feed can lag a report by a day.
+    pub fn results_wanted(&self, force: bool) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for row in &self.rows {
+            let Row::Earn(e) = row else { continue };
+            if !(e.slate || e.listed) || !e.past || self.reported_of(e).is_some() {
+                continue;
+            }
+            let recently = self
+                .results_tried
+                .get(&e.symbol)
+                .is_some_and(|t| t.elapsed() < RESULTS_RETRY);
+            if (force || !recently) && !out.contains(&e.symbol) {
+                out.push(e.symbol.clone());
+            }
+        }
+        out
+    }
+
+    /// Mark a fetch of reported figures as started for `symbols`.
+    pub fn results_started(&mut self, symbols: &[String]) {
+        self.results_loading = true;
+        let now = Instant::now();
+        for s in symbols {
+            self.results_tried.insert(s.clone(), now);
+        }
+    }
+
+    /// Take a finished fetch of reported figures: say what fell short, then
+    /// re-read the store.
+    pub fn results_finished(
+        &mut self,
+        result: Result<Vec<ResultOutcome>, String>,
+        listed: &HashSet<String>,
+    ) {
+        self.results_loading = false;
+        self.results_error = match result {
+            Err(e) => Some(format!("couldn't fetch reported figures: {e}")),
+            Ok(outcomes) => {
+                let failed: Vec<&ResultOutcome> = outcomes.iter().filter(|o| !o.ok()).collect();
+                failed.first().map(|first| {
+                    format!(
+                        "couldn't fetch reported figures for {} of {} companies ({})",
+                        failed.len(),
+                        outcomes.len(),
+                        first.error.as_deref().unwrap_or("unknown error")
+                    )
+                })
+            }
+        };
+        self.reload(listed);
+    }
+
+    /// What a row's company reported for that report, when the figures are
+    /// stored (matched by report date, never by being the newest).
+    pub fn reported_of(&self, e: &EarnRow) -> Option<&ResultRow> {
+        self.reported.get(&e.symbol)?.for_report(e.date)
     }
 
     /// How a row's stock reacted, when that is known.
@@ -1083,6 +1180,7 @@ mod tests {
             session,
             why: (!why.is_empty()).then(|| why.to_string()),
             expect: (!expect.is_empty()).then(|| expect.to_string()),
+            result: None,
             added: "2026-11-15T03:00:00Z".parse().unwrap(),
         }
     }

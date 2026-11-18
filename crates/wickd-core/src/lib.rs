@@ -13,6 +13,7 @@ pub mod calendar_store;
 pub mod config;
 pub mod crypto;
 pub mod earnings_reaction;
+pub mod earnings_results;
 pub mod earnings_store;
 pub mod equities;
 pub mod error;

@@ -82,6 +82,8 @@ enum Request {
     Earnings(std::path::PathBuf, Vec<chrono::NaiveDate>),
     /// Work out how these stocks reacted to their reports.
     Reactions(Vec<calendar::ReactionAsk>),
+    /// Fetch what these companies reported into the results folder.
+    Results(std::path::PathBuf, Vec<String>),
 }
 
 /// Results coming back to the run loop.
@@ -100,6 +102,7 @@ enum Reply {
     Live(live::LiveEvent),
     Info(String, Result<crate::info::SymbolInfo, String>),
     Earnings(Result<Vec<wickd_core::earnings_store::DayOutcome>, String>),
+    Results(Result<Vec<wickd_core::earnings_results::ResultOutcome>, String>),
     Reactions(
         Result<
             Vec<(
@@ -234,6 +237,16 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                     }
                     Request::Reactions(asks) => {
                         Reply::Reactions(calendar::fetch_reactions(&client, asks, Utc::now()).await)
+                    }
+                    Request::Results(dir, symbols) => {
+                        use wickd_core::earnings_results as er;
+                        Reply::Results(match wickd_core::earnings_store::http_client() {
+                            Ok(http) => {
+                                Ok(er::sync_results(&http, er::NASDAQ_SURPRISE_URL, &dir, &symbols)
+                                    .await)
+                            }
+                            Err(e) => Err(e),
+                        })
                     }
                     Request::Earnings(dir, dates) => {
                         use wickd_core::earnings_store as es;
@@ -548,6 +561,7 @@ fn run_loop(
                 Reply::Info(sym, r) => app.set_info(&sym, r),
                 Reply::Earnings(r) => actions.extend(app.set_earnings_fetch(r)),
                 Reply::Reactions(r) => app.set_reactions(r),
+                Reply::Results(r) => app.set_results(r),
                 Reply::Live(live::LiveEvent::Connected(up)) => app.fx_live = up,
                 Reply::Live(live::LiveEvent::Quote(q)) => app.apply_tick(q),
                 Reply::FxAssets(r) => match r {
@@ -651,12 +665,13 @@ fn run_loop(
         if app.mode == Mode::Calendar {
             if slate_check.due() && app.calendar.slate_changed() {
                 app.reload_calendar();
-                actions.extend(app.reactions_action());
+                actions.extend(app.calendar_asks(false));
             }
-            // Opening already asked; `reactions_action` won't ask again while
-            // that request is out.
+            // Opening already asked. Reactions aren't asked for again while a
+            // request is out; reported figures at most every half hour per
+            // company.
             if reactions_timer.due() {
-                actions.extend(app.reactions_action());
+                actions.extend(app.calendar_asks(false));
             }
         } else {
             slate_check.reset();
@@ -719,6 +734,13 @@ fn run_loop(
                 Action::FetchInPlay => send(Request::InPlay(app.watchlist.clone())),
                 Action::FetchNews(s) => send(Request::News(s)),
                 Action::FetchReactions(asks) => send(Request::Reactions(asks)),
+                Action::FetchResults(symbols) => match app.calendar.earn_dir.as_deref() {
+                    Some(dir) => send(Request::Results(
+                        wickd_core::earnings_results::results_dir(dir),
+                        symbols,
+                    )),
+                    None => app.set_results(Err("couldn't find the wickd data folder".into())),
+                },
                 Action::SlateAdd {
                     symbol,
                     date,
@@ -727,8 +749,17 @@ fn run_loop(
                     let r = app.calendar.slate_add(&symbol, date, session);
                     let more = app.slate_written(r.map(|()| format!("{symbol} is on the slate")));
                     for a in more {
-                        if let Action::FetchReactions(asks) = a {
-                            send(Request::Reactions(asks));
+                        match a {
+                            Action::FetchReactions(asks) => send(Request::Reactions(asks)),
+                            Action::FetchResults(symbols) => {
+                                if let Some(dir) = app.calendar.earn_dir.as_deref() {
+                                    send(Request::Results(
+                                        wickd_core::earnings_results::results_dir(dir),
+                                        symbols,
+                                    ));
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }

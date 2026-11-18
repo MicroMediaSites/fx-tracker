@@ -559,31 +559,74 @@ fn reaction_sentence(r: &wickd_core::earnings_reaction::Reaction) -> String {
     s
 }
 
-/// What the box under the list says for the company under the cursor: its
-/// expectation as written, then its reaction. `None` when there is neither.
+/// What a company reported, as a sentence: EPS against the consensus and
+/// the size of the beat or miss.
+fn reported_sentence(r: &wickd_core::earnings_results::ResultRow) -> String {
+    use rust_decimal::Decimal;
+    let Some(eps) = r.eps else {
+        return "Reported: no EPS figure in the feed for this report.".into();
+    };
+    let mut s = format!("Reported: EPS {eps:.2}");
+    if let Some(c) = r.consensus {
+        s.push_str(&format!(" against {c:.2} expected"));
+    }
+    match r.surprise_pct {
+        Some(p) if p > Decimal::ZERO => s.push_str(&format!(", a beat of {p:.1}%")),
+        Some(p) if p < Decimal::ZERO => s.push_str(&format!(", a miss of {:.1}%", -p)),
+        Some(_) => s.push_str(", in line"),
+        None => {}
+    }
+    s.push('.');
+    s
+}
+
+/// What the box under the list says for the company under the cursor, in
+/// the order things happen: the expectation as written before the report,
+/// the result (the reported figures, then the note written afterwards),
+/// and the stock's reaction. `None` when there is nothing to say.
 fn calendar_box(app: &App) -> Option<(String, Vec<String>)> {
     let c = &app.calendar;
     let e = c.selected_earn()?;
+    let watched = e.slate || e.listed;
     let expect = e.expect.as_deref().filter(|_| e.slate);
+    let note = e.result.as_deref().filter(|_| e.slate);
     let reaction = c.reaction_of(e);
-    if expect.is_none() && reaction.is_none() {
+    // Once a watched company's report is out there is always a result to
+    // speak of, even if it is only "the figures aren't in yet".
+    let out = watched && e.past;
+    if expect.is_none() && note.is_none() && reaction.is_none() && !out {
         return None;
     }
-    let mut lines: Vec<String> = expect
-        .map(|t| t.lines().map(str::to_string).collect())
-        .unwrap_or_default();
-    if let Some(r) = reaction {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut section = |name: &'static str, text: Vec<String>, lines: &mut Vec<String>| {
         if !lines.is_empty() {
             lines.push(String::new());
         }
-        lines.push(reaction_sentence(r));
-    }
-    let title = match (expect.is_some(), reaction.is_some()) {
-        (true, true) => "expectation and reaction",
-        (true, false) => "expectation",
-        _ => "reaction",
+        lines.extend(text);
+        parts.push(name);
     };
-    Some((format!(" {} · {title} ", e.symbol), lines))
+    if let Some(t) = expect {
+        section("expectation", t.lines().map(str::to_string).collect(), &mut lines);
+    }
+    if out || note.is_some() {
+        let mut text = Vec::new();
+        if out {
+            text.push(match c.reported_of(e) {
+                Some(r) => reported_sentence(r),
+                None if c.results_loading => "Reported: fetching the figures…".into(),
+                None => "Reported: the figures aren't in the feed yet (it can lag a report by a day). Press r to check again.".into(),
+            });
+        }
+        if let Some(n) = note {
+            text.extend(n.lines().map(str::to_string));
+        }
+        section("result", text, &mut lines);
+    }
+    if let Some(r) = reaction {
+        section("reaction", vec![reaction_sentence(r)], &mut lines);
+    }
+    Some((format!(" {} · {} ", e.symbol, parts.join(" · ")), lines))
 }
 
 /// The calendar (`g c`): the earnings watch. A heading per day and one row
@@ -676,7 +719,12 @@ fn render_calendar(frame: &mut Frame, area: Rect, app: &App) {
             .title(Line::from(Span::styled(format!(" {s} "), dim)).alignment(Alignment::Right));
     }
     // Bottom left: what went wrong fetching, earnings first.
-    if let Some(e) = c.fetch_error.as_ref().or(c.reactions_error.as_ref()) {
+    if let Some(e) = c
+        .fetch_error
+        .as_ref()
+        .or(c.reactions_error.as_ref())
+        .or(c.results_error.as_ref())
+    {
         let room = usize::from(area.width).saturating_sub(14);
         block = block.title_bottom(Line::from(Span::styled(
             format!(" {} ", fit(e, room).trim_end()),
@@ -3467,6 +3515,7 @@ mod tests {
             session,
             why: Some(why.into()),
             expect: expect.map(str::to_string),
+            result: None,
             added: "2026-11-15T03:00:00Z".parse().unwrap(),
         };
         let slate_path = tmp.join("slate.json");
@@ -3497,7 +3546,39 @@ mod tests {
         press(app, KeyCode::Char('c'));
         app.set_earnings_fetch(Ok(vec![]));
         app.set_reactions(Ok(vec![]));
+        app.set_results(Ok(vec![]));
         app.flash = None;
+    }
+
+    /// Store what a company reported, the way a results fetch would.
+    fn store_reported(app: &App, symbol: &str, date: &str, eps: &str, consensus: &str, surprise: &str) {
+        use wickd_core::earnings_results::{results_dir, write_results, ResultRow, ResultsFile};
+        write_results(
+            &results_dir(app.calendar.earn_dir.as_ref().unwrap()),
+            &ResultsFile {
+                symbol: symbol.into(),
+                fetched_at: Utc::now(),
+                source: "nasdaq".into(),
+                rows: vec![
+                    ResultRow {
+                        fiscal_quarter: "Oct 2026".into(),
+                        reported: date.parse().unwrap(),
+                        eps: Some(eps.parse().unwrap()),
+                        consensus: Some(consensus.parse().unwrap()),
+                        surprise_pct: Some(surprise.parse().unwrap()),
+                    },
+                    // Last quarter's row is always there too.
+                    ResultRow {
+                        fiscal_quarter: "Jul 2026".into(),
+                        reported: "2026-08-26".parse().unwrap(),
+                        eps: Some("9.99".parse().unwrap()),
+                        consensus: Some("9.00".parse().unwrap()),
+                        surprise_pct: Some("11".parse().unwrap()),
+                    },
+                ],
+            },
+        )
+        .unwrap();
     }
 
     fn reacted(day: &str, gap: f64, change: f64, complete: bool) -> wickd_core::earnings_reaction::Reaction {
@@ -3536,13 +3617,14 @@ mod tests {
         let mut app = calendar_app(tmp.path());
         press(&mut app, KeyCode::Char('g'));
         // Days are missing from the store, and two watched reports are out:
-        // opening asks for both.
+        // opening asks for the days, their reactions and what they reported.
         let actions = press(&mut app, KeyCode::Char('c'));
         assert_eq!(app.mode, Mode::Calendar);
         assert!(
             matches!(
                 actions.as_slice(),
-                [Action::FetchEarnings(d), Action::FetchReactions(r)] if d.len() == 8 && r.len() == 2
+                [Action::FetchEarnings(d), Action::FetchReactions(r), Action::FetchResults(f)]
+                    if d.len() == 8 && r.len() == 2 && f == &["NVDA", "TGT"]
             ),
             "{actions:?}"
         );
@@ -3608,25 +3690,67 @@ mod tests {
     }
 
     #[test]
-    fn calendar_box_shows_the_expectation_and_the_reaction_of_the_selected_company() {
+    fn calendar_box_reads_expectation_then_result_then_reaction() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = calendar_app(tmp.path());
         open_calendar(&mut app);
         // The cursor opens on the Fed minutes: nothing to say about a release.
         let all = screen(&app, 130, 30).join("\n");
-        assert!(!all.contains("· expectation") && !all.contains("· reaction"), "{all}");
-        // NVDA: its expectation as written.
+        assert!(!all.contains("· expectation") && !all.contains("· result"), "{all}");
+        // NVDA reported last night. Its expectation as written, and the
+        // result said plainly even though the figures aren't in yet.
         press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Char('g'));
         assert_eq!(app.calendar.selected_symbol(), Some("NVDA"));
         let all = screen(&app, 130, 30).join("\n");
-        assert!(all.contains(" NVDA · expectation "), "{all}");
+        assert!(all.contains(" NVDA · expectation · result "), "{all}");
         assert!(all.contains("Beat and raise: +5%.") && all.contains("A cut to the outlook: -10%."));
+        assert!(
+            all.contains("Reported: the figures aren't in the feed yet (it can lag a report by a day). Press r to check again."),
+            "{all}"
+        );
         assert!(!all.contains("Reaction"));
-        // With its reaction in, both, the reaction as a sentence.
-        give_reactions(&mut app);
+        // While a fetch for them is out, it says that instead.
+        app.calendar.results_loading = true;
+        assert!(screen(&app, 130, 30).join("\n").contains("Reported: fetching the figures…"));
+        // The figures arrive: a sentence, matched to this report (not last
+        // quarter's row).
+        store_reported(&app, "NVDA", "2026-11-17", "2.68", "2.49", "7.63");
+        app.set_results(Ok(vec![]));
         let all = screen(&app, 130, 30).join("\n");
-        assert!(all.contains(" NVDA · expectation and reaction "), "{all}");
+        assert!(
+            all.contains("Reported: EPS 2.68 against 2.49 expected, a beat of 7.6%."),
+            "{all}"
+        );
+        assert!(!all.contains("9.99"));
+        // The note written after the report sits under the figures.
+        let path = app.calendar.slate_path.clone().unwrap();
+        crate::slate::update_at(&path, |f| {
+            crate::slate::set(
+                f,
+                "NVDA",
+                &crate::slate::Change {
+                    result: Some("Guided next quarter to 130B.\nMargins guided down.".into()),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+        app.reload_calendar();
+        // With its reaction in, all three, in the order they happened.
+        give_reactions(&mut app);
+        let rows = screen(&app, 130, 34);
+        let all = rows.join("\n");
+        assert!(all.contains(" NVDA · expectation · result · reaction "), "{all}");
+        let at = |needle: &str| {
+            rows.iter()
+                .position(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?} in\n{all}"))
+        };
+        assert!(at("Beat and raise: +5%.") < at("Reported: EPS 2.68"));
+        assert!(at("Reported: EPS 2.68") < at("Guided next quarter to 130B."));
+        assert!(at("Guided next quarter to 130B.") < at("Margins guided down."));
+        assert!(at("Margins guided down.") < at("Reaction on Wed Nov 18"));
         assert!(
             all.contains(
                 "Reaction on Wed Nov 18: opened +2.1%, closed +4.2%, 80% of the way up the day's range, on 2.5× its usual volume."
@@ -3635,22 +3759,90 @@ mod tests {
         );
         // The list is still there above the box, captions and all.
         assert!(all.contains("TIME") && all.contains("Today · Wed Nov 18"));
-        // TGT has no expectation written; its unfinished day is "so far".
+        // TGT reported this morning: no expectation written, a miss, and its
+        // unfinished day is "so far".
+        store_reported(&app, "TGT", "2026-11-18", "1.90", "2.05", "-7.32");
+        app.set_results(Ok(vec![]));
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.calendar.selected_symbol(), Some("TGT"));
         let all = screen(&app, 130, 30).join("\n");
-        assert!(all.contains(" TGT · reaction "), "{all}");
+        assert!(all.contains(" TGT · result · reaction "), "{all}");
+        assert!(all.contains("Reported: EPS 1.90 against 2.05 expected, a miss of 7.3%."), "{all}");
         assert!(
             all.contains(
                 "Reaction so far (Wed Nov 18): opened -1.5%, now -3.1%, 80% of the way up the day's range, on 2.5× its usual volume so far."
             ),
             "{all}"
         );
+        // PANW reports tonight: on the watchlist, nothing to say yet.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.calendar.selected_symbol(), Some("PANW"));
+        let all = screen(&app, 130, 30).join("\n");
+        assert!(!all.contains("· result") && !all.contains("Reported:"), "{all}");
         // A failed reaction fetch says so along the bottom and keeps the figures.
         app.set_reactions(Err("rate limited".into()));
         let all = screen(&app, 130, 30).join("\n");
         assert!(all.contains("couldn't fetch reactions: rate limited"), "{all}");
         assert!(all.contains("-3.1%…"));
+    }
+
+    #[test]
+    fn reported_figures_are_fetched_for_watched_reports_that_are_out_and_not_too_often() {
+        use crate::tui::app::Action;
+        use wickd_core::earnings_results::ResultOutcome;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        press(&mut app, KeyCode::Char('g'));
+        let actions = press(&mut app, KeyCode::Char('c'));
+        // NVDA and TGT have reported; PANW (tonight) hasn't, and TJX isn't watched.
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::FetchResults(s) if s == &["NVDA", "TGT"])),
+            "{actions:?}"
+        );
+        assert!(app.calendar.results_loading);
+        // While that request is out, nothing more is asked.
+        assert_eq!(app.results_action(true), None);
+        // It comes back with nothing new (the feed lags): the box says so,
+        // and the timer doesn't ask again straight away.
+        app.set_results(Ok(vec![]));
+        assert!(!app.calendar.results_loading && app.calendar.results_error.is_none());
+        assert_eq!(app.results_action(false), None, "asked moments ago");
+        // r asks again regardless.
+        app.set_earnings_fetch(Ok(vec![]));
+        let actions = press(&mut app, KeyCode::Char('r'));
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::FetchResults(s) if s == &["NVDA", "TGT"])),
+            "{actions:?}"
+        );
+        // NVDA's figures land; TGT's fetch fails. Only TGT is still wanted,
+        // and the failure is said along the bottom.
+        store_reported(&app, "NVDA", "2026-11-17", "2.68", "2.49", "7.63");
+        let outcome = |symbol: &str, error: Option<&str>| ResultOutcome {
+            symbol: symbol.into(),
+            rows: None,
+            newest: None,
+            written: error.is_none(),
+            kept_stored: false,
+            error: error.map(str::to_string),
+        };
+        app.set_results(Ok(vec![outcome("NVDA", None), outcome("TGT", Some("HTTP 503"))]));
+        assert_eq!(app.calendar.results_wanted(true), ["TGT"]);
+        app.set_earnings_fetch(Ok(vec![]));
+        let all = screen(&app, 130, 30).join("\n");
+        assert!(
+            all.contains("couldn't fetch reported figures for 1 of 2 companies (HTTP 503)"),
+            "{all}"
+        );
+        // Figures stored only for last quarter don't count as this report's.
+        store_reported(&app, "TGT", "2026-08-19", "2.10", "2.00", "5");
+        app.set_results(Ok(vec![]));
+        assert_eq!(app.calendar.results_wanted(true), ["TGT"]);
+        // Removing the watch removes the ask: nothing is fetched for
+        // companies nobody picked.
+        app.calendar.slate_remove("TGT").unwrap();
+        app.reload_calendar();
+        assert!(app.calendar.results_wanted(true).is_empty());
     }
 
     #[test]
@@ -3743,9 +3935,14 @@ mod tests {
         );
         let r = app.calendar.slate_add("TJX", "2026-11-18".parse().unwrap(), wickd_core::earnings_store::Session::PreMarket);
         let more = app.slate_written(r.map(|()| "TJX is on the slate".to_string()));
-        // It reported this morning, so its reaction is asked for at once.
+        // It reported this morning, so its reaction and what it reported are
+        // asked for at once.
         assert!(
-            matches!(more.as_slice(), [Action::FetchReactions(r)] if r.iter().any(|a| a.0 == "TJX")),
+            matches!(
+                more.as_slice(),
+                [Action::FetchReactions(r), Action::FetchResults(f)]
+                    if r.iter().any(|a| a.0 == "TJX") && f == &["TJX"]
+            ),
             "{more:?}"
         );
         // Back on the watch, it is there.
@@ -3944,6 +4141,8 @@ mod tests {
         shoot(&app, "1-opening-fetch-in-flight", w, h);
         app.set_earnings_fetch(Ok(vec![]));
         app.calendar.reactions_loading = false;
+        // The reported figures are whatever the results store holds.
+        app.set_results(Ok(vec![]));
         shoot(&app, "2-watch-before-reactions", w, h);
         // Real reactions from real bars, when a bars file is given.
         if let Ok(path) = std::env::var("WICKD_SNAPSHOT_BARS") {

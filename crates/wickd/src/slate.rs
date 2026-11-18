@@ -1,6 +1,7 @@
 //! The earnings slate (`~/.wickd/slate.json`): the short list of companies
 //! picked ahead of their earnings reports, each with why it was picked and
-//! what is expected, written **before** it reports.
+//! what is expected, written **before** it reports, and, once it has
+//! reported, a note of the result.
 //!
 //! The slate is for watching, then reacting. Nothing here places a trade,
 //! and an entry is never a reason to buy before a report: the play starts
@@ -27,7 +28,8 @@
 //! ```
 //!
 //! Text is kept as written apart from control characters (it is drawn on a
-//! terminal): `why` is one line, `expect` keeps its line breaks.
+//! terminal): `why` is one line, `expect` and `result` keep their line
+//! breaks.
 
 use std::path::{Path, PathBuf};
 
@@ -43,6 +45,8 @@ use crate::lists::{invalid, locked_update, normalize_symbol};
 pub const MAX_WHY_CHARS: usize = 200;
 /// The most an `expect` holds.
 pub const MAX_EXPECT_CHARS: usize = 4_000;
+/// The most a `result` holds.
+pub const MAX_RESULT_CHARS: usize = 4_000;
 /// The most entries a slate holds: it is a short list by design.
 pub const MAX_ENTRIES: usize = 200;
 /// Entries whose report is older than this are left out of listings (they
@@ -64,6 +68,11 @@ pub struct Entry {
     /// What is expected, free text, written before the report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect: Option<String>,
+    /// What was reported and what mattered, free text, written after the
+    /// report. The reported figures themselves come from
+    /// [`wickd_core::earnings_results`]; this is the reading of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
     pub added: DateTime<Utc>,
 }
 
@@ -109,8 +118,22 @@ pub fn update_at<T>(path: &Path, change: impl FnOnce(&mut SlateFile) -> Result<T
 pub struct Change {
     pub why: Option<String>,
     pub expect: Option<String>,
+    pub result: Option<String>,
     pub date: Option<NaiveDate>,
     pub session: Option<Session>,
+}
+
+/// Free text as stored: line breaks kept, tabs and other control characters
+/// gone (it is drawn on a terminal), trimmed. Not `clean_text`, which
+/// flattens to one line.
+fn clean_free_text(s: &str) -> String {
+    let t: String = s
+        .replace("\r\n", "\n")
+        .chars()
+        .map(|c| if c == '\t' || c == '\r' { ' ' } else { c })
+        .filter(|c| *c == '\n' || !c.is_control())
+        .collect();
+    t.trim().to_string()
 }
 
 impl Change {
@@ -133,13 +156,7 @@ impl Change {
             self.why = Some(w);
         }
         if let Some(e) = self.expect.take() {
-            let e: String = e
-                .replace("\r\n", "\n")
-                .chars()
-                .map(|c| if c == '\t' || c == '\r' { ' ' } else { c })
-                .filter(|c| *c == '\n' || !c.is_control())
-                .collect();
-            let e = e.trim().to_string();
+            let e = clean_free_text(&e);
             if e.chars().count() > MAX_EXPECT_CHARS {
                 return Err(invalid(format!(
                     "--expect is {} characters; the most is {MAX_EXPECT_CHARS}",
@@ -147,6 +164,16 @@ impl Change {
                 )));
             }
             self.expect = Some(e);
+        }
+        if let Some(r) = self.result.take() {
+            let r = clean_free_text(&r);
+            if r.chars().count() > MAX_RESULT_CHARS {
+                return Err(invalid(format!(
+                    "--result is {} characters; the most is {MAX_RESULT_CHARS}",
+                    r.chars().count()
+                )));
+            }
+            self.result = Some(r);
         }
         Ok(self)
     }
@@ -159,6 +186,7 @@ impl Change {
         };
         text(&self.why, &mut e.why);
         text(&self.expect, &mut e.expect);
+        text(&self.result, &mut e.result);
         if let Some(d) = self.date {
             e.date = d;
         }
@@ -244,6 +272,7 @@ pub fn add(
             },
             why: None,
             expect: None,
+            result: None,
             added: now,
         };
         change.apply(&mut e);
@@ -516,6 +545,50 @@ mod tests {
         }
         .cleaned()
         .is_ok());
+    }
+
+    #[test]
+    fn the_result_note_is_written_after_cleared_by_empty_and_optional_in_old_files() {
+        let mut f = SlateFile::default();
+        let before = Change {
+            expect: Some("EPS 0.64 expected.".into()),
+            ..Default::default()
+        };
+        add(&mut f, &syms(&["WMT"]), &before, known, now()).unwrap();
+        assert_eq!(f.entries[0].result, None);
+        let after = Change {
+            result: Some("  Beat: 0.66.\r\nRaised the year.\u{7}  ".into()),
+            ..Default::default()
+        }
+        .cleaned()
+        .unwrap();
+        let e = set(&mut f, "WMT", &after).unwrap();
+        assert_eq!(e.result.as_deref(), Some("Beat: 0.66.\nRaised the year."));
+        assert_eq!(
+            e.expect.as_deref(),
+            Some("EPS 0.64 expected."),
+            "the expectation is untouched"
+        );
+        let cleared = Change {
+            result: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(set(&mut f, "WMT", &cleared).unwrap().result, None);
+        let long = Change {
+            result: Some("x".repeat(MAX_RESULT_CHARS + 1)),
+            ..Default::default()
+        };
+        let err = long.cleaned().unwrap_err();
+        assert!(
+            is_validation(&err) && err.to_string().contains("--result"),
+            "{err}"
+        );
+        // A slate written before the field existed loads, and an entry with
+        // no result doesn't write the key.
+        let old = r#"{"version":1,"entries":[{"symbol":"HD","date":"2026-11-17","session":"pre_market","why":"w","added":"2026-11-16T03:00:00Z"}]}"#;
+        let file: SlateFile = serde_json::from_str(old).unwrap();
+        assert_eq!(file.entries[0].result, None);
+        assert!(!serde_json::to_string(&file).unwrap().contains("result"));
     }
 
     #[test]
