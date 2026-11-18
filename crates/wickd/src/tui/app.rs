@@ -79,6 +79,8 @@ pub enum Action {
     FetchNews(String),
     /// Fetch the earnings calendar for these days into the store.
     FetchEarnings(Vec<chrono::NaiveDate>),
+    /// Fetch the results headlines for these reports.
+    FetchHeadlines(Vec<super::calendar::ReactionAsk>),
     /// Fetch what these companies reported (EPS against the consensus).
     FetchResults(Vec<String>),
     /// Fetch how these watched stocks reacted to their reports.
@@ -1197,13 +1199,44 @@ impl App {
         Some(Action::FetchResults(wanted))
     }
 
-    /// The background asks the calendar makes whenever its rows change:
-    /// reactions and reported figures for the watched companies.
-    pub fn calendar_asks(&mut self, force_results: bool) -> Vec<Action> {
+    /// Ask the news feed for the results headlines of the watched reports
+    /// that are out and have none stored, when no such request is already
+    /// out. `force` (the `r` key) asks even about one asked about recently.
+    pub fn headlines_action(&mut self, force: bool) -> Option<Action> {
+        if self.calendar.headlines_loading {
+            return None;
+        }
+        let wanted = self.calendar.headlines_wanted(force);
+        if wanted.is_empty() {
+            return None;
+        }
+        self.calendar.headlines_started(&wanted);
+        Some(Action::FetchHeadlines(wanted))
+    }
+
+    /// The background asks the calendar makes whenever its rows change, for
+    /// the watched companies: reactions, results headlines and reported
+    /// figures.
+    pub fn calendar_asks(&mut self, force: bool) -> Vec<Action> {
         self.reactions_action()
             .into_iter()
-            .chain(self.results_action(force_results))
+            .chain(self.headlines_action(force))
+            .chain(self.results_action(force))
             .collect()
+    }
+
+    /// A headlines fetch finished.
+    pub fn set_headlines(&mut self, result: Result<(usize, usize, Option<String>), String>) {
+        let listed = self.listed_symbols();
+        self.calendar.headlines_finished(result, &listed);
+        self.finish_update();
+    }
+
+    /// When an `r` update has fully come back, say what it brought in.
+    fn finish_update(&mut self) {
+        if let Some(summary) = self.calendar.take_update_summary() {
+            self.flash = Some(summary);
+        }
     }
 
     /// A fetch of reported figures finished.
@@ -1213,6 +1246,7 @@ impl App {
     ) {
         let listed = self.listed_symbols();
         self.calendar.results_finished(result, &listed);
+        self.finish_update();
     }
 
     /// A reaction fetch finished.
@@ -1227,6 +1261,7 @@ impl App {
         >,
     ) {
         self.calendar.reactions_finished(result);
+        self.finish_update();
     }
 
     /// A slate add or remove was written (or failed): say so and re-read.
@@ -1305,7 +1340,12 @@ impl App {
         let listed = self.listed_symbols();
         self.calendar.fetch_finished(result, &listed);
         self.refresh_reports_soon();
-        self.calendar_asks(false)
+        // During an update (`r`) the follow-up asks are forced too: new rows
+        // may have come into view.
+        let force = self.calendar.updating.is_some();
+        let asks = self.calendar_asks(force);
+        self.finish_update();
+        asks
     }
 
     /// Re-read which stocks report today or on the next weekday (disk only).
@@ -1369,16 +1409,21 @@ impl App {
                 }
             },
             Cmd::Refresh => {
-                if self.calendar.loading {
-                    self.flash = Some("already fetching".into());
+                if self.calendar.loading || self.calendar.updating.is_some() {
+                    self.flash = Some("already updating".into());
                 } else if self.calendar.earn_dir.is_none() {
                     self.flash = Some("couldn't find the wickd data folder".into());
                 } else {
+                    // One key updates everything on the watch: who reports,
+                    // then reactions, results headlines and reported figures
+                    // for every watched report that is out. What was known
+                    // before is kept so the screen can say what came in.
                     self.reload_calendar();
+                    self.calendar.updating = Some(self.calendar.known());
                     self.calendar.fetch_started(false);
                     let mut actions = vec![Action::FetchEarnings(self.calendar.fetch_dates())];
-                    // `r` also re-checks the reported figures now.
                     actions.extend(self.calendar_asks(true));
+                    self.flash = Some("updating everything on your watch…".into());
                     return actions;
                 }
             }

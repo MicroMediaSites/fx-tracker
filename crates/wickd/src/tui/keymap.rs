@@ -309,7 +309,7 @@ pub static BINDINGS: &[Binding] = &[
     bare(&[K::Char('/')], Cmd::Search, "search", WDI),
     bare(&[K::Char('r')], Cmd::Refresh, "refresh", WDI),
     bare(&[K::Char('r')], Cmd::Refresh, "reload from disk", J),
-    bare(&[K::Char('r')], Cmd::Refresh, "fetch earnings now", C),
+    bare(&[K::Char('r')], Cmd::Refresh, "update everything", C),
     bare(
         &[K::Esc, K::Char('q'), K::Backspace],
         Cmd::Back,

@@ -24,6 +24,7 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
 
+use wickd_core::earnings_headlines::{headlines_dir, read_headlines, Headline};
 use wickd_core::earnings_reaction::{reaction, Reaction, VOLUME_SESSIONS};
 use wickd_core::earnings_results::{read_results, results_dir, ResultRow};
 use wickd_core::earnings_store::{earnings_dir, market_date, Session};
@@ -59,7 +60,7 @@ enum SlateCommand {
 
 /// When in the day a company reports, as typed on the command line.
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum SessionArg {
+pub enum SessionArg {
     /// Before the open.
     Pre,
     /// After the close.
@@ -273,6 +274,9 @@ fn rm(args: RmArgs) -> Result<serde_json::Value> {
 struct Listed {
     #[serde(flatten)]
     entry: Entry,
+    /// The stored results headlines for this report, best first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    headlines: Vec<Headline>,
     /// The stored reported figures for this report.
     #[serde(skip_serializing_if = "Option::is_none")]
     reported: Option<ResultRow>,
@@ -305,8 +309,19 @@ fn with_reactions(
                 .get(&entry.symbol)
                 .and_then(|b| reaction(b, entry.date, entry.session, now));
             let reported = reported_for(results, &entry);
+            // The headlines sit beside the results, under the same folder.
+            let headlines = results
+                .and_then(|r| r.parent())
+                .and_then(|earn| {
+                    read_headlines(&headlines_dir(earn), &entry.symbol, entry.date)
+                        .ok()
+                        .flatten()
+                })
+                .map(|f| f.picked)
+                .unwrap_or_default();
             Listed {
                 entry,
+                headlines,
                 reported,
                 reaction,
             }

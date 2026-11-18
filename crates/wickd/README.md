@@ -114,17 +114,24 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
     close (`…` while the session is still open). Fetched in the background
     from Alpaca daily bars, re-asked every minute while the screen is open.
   - **The box.** With the cursor on a company, a box under the list reads
-    in the order things happened. The **expectation**, as written before
-    the report (slate entries). The **result**, once the report is out: the
-    reported EPS against the consensus as a sentence ("a beat of 7.6%"),
-    then the note written afterwards with `slate set --result`. The
-    **reaction**: the gap at the open, the day's change, where it closed in
-    the day's range, and volume against its 20-session average.
-  - **Reported figures** are fetched in the background, only for watched
-    companies whose report is out, when the screen opens and on `r`, and no
-    more than once every half hour per company otherwise. The feed can lag
-    a report by a day; until it catches up the box says the figures aren't
-    in yet.
+    in the order things happened (it takes up to half the screen). The
+    **expectation**, as written before the report (slate entries). The
+    **result**, once the report is out: the results headlines as published,
+    each with its local time; then, when the slower table has caught up,
+    the reported EPS against the consensus as a sentence ("a beat of
+    7.6%"); then the note written afterwards with `slate set --result`.
+    The **reaction**: the gap at the open, the day's change, where it
+    closed in the day's range, and volume against its 20-session average.
+  - **`r` updates everything.** One key, for the evening: who reports, then
+    reactions, results headlines and reported figures for every watched
+    company whose report is out, whenever they were last asked for. The
+    header says "updating everything…" while it runs, and when the last
+    piece is back a line says what came in ("Updated. New for HD, NVDA.")
+    or that nothing new did. Nothing is ever sent to you; you pull.
+  - **Between updates**, headlines and figures are also fetched when the
+    screen opens, only for watched companies whose report is out and that
+    have none stored, and no more than once every half hour per report.
+    Nothing is fetched for companies nobody picked.
   - **Everything** (`a`). From today on, every company that reports and
     every US release, watched companies first in each session, then largest
     first. This is where you browse to add to the slate. `a` again returns
@@ -136,7 +143,7 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
     the screen picks up changes to the slate within a couple of seconds.
     `j`/`k` move between rows, `J`/`K` a page, `g g`/`g e` go to the top /
     end, `enter` on a company opens its chart (`esc` there comes back), `r`
-    fetches earnings now, and `esc` returns to where you were.
+    updates everything, and `esc` returns to where you were.
   - **Data.** Economic events are read from `~/.wickd/calendar/` (kept
     fresh by `wickd calendar sync`; this screen never writes it), earnings
     from `~/.wickd/earnings/`. What is stored shows at once, and a
@@ -449,6 +456,34 @@ after the report has come, from one batched Alpaca daily-bars request
 rejected Alpaca keys (only with `--reactions`); exit 4 means a bad symbol,
 over-long text, or `set` on a symbol that isn't on the slate (`rm` exits 0
 and lists it under `not_on_slate`). `ls` always carries `as_of`.
+
+### `wickd earnings headlines` — the results, the same day
+
+The headlines that state a report's results, from the broker's news feed
+(the same keys as `wickd quote`). A wire headline with the EPS, the sales
+figure and the beat or miss is usually out within minutes of a report, where
+the reported-figures table below runs a day or two behind.
+
+```sh
+wickd earnings headlines NVDA                              # the report on the slate, or the latest stored one
+wickd earnings headlines HD --date 2026-11-17 --session pre
+wickd earnings headlines NVDA --all                        # + every headline scanned, with its score
+```
+
+- It reads the headlines published from the moment the report could be out
+  (4:00 AM Eastern for a before-the-open report, the 4:00 PM close for an
+  after-the-close one) for about a day, oldest first, and keeps the few that
+  state the results: the figures line first, then guidance. Previews, analyst
+  notes and unrelated news are left out.
+- Picking is by what a headline says, not by a fixed format, and a headline
+  is shown as published. Nothing is extracted from it, so a wrong pick is a
+  visible wrong headline, never a wrong number. `--all` shows what was
+  scanned and how each scored, for checking the picking.
+- The picked headlines are stored under `~/.wickd/earnings/headlines/`, one
+  file per report, and `slate ls` carries them as `headlines`. A later fetch
+  that picks nothing keeps what is stored.
+- Exit 2 means no or rejected Alpaca keys; exit 4 a bad symbol, or no report
+  found for it (give `--date`).
 
 ### `wickd earnings results` — what was actually reported
 

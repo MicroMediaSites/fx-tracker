@@ -431,6 +431,42 @@ impl AlpacaClient {
             .await?;
         Ok(r.news)
     }
+
+    /// Headlines for `symbols` published from `start` up to `end`, **oldest
+    /// first**: the first `limit` (at most 50) after `start`. Unlike
+    /// [`Self::news`], which returns the newest and so can't reach back past
+    /// a busy stock's latest fifty, this finds what was published right
+    /// after a moment in the past (an earnings report).
+    pub async fn news_window(
+        &self,
+        symbols: &[String],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<NewsItem>, AlpacaError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            news: Vec<NewsItem>,
+        }
+        if symbols.is_empty() || end <= start {
+            return Ok(Vec::new());
+        }
+        let url = format!("{}/v1beta1/news", self.data_base);
+        let r: Resp = self
+            .get(
+                &url,
+                &[
+                    ("symbols", symbols.join(",")),
+                    ("start", start.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                    ("end", end.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                    ("limit", limit.clamp(1, 50).to_string()),
+                    ("sort", "asc".to_string()),
+                ],
+            )
+            .await?;
+        Ok(r.news)
+    }
 }
 
 /// Top movers for the session.

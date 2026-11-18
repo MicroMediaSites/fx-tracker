@@ -82,6 +82,8 @@ enum Request {
     Earnings(std::path::PathBuf, Vec<chrono::NaiveDate>),
     /// Work out how these stocks reacted to their reports.
     Reactions(Vec<calendar::ReactionAsk>),
+    /// Fetch and store the results headlines for these reports.
+    Headlines(std::path::PathBuf, Vec<calendar::ReactionAsk>),
     /// Fetch what these companies reported into the results folder.
     Results(std::path::PathBuf, Vec<String>),
 }
@@ -103,6 +105,7 @@ enum Reply {
     Info(String, Result<crate::info::SymbolInfo, String>),
     Earnings(Result<Vec<wickd_core::earnings_store::DayOutcome>, String>),
     Results(Result<Vec<wickd_core::earnings_results::ResultOutcome>, String>),
+    Headlines((usize, usize, Option<String>)),
     Reactions(
         Result<
             Vec<(
@@ -238,6 +241,9 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                     Request::Reactions(asks) => {
                         Reply::Reactions(calendar::fetch_reactions(&client, asks, Utc::now()).await)
                     }
+                    Request::Headlines(dir, asks) => Reply::Headlines(
+                        calendar::fetch_headlines(&client, &dir, asks, Utc::now()).await,
+                    ),
                     Request::Results(dir, symbols) => {
                         use wickd_core::earnings_results as er;
                         Reply::Results(match wickd_core::earnings_store::http_client() {
@@ -562,6 +568,7 @@ fn run_loop(
                 Reply::Earnings(r) => actions.extend(app.set_earnings_fetch(r)),
                 Reply::Reactions(r) => app.set_reactions(r),
                 Reply::Results(r) => app.set_results(r),
+                Reply::Headlines(r) => app.set_headlines(Ok(r)),
                 Reply::Live(live::LiveEvent::Connected(up)) => app.fx_live = up,
                 Reply::Live(live::LiveEvent::Quote(q)) => app.apply_tick(q),
                 Reply::FxAssets(r) => match r {
@@ -737,6 +744,13 @@ fn run_loop(
                 Action::FetchInPlay => send(Request::InPlay(app.watchlist.clone())),
                 Action::FetchNews(s) => send(Request::News(s)),
                 Action::FetchReactions(asks) => send(Request::Reactions(asks)),
+                Action::FetchHeadlines(asks) => match app.calendar.earn_dir.as_deref() {
+                    Some(dir) => send(Request::Headlines(
+                        wickd_core::earnings_headlines::headlines_dir(dir),
+                        asks,
+                    )),
+                    None => app.set_headlines(Err("couldn't find the wickd data folder".into())),
+                },
                 Action::FetchResults(symbols) => match app.calendar.earn_dir.as_deref() {
                     Some(dir) => send(Request::Results(
                         wickd_core::earnings_results::results_dir(dir),

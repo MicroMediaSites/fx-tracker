@@ -46,6 +46,7 @@ use rust_decimal::Decimal;
 
 use wickd_core::backtest::surprise::impact_rank;
 use wickd_core::calendar_store::{self, CalendarEvent};
+use wickd_core::earnings_headlines::{self, Headline, HeadlinesFile};
 use wickd_core::earnings_reaction::{earliest_reaction_day, Reaction};
 use wickd_core::earnings_results::{self, ResultOutcome, ResultRow, ResultsFile};
 use wickd_core::earnings_store::{self, clean_text, DayFile, DayOutcome, Session};
@@ -611,6 +612,18 @@ pub struct CalendarState {
     pub reactions_loading: bool,
     /// Why the last reaction fetch failed (rows simply show no figures).
     pub reactions_error: Option<String>,
+    /// The results headlines stored for each watched report that is out, by
+    /// symbol and report date.
+    pub headlines: HashMap<(String, NaiveDate), HeadlinesFile>,
+    /// A headlines fetch is in flight.
+    pub headlines_loading: bool,
+    /// Why the last headlines fetch fell short.
+    pub headlines_error: Option<String>,
+    /// When each report's headlines were last asked for.
+    headlines_tried: HashMap<(String, NaiveDate), Instant>,
+    /// Set by `r` until everything it started has come back: what was
+    /// already known then, so the screen can say what came in.
+    pub updating: Option<HashSet<String>>,
     /// What each watched company that has reported actually reported, as
     /// stored (by symbol).
     pub reported: HashMap<String, ResultsFile>,
@@ -659,6 +672,11 @@ impl CalendarState {
             reactions: HashMap::new(),
             reactions_loading: false,
             reactions_error: None,
+            headlines: HashMap::new(),
+            headlines_loading: false,
+            headlines_error: None,
+            headlines_tried: HashMap::new(),
+            updating: None,
             reported: HashMap::new(),
             results_loading: false,
             results_error: None,
@@ -768,6 +786,25 @@ impl CalendarState {
         });
         // Reactions for reports that have left the screen are dropped.
         self.reactions.retain(|(_, date), _| *date >= start);
+        // The results headlines stored for the watched reports that are out
+        // (disk).
+        self.headlines.clear();
+        if let Some(dir) = self
+            .earn_dir
+            .as_deref()
+            .map(earnings_headlines::headlines_dir)
+        {
+            for row in &self.rows {
+                let Row::Earn(e) = row else { continue };
+                if !(e.slate || e.listed) || !e.past {
+                    continue;
+                }
+                if let Ok(Some(file)) = earnings_headlines::read_headlines(&dir, &e.symbol, e.date)
+                {
+                    self.headlines.insert((e.symbol.clone(), e.date), file);
+                }
+            }
+        }
         // What the watched companies that have reported did report (disk).
         self.reported.clear();
         if let Some(dir) = self.earn_dir.as_deref().map(earnings_results::results_dir) {
@@ -912,6 +949,116 @@ impl CalendarState {
         crate::slate::update_at(path, |f| Ok(crate::slate::remove(f, &[symbol.to_string()])))
             .map(|_| ())
             .map_err(|e| format!("{e:#}"))
+    }
+
+    /// The results headlines for a row's report, when any are stored.
+    pub fn headlines_of(&self, e: &EarnRow) -> &[Headline] {
+        self.headlines
+            .get(&(e.symbol.clone(), e.date))
+            .map_or(&[], |f| &f.picked[..])
+    }
+
+    /// The watched reports that are out and have no results headline
+    /// stored: the ones worth asking the news feed about. Unless `force`d
+    /// (the `r` key), a report asked about in the last half hour is left
+    /// alone.
+    pub fn headlines_wanted(&self, force: bool) -> Vec<ReactionAsk> {
+        let mut out: Vec<ReactionAsk> = Vec::new();
+        for row in &self.rows {
+            let Row::Earn(e) = row else { continue };
+            if !(e.slate || e.listed) || !e.past || !self.headlines_of(e).is_empty() {
+                continue;
+            }
+            let key = (e.symbol.clone(), e.date);
+            let recently = self
+                .headlines_tried
+                .get(&key)
+                .is_some_and(|t| t.elapsed() < RESULTS_RETRY);
+            if (force || !recently) && !out.iter().any(|(s, d, _)| *s == key.0 && *d == key.1) {
+                out.push((e.symbol.clone(), e.date, e.session));
+            }
+        }
+        out
+    }
+
+    /// Mark a headlines fetch as started for `asks`.
+    pub fn headlines_started(&mut self, asks: &[ReactionAsk]) {
+        self.headlines_loading = true;
+        let now = Instant::now();
+        for (s, d, _) in asks {
+            self.headlines_tried.insert((s.clone(), *d), now);
+        }
+    }
+
+    /// Take a finished headlines fetch (`failed` = how many reports
+    /// couldn't be fetched, with the first reason), then re-read the store.
+    pub fn headlines_finished(
+        &mut self,
+        result: Result<(usize, usize, Option<String>), String>,
+        listed: &HashSet<String>,
+    ) {
+        self.headlines_loading = false;
+        self.headlines_error = match result {
+            Err(e) => Some(format!("couldn't fetch headlines: {e}")),
+            Ok((_, 0, _)) => None,
+            Ok((asked, failed, first)) => Some(format!(
+                "couldn't fetch headlines for {failed} of {asked} reports ({})",
+                first.as_deref().unwrap_or("unknown error")
+            )),
+        };
+        self.reload(listed);
+    }
+
+    /// Everything known about the watched reports right now, one key per
+    /// kind of thing per company: used to say what an update brought in.
+    pub fn known(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for row in &self.rows {
+            let Row::Earn(e) = row else { continue };
+            if !(e.slate || e.listed) {
+                continue;
+            }
+            if !self.headlines_of(e).is_empty() {
+                out.insert(format!("{} headlines", e.symbol));
+            }
+            if self.reported_of(e).is_some() {
+                out.insert(format!("{} figures", e.symbol));
+            }
+            if self.reaction_of(e).is_some() {
+                out.insert(format!("{} reaction", e.symbol));
+            }
+        }
+        out
+    }
+
+    /// Whether anything an update started is still out.
+    pub fn busy(&self) -> bool {
+        self.loading || self.reactions_loading || self.results_loading || self.headlines_loading
+    }
+
+    /// If an update (`r`) has fully come back, end it and say what it
+    /// brought in: the companies with something new, in screen order.
+    pub fn take_update_summary(&mut self) -> Option<String> {
+        if self.busy() {
+            return None;
+        }
+        let before = self.updating.take()?;
+        let now = self.known();
+        let mut new: Vec<String> = Vec::new();
+        for row in &self.rows {
+            let Row::Earn(e) = row else { continue };
+            let gained = now
+                .iter()
+                .any(|k| k.starts_with(&format!("{} ", e.symbol)) && !before.contains(k));
+            if gained && !new.contains(&e.symbol) {
+                new.push(e.symbol.clone());
+            }
+        }
+        Some(if new.is_empty() {
+            "Updated. Nothing new came in.".into()
+        } else {
+            format!("Updated. New for {}.", new.join(", "))
+        })
     }
 
     /// The watched companies whose report is out and whose reported figures
@@ -1081,6 +1228,38 @@ fn row_key(r: &Row) -> (u8, String, String) {
 
 fn file_mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// Fetch and store the results headlines for each of `asks` (one request
+/// per report: the feed returns the newest or the oldest fifty for all the
+/// symbols asked together, which would starve the quieter ones). Returns
+/// how many were asked, how many failed, and the first failure's reason.
+pub async fn fetch_headlines(
+    client: &wickd_core::equities::alpaca::AlpacaClient,
+    dir: &Path,
+    asks: Vec<ReactionAsk>,
+    now: DateTime<Utc>,
+) -> (usize, usize, Option<String>) {
+    let asked = asks.len();
+    let mut failed = 0;
+    let mut first: Option<String> = None;
+    for (symbol, date, session) in asks {
+        let r = match earnings_headlines::window(date, session) {
+            Some((start, end)) => client
+                .news_window(std::slice::from_ref(&symbol), start, end.min(now), 50)
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|items| {
+                    earnings_headlines::store_fetch(dir, &symbol, date, &items, now).map(|_| ())
+                }),
+            None => Err(format!("no time window for {symbol} on {date}")),
+        };
+        if let Err(e) = r {
+            failed += 1;
+            first.get_or_insert(e);
+        }
+    }
+    (asked, failed, first)
 }
 
 /// Fetch daily bars for `asks` in one batched request and work out each
