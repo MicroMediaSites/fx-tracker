@@ -79,6 +79,8 @@ pub enum Action {
     FetchNews(String),
     /// Fetch the earnings calendar for these days into the store.
     FetchEarnings(Vec<chrono::NaiveDate>),
+    /// Fetch what these companies reported (EPS against the consensus).
+    FetchResults(Vec<String>),
     /// Fetch how these watched stocks reacted to their reports.
     FetchReactions(Vec<super::calendar::ReactionAsk>),
     /// Put a company on the slate for the report on this date.
@@ -1180,6 +1182,39 @@ impl App {
         Some(Action::FetchReactions(wanted))
     }
 
+    /// Ask what the watched companies that have reported did report, when
+    /// any are missing and no such request is already out. `force` (the `r`
+    /// key) asks even about a company asked about recently.
+    pub fn results_action(&mut self, force: bool) -> Option<Action> {
+        if self.calendar.results_loading {
+            return None;
+        }
+        let wanted = self.calendar.results_wanted(force);
+        if wanted.is_empty() {
+            return None;
+        }
+        self.calendar.results_started(&wanted);
+        Some(Action::FetchResults(wanted))
+    }
+
+    /// The background asks the calendar makes whenever its rows change:
+    /// reactions and reported figures for the watched companies.
+    pub fn calendar_asks(&mut self, force_results: bool) -> Vec<Action> {
+        self.reactions_action()
+            .into_iter()
+            .chain(self.results_action(force_results))
+            .collect()
+    }
+
+    /// A fetch of reported figures finished.
+    pub fn set_results(
+        &mut self,
+        result: Result<Vec<wickd_core::earnings_results::ResultOutcome>, String>,
+    ) {
+        let listed = self.listed_symbols();
+        self.calendar.results_finished(result, &listed);
+    }
+
     /// A reaction fetch finished.
     pub fn set_reactions(
         &mut self,
@@ -1201,7 +1236,7 @@ impl App {
             Err(e) => format!("couldn't update the slate: {e}"),
         });
         self.reload_calendar();
-        self.reactions_action().into_iter().collect()
+        self.calendar_asks(false)
     }
 
     /// `s`: put the company under the cursor on the slate, or take it off.
@@ -1257,7 +1292,7 @@ impl App {
             self.calendar.fetch_started(true);
             actions.push(Action::FetchEarnings(self.calendar.fetch_dates()));
         }
-        actions.extend(self.reactions_action());
+        actions.extend(self.calendar_asks(false));
         actions
     }
 
@@ -1270,7 +1305,7 @@ impl App {
         let listed = self.listed_symbols();
         self.calendar.fetch_finished(result, &listed);
         self.refresh_reports_soon();
-        self.reactions_action().into_iter().collect()
+        self.calendar_asks(false)
     }
 
     /// Re-read which stocks report today or on the next weekday (disk only).
@@ -1342,7 +1377,8 @@ impl App {
                     self.reload_calendar();
                     self.calendar.fetch_started(false);
                     let mut actions = vec![Action::FetchEarnings(self.calendar.fetch_dates())];
-                    actions.extend(self.reactions_action());
+                    // `r` also re-checks the reported figures now.
+                    actions.extend(self.calendar_asks(true));
                     return actions;
                 }
             }

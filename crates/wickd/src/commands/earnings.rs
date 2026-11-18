@@ -18,6 +18,14 @@
 //!
 //! `wickd earnings slate …` (see [`super::slate`]) is the watch list built on
 //! top of this store.
+//!
+//!   wickd earnings results sync NVDA HD      # what they reported (EPS vs consensus)
+//!   wickd earnings results sync --slate      # every company on the slate
+//!   wickd earnings results show NVDA         # stored, no network
+//!
+//! Reported figures come from a second unofficial Nasdaq table, one request
+//! per company, and can lag a report by a day (see
+//! `wickd_core::earnings_results`).
 
 use std::collections::HashSet;
 
@@ -25,6 +33,9 @@ use chrono::{Duration, NaiveDate, Utc};
 use clap::{Args, Subcommand};
 use rust_decimal::Decimal;
 
+use wickd_core::earnings_results::{
+    read_results, results_dir, results_symbol, sync_results, NASDAQ_SURPRISE_URL,
+};
 use wickd_core::earnings_store::{
     earnings_dir, http_client, market_date, read_days, sort_rows, sync_days, weekdays_from,
     DayFile, EarningsRow, NASDAQ_EARNINGS_URL, SOURCE,
@@ -54,6 +65,48 @@ enum EarningsCommand {
     /// what is expected: add | set | rm | ls (`ls --reactions` adds how the
     /// stock reacted).
     Slate(super::slate::SlateArgs),
+    /// What companies actually reported (EPS against the consensus): `sync`
+    /// fetches Nasdaq's per-company table into the store, `show` prints
+    /// what is stored. The source is unofficial and can lag a report by a
+    /// day.
+    Results(ResultsArgs),
+}
+
+#[derive(Args, Debug)]
+struct ResultsArgs {
+    #[command(subcommand)]
+    command: ResultsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ResultsCommand {
+    /// Fetch and store the reported figures for these companies → JSON per
+    /// company.
+    Sync(ResultsSyncArgs),
+    /// Print the stored reported figures for these companies → JSON (no
+    /// network).
+    Show(ResultsShowArgs),
+}
+
+#[derive(Args, Debug)]
+struct ResultsSyncArgs {
+    /// Stock tickers (commas work too).
+    symbols: Vec<String>,
+
+    /// Also every company on the slate.
+    #[arg(long)]
+    slate: bool,
+
+    /// URL template override, `{symbol}` replaced by the ticker (testing).
+    #[arg(long, default_value = NASDAQ_SURPRISE_URL, hide = true)]
+    url: String,
+}
+
+#[derive(Args, Debug)]
+struct ResultsShowArgs {
+    /// Stock tickers (commas work too).
+    #[arg(required = true)]
+    symbols: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -93,7 +146,102 @@ pub async fn run(args: EarningsArgs, out: Out) -> ! {
         EarningsCommand::Sync(a) => sync(a, out).await,
         EarningsCommand::Upcoming(a) => upcoming(a, out),
         EarningsCommand::Slate(a) => super::slate::run(a, out).await,
+        EarningsCommand::Results(a) => match a.command {
+            ResultsCommand::Sync(a) => results_sync(a, out).await,
+            ResultsCommand::Show(a) => results_show(a, out),
+        },
     }
+}
+
+/// The tickers typed on the command line: split on commas, checked,
+/// de-duplicated, in order. A symbol that isn't a plain ticker is refused.
+fn result_tickers(raw: &[String], out: Out) -> Vec<String> {
+    let mut syms: Vec<String> = Vec::new();
+    for s in raw.iter().flat_map(|s| s.split(',')).filter(|s| !s.trim().is_empty()) {
+        match results_symbol(s) {
+            Some(sym) if !syms.contains(&sym) => syms.push(sym),
+            Some(_) => {}
+            None => out.fail(
+                exit::VALIDATION,
+                "earnings_bad_symbol",
+                format!("'{s}' is not a stock ticker"),
+            ),
+        }
+    }
+    syms
+}
+
+async fn results_sync(args: ResultsSyncArgs, out: Out) -> ! {
+    let mut symbols = result_tickers(&args.symbols, out);
+    if args.slate {
+        let slate = crate::slate::slate_path().and_then(|p| crate::slate::load_at(&p));
+        match slate {
+            Ok(file) => {
+                for e in file.entries {
+                    if let Some(sym) = results_symbol(&e.symbol).filter(|s| !symbols.contains(s)) {
+                        symbols.push(sym);
+                    }
+                }
+            }
+            Err(e) => out.fail(exit::GENERIC, "earnings_slate_unreadable", format!("{e:#}")),
+        }
+    }
+    if symbols.is_empty() {
+        out.fail(
+            exit::VALIDATION,
+            "earnings_no_symbols",
+            "give at least one stock ticker, or --slate for every company on the slate",
+        );
+    }
+    let dir = match earnings_dir() {
+        Ok(d) => results_dir(&d),
+        Err(e) => out.fail(exit::GENERIC, "earnings_dir_failed", e),
+    };
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(e) => out.fail(exit::GENERIC, "earnings_client_failed", e),
+    };
+    let outcomes = sync_results(&client, &args.url, &dir, &symbols).await;
+    let failed = outcomes.iter().filter(|o| !o.ok()).count();
+    if every_day_failed(outcomes.len(), failed) {
+        let first = outcomes
+            .first()
+            .and_then(|o| o.error.clone())
+            .unwrap_or_else(|| "unknown error".into());
+        out.fail(
+            exit::GENERIC,
+            "earnings_results_failed",
+            format!("no company's results could be fetched ({failed} tried); stored results are unchanged. First error: {first}"),
+        );
+    }
+    out.ok(&serde_json::json!({
+        "source": SOURCE,
+        "dir": dir.display().to_string(),
+        "requested": outcomes.len(),
+        "failed": failed,
+        "results": outcomes,
+    }));
+    std::process::exit(exit::OK);
+}
+
+fn results_show(args: ResultsShowArgs, out: Out) -> ! {
+    let symbols = result_tickers(&args.symbols, out);
+    let dir = match earnings_dir() {
+        Ok(d) => results_dir(&d),
+        Err(e) => out.fail(exit::GENERIC, "earnings_dir_failed", e),
+    };
+    let mut stored = serde_json::Map::new();
+    for sym in &symbols {
+        match read_results(&dir, sym) {
+            // `null` = nothing stored for it (run `results sync`).
+            Ok(file) => {
+                stored.insert(sym.clone(), serde_json::to_value(file).unwrap_or_default());
+            }
+            Err(e) => out.fail(exit::GENERIC, "earnings_results_unreadable", e),
+        }
+    }
+    out.ok(&serde_json::json!({ "results": stored }));
+    std::process::exit(exit::OK);
 }
 
 fn check_days(days: u32, out: Out) {

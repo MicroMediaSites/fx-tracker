@@ -5,6 +5,7 @@
 //!   wickd earnings slate add INTU ROST                  # dates come from the earnings store
 //!   wickd earnings slate add XYZ --date 2026-12-02 --session post
 //!   wickd earnings slate set WMT --expect-file notes.txt
+//!   wickd earnings slate set WMT --result "Beat and raised; margins the worry."   # after the report
 //!   wickd earnings slate rm ROST
 //!   wickd earnings slate ls                             # soonest report first (no network)
 //!   wickd earnings slate ls --reactions                 # + how each reacted (Alpaca daily bars)
@@ -24,6 +25,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use wickd_core::earnings_reaction::{reaction, Reaction, VOLUME_SESSIONS};
+use wickd_core::earnings_results::{read_results, results_dir, ResultRow};
 use wickd_core::earnings_store::{earnings_dir, market_date, Session};
 use wickd_core::equities::alpaca::{AlpacaClient, AlpacaError, QuoteFeed};
 use wickd_core::equities::Bar;
@@ -46,7 +48,7 @@ enum SlateCommand {
     /// replaces only the fields given.
     Add(AddArgs),
     /// Change fields of an entry already on the slate. What isn't given is
-    /// kept; an empty `--why` or `--expect` clears it.
+    /// kept; an empty `--why`, `--expect` or `--result` clears it.
     Set(SetArgs),
     /// Take companies off the slate.
     Rm(RmArgs),
@@ -87,6 +89,13 @@ struct Fields {
     /// Read the expectation from a file (`-` = stdin), for several lines.
     #[arg(long, value_name = "PATH|-")]
     expect_file: Option<String>,
+    /// What was reported and what mattered, written after the report: free
+    /// text.
+    #[arg(long, conflicts_with = "result_file")]
+    result: Option<String>,
+    /// Read the result from a file (`-` = stdin), for several lines.
+    #[arg(long, value_name = "PATH|-")]
+    result_file: Option<String>,
     /// The report's date, when the earnings store doesn't have it (or has
     /// it wrong).
     #[arg(long, value_name = "YYYY-MM-DD")]
@@ -98,14 +107,18 @@ struct Fields {
 
 impl Fields {
     fn change(self) -> Result<Change> {
-        let expect = match (self.expect, self.expect_file) {
-            (Some(e), _) => Some(e),
-            (None, Some(path)) => Some(read_text(&path)?),
-            (None, None) => None,
-        };
+        let text =
+            |inline: Option<String>, file: Option<String>, flag: &str| -> Result<Option<String>> {
+                Ok(match (inline, file) {
+                    (Some(t), _) => Some(t),
+                    (None, Some(path)) => Some(read_text(flag, &path)?),
+                    (None, None) => None,
+                })
+            };
         Change {
             why: self.why,
-            expect,
+            expect: text(self.expect, self.expect_file, "--expect-file")?,
+            result: text(self.result, self.result_file, "--result-file")?,
             date: self.date,
             session: self.session.map(Session::from),
         }
@@ -113,9 +126,9 @@ impl Fields {
     }
 }
 
-/// Read `--expect-file` (`-` = stdin), capped well above the stored limit so
-/// a wrong path can't pull a huge file into memory.
-fn read_text(path: &str) -> Result<String> {
+/// Read a text file named by `flag` (`-` = stdin), capped well above the
+/// stored limit so a wrong path can't pull a huge file into memory.
+fn read_text(flag: &str, path: &str) -> Result<String> {
     use std::io::Read;
     const CAP: u64 = 64 * 1024;
     let mut buf = String::new();
@@ -124,11 +137,9 @@ fn read_text(path: &str) -> Result<String> {
     } else {
         std::fs::File::open(path).and_then(|f| f.take(CAP + 1).read_to_string(&mut buf))
     };
-    read.map_err(|e| ValidationError(format!("--expect-file {path}: {e}")))?;
+    read.map_err(|e| ValidationError(format!("{flag} {path}: {e}")))?;
     if buf.len() as u64 > CAP {
-        return Err(
-            ValidationError(format!("--expect-file {path}: more than {} KB", CAP / 1024)).into(),
-        );
+        return Err(ValidationError(format!("{flag} {path}: more than {} KB", CAP / 1024)).into());
     }
     Ok(buf)
 }
@@ -241,7 +252,7 @@ fn set(args: SetArgs) -> Result<serde_json::Value> {
     let change = args.fields.change()?;
     if change.is_empty() {
         return Err(ValidationError(
-            "nothing to change: give --why, --expect, --expect-file, --date or --session".into(),
+            "nothing to change: give --why, --expect, --result (or their -file forms), --date or --session".into(),
         )
         .into());
     }
@@ -256,13 +267,27 @@ fn rm(args: RmArgs) -> Result<serde_json::Value> {
     Ok(serde_json::json!({ "removed": removed, "not_on_slate": not_on_slate }))
 }
 
-/// A slate entry with how the stock reacted, when that is known.
+/// A slate entry with what it reported and how the stock reacted, when
+/// those are known.
 #[derive(Debug, Serialize)]
 struct Listed {
     #[serde(flatten)]
     entry: Entry,
+    /// The stored reported figures for this report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reported: Option<ResultRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reaction: Option<Reaction>,
+}
+
+/// The stored reported figures for `entry`'s report (disk only; none when
+/// the results feed hasn't caught up, or nothing is stored).
+fn reported_for(results: Option<&std::path::Path>, entry: &Entry) -> Option<ResultRow> {
+    read_results(results?, &entry.symbol)
+        .ok()
+        .flatten()?
+        .for_report(entry.date)
+        .cloned()
 }
 
 /// Each entry with its reaction from `bars` (none when its reaction day
@@ -270,6 +295,7 @@ struct Listed {
 fn with_reactions(
     entries: Vec<Entry>,
     bars: &HashMap<String, Vec<Bar>>,
+    results: Option<&std::path::Path>,
     now: DateTime<Utc>,
 ) -> Vec<Listed> {
     entries
@@ -278,7 +304,12 @@ fn with_reactions(
             let reaction = bars
                 .get(&entry.symbol)
                 .and_then(|b| reaction(b, entry.date, entry.session, now));
-            Listed { entry, reaction }
+            let reported = reported_for(results, &entry);
+            Listed {
+                entry,
+                reported,
+                reaction,
+            }
         })
         .collect()
 }
@@ -301,8 +332,10 @@ async fn ls(args: LsArgs, out: Out) -> Result<serde_json::Value> {
     let now = Utc::now();
     let today = market_date(now);
     let entries = slate::ordered(&file, today, args.all);
+    let results = earnings_dir().ok().map(|d| results_dir(&d));
     if !args.reactions {
-        return Ok(serde_json::json!({ "count": entries.len(), "as_of": now, "entries": entries }));
+        let listed = with_reactions(entries, &HashMap::new(), results.as_deref(), now);
+        return Ok(serde_json::json!({ "count": listed.len(), "as_of": now, "entries": listed }));
     }
     // Only entries whose report day has come can have reacted.
     let due: Vec<String> = entries
@@ -337,7 +370,7 @@ async fn ls(args: LsArgs, out: Out) -> Result<serde_json::Value> {
         }
     };
     let no_bars: Vec<&String> = due.iter().filter(|s| !bars.contains_key(*s)).collect();
-    let listed = with_reactions(entries, &bars, now);
+    let listed = with_reactions(entries, &bars, results.as_deref(), now);
     Ok(serde_json::json!({
         "count": listed.len(),
         "as_of": now,
@@ -361,6 +394,7 @@ mod tests {
             session,
             why: None,
             expect: None,
+            result: None,
             added: "2026-11-15T03:00:00Z".parse().unwrap(),
         }
     }
@@ -402,6 +436,24 @@ mod tests {
                 bar("2026-11-17", 335.0, 339.0, 9_000_000.0),
             ],
         );
+        // HD's reported figures are stored; the others have none.
+        let results = tempfile::tempdir().unwrap();
+        wickd_core::earnings_results::write_results(
+            results.path(),
+            &wickd_core::earnings_results::ResultsFile {
+                symbol: "HD".into(),
+                fetched_at: now,
+                source: "nasdaq".into(),
+                rows: vec![ResultRow {
+                    fiscal_quarter: "Oct 2026".into(),
+                    reported: d("2026-11-17"),
+                    eps: Some(rust_decimal_macros::dec!(3.74)),
+                    consensus: Some(rust_decimal_macros::dec!(3.86)),
+                    surprise_pct: Some(rust_decimal_macros::dec!(-3.11)),
+                }],
+            },
+        )
+        .unwrap();
         let listed = with_reactions(
             vec![
                 entry("HD", "2026-11-17", Session::PreMarket),
@@ -411,6 +463,7 @@ mod tests {
                 entry("ZZZ", "2026-11-17", Session::PreMarket),
             ],
             &bars,
+            Some(results.path()),
             now,
         );
         let hd = listed[0].reaction.as_ref().unwrap();
@@ -418,8 +471,16 @@ mod tests {
         assert!((hd.gap_pct - (335.0 - 347.5) / 347.5 * 100.0).abs() < 1e-9);
         assert!(hd.complete);
         assert!(listed[1].reaction.is_none() && listed[2].reaction.is_none());
-        // The JSON carries the entry's own fields at the top level.
+        // The reported figures ride along, matched by report date.
+        assert_eq!(
+            listed[0].reported.as_ref().and_then(|r| r.eps),
+            Some(rust_decimal_macros::dec!(3.74))
+        );
+        assert!(listed[1].reported.is_none() && listed[2].reported.is_none());
+        // The JSON carries the entry's own fields at the top level, with
+        // the reported figures and the reaction beside them.
         let json = serde_json::to_value(&listed[0]).unwrap();
+        assert_eq!(json["reported"]["consensus"], "3.86");
         assert_eq!(json["symbol"], "HD");
         assert_eq!(json["session"], "pre_market");
         assert!(json["reaction"]["gap_pct"].is_number());
@@ -445,6 +506,51 @@ mod tests {
         );
         // An empty slate asks from about six weeks back, not from the epoch.
         assert!((now - bars_start(&[], now)).num_days() < 60);
+    }
+
+    #[test]
+    fn the_text_flags_parse_and_only_a_field_and_its_own_file_conflict() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct Cli {
+            #[command(flatten)]
+            fields: Fields,
+        }
+        let parse = |args: &[&str]| Cli::try_parse_from([&["slate"], args].concat());
+        // Different fields from different files: fine.
+        let ok = parse(&["--expect-file", "e.txt", "--result-file", "r.txt"]).unwrap();
+        assert_eq!(
+            (
+                ok.fields.expect_file.as_deref(),
+                ok.fields.result_file.as_deref()
+            ),
+            (Some("e.txt"), Some("r.txt"))
+        );
+        assert!(parse(&["--expect", "x", "--result", "y", "--date", "2026-11-19"]).is_ok());
+        // The same field given twice over is refused.
+        assert!(parse(&["--result", "x", "--result-file", "r.txt"]).is_err());
+        assert!(parse(&["--expect", "x", "--expect-file", "e.txt"]).is_err());
+        // Each flag's help is its own.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let help = |name: &str| {
+            cmd.get_arguments()
+                .find(|a| a.get_long() == Some(name))
+                .and_then(|a| a.get_help())
+                .map(|h| h.to_string())
+                .unwrap_or_default()
+        };
+        assert!(
+            help("date").starts_with("The report's date"),
+            "{}",
+            help("date")
+        );
+        assert!(
+            help("result").starts_with("What was reported"),
+            "{}",
+            help("result")
+        );
+        assert!(!help("result").contains("date"), "{}", help("result"));
     }
 
     #[test]
