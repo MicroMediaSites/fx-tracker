@@ -201,7 +201,7 @@ impl InPlayState {
     pub fn step_pin(&mut self, forward: bool) -> Result<Action, String> {
         let selected = self.selected_symbol();
         let Some(pin) = self.reader_pin.as_mut() else {
-            return Err("no article open".into());
+            return Err("no headline list to page through".into());
         };
         if pin.items.is_empty() {
             return Err("headlines unavailable".into());
@@ -1400,6 +1400,20 @@ impl App {
                     .into(),
                 );
             }
+            Cmd::GoSource => match self.calendar.selected_source() {
+                Some((url, label)) => {
+                    // The window now shows a release, not an in-play
+                    // headline list: its prev/next keys have nothing to page.
+                    self.inplay.reader_pin = None;
+                    return vec![Action::ReaderShow { url, label }];
+                }
+                None => {
+                    self.flash = Some(match self.calendar.selected_symbol() {
+                        Some(sym) => format!("no source article stored for {sym}'s report yet"),
+                        None => "only a company's row has a source article".into(),
+                    });
+                }
+            },
             Cmd::Open => match self.calendar.selected_symbol().map(str::to_string) {
                 Some(sym) => return self.open_detail(sym, Mode::Calendar),
                 None => {
@@ -3193,7 +3207,7 @@ mod tests {
         a.inplay.reader_pin = None;
         assert_eq!(
             a.set_reader(ReaderEvent::Nav(NavDir::Next)),
-            vec![Action::ReaderNotice("no article open".into())]
+            vec![Action::ReaderNotice("no headline list to page through".into())]
         );
     }
 

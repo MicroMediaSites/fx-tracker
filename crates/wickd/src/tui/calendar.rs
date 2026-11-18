@@ -1172,6 +1172,21 @@ impl CalendarState {
     }
 
     /// The earnings row under the cursor.
+    /// The source article for the selected report (`g a` / `g s`): the
+    /// best stored headline that carries the release's figures and a link,
+    /// else the best one with a link. Returns `(url, badge label)`.
+    pub fn selected_source(&self) -> Option<(String, String)> {
+        let e = self.selected_earn()?;
+        let heads = self.headlines_of(e);
+        let linked = |h: &&Headline| h.url.as_deref().is_some_and(|u| !u.trim().is_empty());
+        let best = heads
+            .iter()
+            .filter(linked)
+            .find(|h| !h.lede.is_empty())
+            .or_else(|| heads.iter().find(linked))?;
+        Some((best.url.clone()?, format!("{} · {}", e.symbol, best.headline)))
+    }
+
     pub fn selected_earn(&self) -> Option<&EarnRow> {
         match self.rows.get(self.selected) {
             Some(Row::Earn(e)) => Some(e),
@@ -2252,5 +2267,79 @@ mod tests {
             Some("couldn't find the wickd data folder")
         );
         assert!(!s.needs_fetch());
+    }
+
+    #[test]
+    fn source_article_is_the_linked_release_with_figures() {
+        let date = d("2026-11-17");
+        let mut s = CalendarState::new(None, None, None);
+        s.rows = vec![
+            Row::Day("Tue Nov 17".into()),
+            Row::Earn(EarnRow {
+                symbol: "NVDA".into(),
+                name: "NVIDIA".into(),
+                date,
+                session: Session::AfterHours,
+                eps_forecast: None,
+                last_year_eps: None,
+                market_cap: None,
+                listed: true,
+                slate: true,
+                why: None,
+                expect: None,
+                result: None,
+                past: true,
+            }),
+        ];
+        s.selected = 1;
+        // Nothing stored yet: no source.
+        assert_eq!(s.selected_source(), None);
+        let head = |h: &str, url: Option<&str>, lede: bool| Headline {
+            time: Utc::now(),
+            headline: h.into(),
+            source: String::new(),
+            url: url.map(str::to_string),
+            lede: if lede {
+                vec!["revenue $115.8 billion".into()]
+            } else {
+                vec![]
+            },
+        };
+        let file = |picked| HeadlinesFile {
+            symbol: "NVDA".into(),
+            date,
+            fetched_at: Utc::now(),
+            scanned: 3,
+            picked,
+        };
+        // A link-less headline with figures is passed over; the linked
+        // release with figures beats a linked one without.
+        s.headlines.insert(
+            ("NVDA".into(), date),
+            file(vec![
+                head("no link", None, true),
+                head("wire", Some("https://x/wire"), false),
+                head("release", Some("https://x/release"), true),
+            ]),
+        );
+        assert_eq!(
+            s.selected_source(),
+            Some(("https://x/release".into(), "NVDA · release".into()))
+        );
+        // Without any figures, the best linked headline is the source.
+        s.headlines.insert(
+            ("NVDA".into(), date),
+            file(vec![
+                head("no link", None, false),
+                head("wire", Some("https://x/wire"), false),
+            ]),
+        );
+        assert_eq!(
+            s.selected_source(),
+            Some(("https://x/wire".into(), "NVDA · wire".into()))
+        );
+        // The day heading has no source.
+        s.selected = 0;
+        assert_eq!(s.selected_source(), None);
     }
 }
