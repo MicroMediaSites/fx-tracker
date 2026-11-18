@@ -49,6 +49,7 @@ mod pending {
 mod prompt;
 mod risk;
 mod signal_alert;
+mod slate;
 mod sink;
 mod spread_stats;
 /// Shim: the socket-hub server moved to wickd-core (AGT-652) so the desktop

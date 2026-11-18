@@ -325,6 +325,56 @@ fetched yet" can be told apart. `--min-cap` leaves out companies with no
 market value; `--lists` and `--symbols` together keep the union. Exit 4
 means `--days` was over 60.
 
+### `wickd earnings slate` — the companies you're watching
+
+The slate is a short list of companies picked ahead of their reports, each
+with why it was picked and what is expected, written **before** it reports.
+It is for watching, then reacting: an entry is never a reason to buy ahead
+of a report. Stored in `~/.wickd/slate.json`; safe to write from an agent
+while the TUI is open (locked read-modify-write, atomic replace).
+
+```sh
+wickd earnings slate add WMT --why "reads the consumer" --expect "EPS 0.64 expected. Good: a raised year."
+wickd earnings slate add INTU ROST                    # date and session from the earnings store
+wickd earnings slate add XYZ --date 2026-12-02 --session post
+wickd earnings slate set WMT --expect-file notes.txt  # `-` reads stdin; line breaks kept
+wickd earnings slate rm ROST
+wickd earnings slate ls                               # soonest report first (no network)
+wickd earnings slate ls --reactions                   # + how each stock reacted
+```
+
+- `add` takes the report's date and session from the earnings store (the
+  next stored report from today on). A symbol with no stored report is
+  refused unless you give `--date`; run `wickd earnings sync` first. Re-adding
+  a symbol keeps its place and replaces only the fields you give.
+- `set` changes `--why`, `--expect`, `--date` or `--session`
+  (`pre` | `post` | `unknown`) on one entry. What you don't give is kept; an
+  empty `--why ""` or `--expect ""` clears it.
+- `why` is one line (max 200 characters); `expect` is free text (max 4,000).
+  Longer text is refused, not cut.
+- `ls` leaves out entries whose report is more than 14 days past unless
+  `--all`. Nothing is deleted without `rm`.
+
+`ls --reactions` adds a `reaction` to each entry whose first trading day
+after the report has come, from one batched Alpaca daily-bars request
+(consolidated volume; the same keys as `wickd quote`):
+
+- `day`: the reaction day. The report day for a before-the-open report (and
+  for one with no time given), the next trading day for an after-the-close
+  one.
+- `gap_pct`: the open against the prior close. The jump on the news.
+- `change_pct`: the close against the prior close. The whole first day.
+- `close_in_range`: where the close sat in the day's range, 0 (on the low)
+  to 100 (on the high).
+- `rel_volume`: the day's volume as a multiple of the average of the 20
+  sessions before it.
+- `complete`: false while that day's session is still open, so the figures
+  are "so far" (and `rel_volume` understates the final number).
+
+`no_bars` lists symbols Alpaca returned nothing for. Exit 2 means no or
+rejected Alpaca keys (only with `--reactions`); exit 4 means a bad symbol,
+over-long text, or a symbol that isn't on the slate.
+
 ## `wickd info` — what is this symbol?
 
 ```sh

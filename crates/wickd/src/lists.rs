@@ -47,7 +47,7 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
-fn invalid(msg: String) -> anyhow::Error {
+pub fn invalid(msg: String) -> anyhow::Error {
     ValidationError(msg).into()
 }
 
@@ -183,17 +183,32 @@ pub fn load_at(path: &Path) -> Result<ListsFile> {
 /// Apply `change` to the lists under an exclusive lock and save atomically.
 /// Returns whatever `change` returns.
 pub fn update_at<T>(path: &Path, change: impl FnOnce(&mut ListsFile) -> Result<T>) -> Result<T> {
+    locked_update(path, load_at, change)
+}
+
+/// Read-modify-write a JSON store shared by the CLI and the TUI: take an
+/// exclusive lock on `<path>.lock`, `load` the file, apply `change`, and
+/// replace the file atomically (tmp + rename). Concurrent writers never lose
+/// each other's changes and a crash never leaves a truncated file. Returns
+/// whatever `change` returns; if `change` fails nothing is written.
+pub fn locked_update<F: Serialize, T>(
+    path: &Path,
+    load: impl FnOnce(&Path) -> Result<F>,
+    change: impl FnOnce(&mut F) -> Result<T>,
+) -> Result<T> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
+    let lock_path = path.with_extension("json.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(path.with_extension("json.lock"))
-        .context("opening the lists lock file")?;
-    let _guard = Flock::exclusive(&lock)?;
-    let mut file = load_at(path)?;
+        .open(&lock_path)
+        .with_context(|| format!("opening the lock file {}", lock_path.display()))?;
+    let _guard = Flock::exclusive(&lock)
+        .with_context(|| format!("locking {}", path.display()))?;
+    let mut file = load(path)?;
     let out = change(&mut file)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&file)?)
@@ -210,7 +225,7 @@ impl<'a> Flock<'a> {
         use std::os::unix::io::AsRawFd;
         // SAFETY: flock on a file descriptor we own for the guard's lifetime.
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            bail!("locking lists.json: {}", std::io::Error::last_os_error());
+            bail!("flock failed: {}", std::io::Error::last_os_error());
         }
         Ok(Self(f))
     }
