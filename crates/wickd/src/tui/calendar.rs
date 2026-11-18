@@ -1182,8 +1182,7 @@ impl CalendarState {
             .filter(|h| h.has_link())
             .find(|h| !h.lede.is_empty())
             .or_else(|| heads.iter().find(|h| h.has_link()))?;
-        let url = best.url.clone().unwrap_or_default();
-        Some((url, format!("{} · {}", e.symbol, best.headline)))
+        Some((best.url.clone()?, format!("{} · {}", e.symbol, best.headline)))
     }
 
     /// The earnings row under the cursor.
@@ -1270,6 +1269,7 @@ pub async fn fetch_headlines(
     for (symbol, date, session) in asks {
         let r = earnings_headlines::fetch_report(client, &symbol, date, session, now)
             .await
+            .map_err(|e| e.to_string())
             .and_then(|f| {
                 earnings_headlines::store_fetch_with(dir, &symbol, date, &f.items, &f.ledes, now)
                     .map(|_| ())

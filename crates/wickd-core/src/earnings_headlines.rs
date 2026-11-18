@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::earnings_results::results_symbol;
 use crate::earnings_store::{clean_text, Session};
-use crate::equities::alpaca::{AlpacaClient, NewsItem};
+use crate::equities::alpaca::{AlpacaClient, AlpacaError, NewsItem};
 use crate::equities::eastern_offset_hours;
 
 /// The most headlines kept for one report.
@@ -445,11 +445,10 @@ pub fn pick(items: &[NewsItem]) -> Vec<Headline> {
 /// [`pick`], with the release text read for some items (`ledes`, by item
 /// id) attached to their headlines.
 pub fn pick_with(items: &[NewsItem], ledes: &HashMap<i64, Vec<String>>) -> Vec<Headline> {
-    let scored: Vec<(u32, &NewsItem)> = ranked(items).into_iter().map(|n| (0, n)).collect();
     let mut seen: Vec<String> = Vec::new();
-    scored
+    ranked(items)
         .into_iter()
-        .filter_map(|(_, n)| {
+        .filter_map(|n| {
             let headline = clean_text(&n.headline, MAX_HEADLINE_CHARS);
             // The same headline often runs twice (an update, a repost).
             let key = headline.to_lowercase();
@@ -472,6 +471,16 @@ pub fn pick_with(items: &[NewsItem], ledes: &HashMap<i64, Vec<String>>) -> Vec<H
         })
         .take(MAX_PICKED)
         .collect()
+}
+
+/// Why [`fetch_report`] read nothing. The feed's own error is kept whole so
+/// a caller can tell rejected keys (re-login) from a network blip.
+#[derive(Debug, thiserror::Error)]
+pub enum FetchError {
+    #[error("no time window for {symbol} on {date}")]
+    NoWindow { symbol: String, date: NaiveDate },
+    #[error(transparent)]
+    Feed(#[from] AlpacaError),
 }
 
 /// What [`fetch_report`] read from the feed for one report.
@@ -498,14 +507,15 @@ pub async fn fetch_report(
     date: NaiveDate,
     session: Session,
     now: DateTime<Utc>,
-) -> Result<Fetched, String> {
-    let (start, end) =
-        window(date, session).ok_or_else(|| format!("no time window for {symbol} on {date}"))?;
+) -> Result<Fetched, FetchError> {
+    let (start, end) = window(date, session).ok_or_else(|| FetchError::NoWindow {
+        symbol: symbol.to_string(),
+        date,
+    })?;
     let symbols = [symbol.to_string()];
     let items = client
         .news_window(&symbols, start, end.min(now), 50)
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
     let mut ledes = HashMap::new();
     let mut body_chars = None;
     if let Some(top) = best(&items) {
@@ -964,5 +974,14 @@ mod tests {
         assert!(read_headlines(&dir, "HD", date)
             .unwrap_err()
             .contains("HD_2026-11-17.json"));
+    }
+
+    #[test]
+    fn a_feed_error_keeps_its_kind() {
+        // The CLI maps rejected keys to the auth exit code: the variant must
+        // survive the trip through FetchError, not be flattened to text.
+        let e: FetchError = AlpacaError::Auth("401".into()).into();
+        assert!(matches!(e, FetchError::Feed(AlpacaError::Auth(_))));
+        assert!(e.to_string().contains("rejected the API keys"));
     }
 }

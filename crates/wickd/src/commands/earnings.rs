@@ -231,7 +231,7 @@ fn report_of(
 
 async fn headlines(args: HeadlinesArgs, out: Out) -> ! {
     use wickd_core::earnings_headlines as eh;
-    use wickd_core::equities::alpaca::{AlpacaClient, QuoteFeed};
+    use wickd_core::equities::alpaca::{AlpacaClient, AlpacaError, QuoteFeed};
     let Some(symbol) = results_symbol(&args.symbol) else {
         out.fail(
             exit::VALIDATION,
@@ -276,11 +276,12 @@ async fn headlines(args: HeadlinesArgs, out: Out) -> ! {
     let client = AlpacaClient::new(creds, QuoteFeed::Iex);
     let fetched = match eh::fetch_report(&client, &symbol, date, session, now).await {
         Ok(f) => f,
-        Err(e) => out.fail(
-            exit::GENERIC,
-            "earnings_headlines_failed",
-            format!("{e} (if the keys were rejected, run `wickd alpaca login`)"),
+        Err(eh::FetchError::Feed(AlpacaError::Auth(_))) => out.fail(
+            exit::AUTH,
+            "alpaca_auth",
+            "Alpaca rejected the keys — run `wickd alpaca login`",
         ),
+        Err(e) => out.fail(exit::GENERIC, "earnings_headlines_failed", format!("{e}")),
     };
     let items = &fetched.items;
     let stored = match eh::store_fetch_with(
