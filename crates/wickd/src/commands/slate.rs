@@ -299,14 +299,15 @@ fn bars_start(entries: &[Entry], now: DateTime<Utc>) -> DateTime<Utc> {
 async fn ls(args: LsArgs, out: Out) -> Result<serde_json::Value> {
     let file = slate::load_at(&slate::slate_path()?)?;
     let now = Utc::now();
-    let entries = slate::ordered(&file, market_date(now), args.all);
+    let today = market_date(now);
+    let entries = slate::ordered(&file, today, args.all);
     if !args.reactions {
-        return Ok(serde_json::json!({ "count": entries.len(), "entries": entries }));
+        return Ok(serde_json::json!({ "count": entries.len(), "as_of": now, "entries": entries }));
     }
     // Only entries whose report day has come can have reacted.
     let due: Vec<String> = entries
         .iter()
-        .filter(|e| e.date <= market_date(now))
+        .filter(|e| e.date <= today)
         .map(|e| e.symbol.clone())
         .collect();
     let bars = if due.is_empty() {

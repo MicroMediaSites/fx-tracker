@@ -75,8 +75,11 @@ pub enum Cmd {
     GoInPlay,
     GoJournal,
     GoCalendar,
-    /// Calendar: everything ↔ the important ones.
+    /// Calendar: the watch ↔ everything that reports.
     ToggleAll,
+    /// Calendar: put the company under the cursor on the slate, or take
+    /// it off.
+    ToggleSlate,
     /// Journal: the previous (older) / next (newer) entry.
     EntryOlder,
     EntryNewer,
@@ -272,9 +275,10 @@ pub static BINDINGS: &[Binding] = &[
     bare(
         &[K::Char('a')],
         Cmd::ToggleAll,
-        "everything ↔ important only",
+        "your watch ↔ everything",
         C,
     ),
+    bare(&[K::Char('s')], Cmd::ToggleSlate, "slate: add / remove", C),
     bare(&[K::Right, K::Char('l')], Cmd::FocusRight, "→ headlines", I),
     bare(&[K::Left, K::Char('h')], Cmd::FocusLeft, "← list", I),
     bare(&[K::Left, K::Char('h')], Cmd::CursorLeft, "cursor ←", D),
@@ -821,6 +825,7 @@ mod tests {
         assert_eq!(run(cal, &[c('K')]), vec![Step::Act(Cmd::PageUp, None)]);
         assert_eq!(run(cal, &[K::Enter]), vec![Step::Act(Cmd::Open, None)]);
         assert_eq!(run(cal, &[c('a')]), vec![Step::Act(Cmd::ToggleAll, None)]);
+        assert_eq!(run(cal, &[c('s')]), vec![Step::Act(Cmd::ToggleSlate, None)]);
         assert_eq!(run(cal, &[c('r')]), vec![Step::Act(Cmd::Refresh, None)]);
         for k in [K::Esc, c('q'), K::Backspace] {
             assert_eq!(run(cal, &[k]), vec![Step::Act(Cmd::Back, None)]);

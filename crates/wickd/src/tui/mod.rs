@@ -80,6 +80,8 @@ enum Request {
     Info(String),
     /// Fetch these days of the earnings calendar into this folder.
     Earnings(std::path::PathBuf, Vec<chrono::NaiveDate>),
+    /// Work out how these stocks reacted to their reports.
+    Reactions(Vec<calendar::ReactionAsk>),
 }
 
 /// Results coming back to the run loop.
@@ -98,6 +100,15 @@ enum Reply {
     Live(live::LiveEvent),
     Info(String, Result<crate::info::SymbolInfo, String>),
     Earnings(Result<Vec<wickd_core::earnings_store::DayOutcome>, String>),
+    Reactions(
+        Result<
+            Vec<(
+                calendar::ReactionAsk,
+                wickd_core::earnings_reaction::Reaction,
+            )>,
+            String,
+        >,
+    ),
 }
 
 /// Headline lookback, shared by the list's NEWS column and the side pane so
@@ -220,6 +231,9 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                     }
                     Request::Sparks(syms) if stocks(syms.clone()).is_empty() => {
                         Reply::Sparks(Ok(HashMap::new()))
+                    }
+                    Request::Reactions(asks) => {
+                        Reply::Reactions(calendar::fetch_reactions(&client, asks, Utc::now()).await)
                     }
                     Request::Earnings(dir, dates) => {
                         use wickd_core::earnings_store as es;
@@ -490,6 +504,11 @@ fn run_loop(
     // (disk only) at start and every minute, so the markers follow a sync
     // made elsewhere and the change of day.
     let mut reports_check = Every::new(Duration::from_secs(60));
+    // While the calendar is open: pick up slate edits made by an agent
+    // (every 2s, by modification time), and re-ask for the watched stocks'
+    // reactions every minute so today's figures keep moving.
+    let mut slate_check = Every::new(Duration::from_secs(2));
+    let mut reactions_timer = Every::new(Duration::from_secs(60));
     // Rebuild the in-play list every minute while it's on screen.
     let mut inplay_timer = Every::new(Duration::from_secs(60));
 
@@ -527,7 +546,8 @@ fn run_loop(
                     }
                 }
                 Reply::Info(sym, r) => app.set_info(&sym, r),
-                Reply::Earnings(r) => app.set_earnings_fetch(r),
+                Reply::Earnings(r) => actions.extend(app.set_earnings_fetch(r)),
+                Reply::Reactions(r) => app.set_reactions(r),
                 Reply::Live(live::LiveEvent::Connected(up)) => app.fx_live = up,
                 Reply::Live(live::LiveEvent::Quote(q)) => app.apply_tick(q),
                 Reply::FxAssets(r) => match r {
@@ -628,6 +648,21 @@ fn run_loop(
             inplay_timer.reset();
         }
 
+        if app.mode == Mode::Calendar {
+            if slate_check.due() && app.calendar.slate_changed() {
+                app.reload_calendar();
+                actions.extend(app.reactions_action());
+            }
+            // Opening already asked; `reactions_action` won't ask again while
+            // that request is out.
+            if reactions_timer.due() {
+                actions.extend(app.reactions_action());
+            }
+        } else {
+            slate_check.reset();
+            reactions_timer.reset();
+        }
+
         if app.mode == Mode::Journal {
             if journal_check.due() {
                 app.journal.poll();
@@ -683,11 +718,29 @@ fn run_loop(
                 Action::FetchHistory(s, r) => send(Request::History(s, r)),
                 Action::FetchInPlay => send(Request::InPlay(app.watchlist.clone())),
                 Action::FetchNews(s) => send(Request::News(s)),
+                Action::FetchReactions(asks) => send(Request::Reactions(asks)),
+                Action::SlateAdd {
+                    symbol,
+                    date,
+                    session,
+                } => {
+                    let r = app.calendar.slate_add(&symbol, date, session);
+                    let more = app.slate_written(r.map(|()| format!("{symbol} is on the slate")));
+                    for a in more {
+                        if let Action::FetchReactions(asks) = a {
+                            send(Request::Reactions(asks));
+                        }
+                    }
+                }
+                Action::SlateRemove(symbol) => {
+                    let r = app.calendar.slate_remove(&symbol);
+                    app.slate_written(r.map(|()| format!("{symbol} is off the slate")));
+                }
                 Action::FetchEarnings(dates) => match app.calendar.earn_dir.clone() {
                     Some(dir) => send(Request::Earnings(dir, dates)),
-                    None => app.set_earnings_fetch(Err(
-                        "couldn't find the wickd data folder".into(),
-                    )),
+                    None => {
+                        app.set_earnings_fetch(Err("couldn't find the wickd data folder".into()));
+                    }
                 },
                 Action::SaveWatchlist => {
                     if let Err(e) = store::save_watchlist(&app.watchlist) {

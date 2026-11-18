@@ -79,6 +79,16 @@ pub enum Action {
     FetchNews(String),
     /// Fetch the earnings calendar for these days into the store.
     FetchEarnings(Vec<chrono::NaiveDate>),
+    /// Fetch how these watched stocks reacted to their reports.
+    FetchReactions(Vec<super::calendar::ReactionAsk>),
+    /// Put a company on the slate for the report on this date.
+    SlateAdd {
+        symbol: String,
+        date: chrono::NaiveDate,
+        session: wickd_core::earnings_store::Session,
+    },
+    /// Take a company off the slate.
+    SlateRemove(String),
     Quit,
 }
 
@@ -1151,9 +1161,79 @@ impl App {
             .collect()
     }
 
-    fn reload_calendar(&mut self) {
+    pub fn reload_calendar(&mut self) {
         let listed = self.listed_symbols();
         self.calendar.reload(&listed);
+    }
+
+    /// Ask how the watched stocks reacted, when any report's reaction day
+    /// has come and no such request is already out.
+    pub fn reactions_action(&mut self) -> Option<Action> {
+        if self.calendar.reactions_loading {
+            return None;
+        }
+        let wanted = self.calendar.reactions_wanted();
+        if wanted.is_empty() {
+            return None;
+        }
+        self.calendar.reactions_loading = true;
+        Some(Action::FetchReactions(wanted))
+    }
+
+    /// A reaction fetch finished.
+    pub fn set_reactions(
+        &mut self,
+        result: Result<
+            Vec<(
+                super::calendar::ReactionAsk,
+                wickd_core::earnings_reaction::Reaction,
+            )>,
+            String,
+        >,
+    ) {
+        self.calendar.reactions_finished(result);
+    }
+
+    /// A slate add or remove was written (or failed): say so and re-read.
+    pub fn slate_written(&mut self, result: Result<String, String>) -> Vec<Action> {
+        self.flash = Some(match result {
+            Ok(done) => done,
+            Err(e) => format!("couldn't update the slate: {e}"),
+        });
+        self.reload_calendar();
+        self.reactions_action().into_iter().collect()
+    }
+
+    /// `s`: put the company under the cursor on the slate, or take it off.
+    /// An entry with a why or an expectation written on it takes a second
+    /// `s` to remove: that text can't be brought back.
+    fn toggle_slate(&mut self) -> Vec<Action> {
+        let Some(e) = self.calendar.selected_earn().cloned() else {
+            self.calendar.pending_remove = None;
+            if !self.calendar.rows.is_empty() {
+                self.flash = Some("only a company's row goes on the slate".into());
+            }
+            return vec![];
+        };
+        if !e.slate {
+            self.calendar.pending_remove = None;
+            return vec![Action::SlateAdd {
+                symbol: e.symbol,
+                date: e.date,
+                session: e.session,
+            }];
+        }
+        let has_text = e.why.is_some() || e.expect.is_some();
+        if has_text && self.calendar.pending_remove.as_deref() != Some(e.symbol.as_str()) {
+            self.flash = Some(format!(
+                "{} has notes on the slate; press s again to remove it and them",
+                e.symbol
+            ));
+            self.calendar.pending_remove = Some(e.symbol);
+            return vec![];
+        }
+        self.calendar.pending_remove = None;
+        vec![Action::SlateRemove(e.symbol)]
     }
 
     /// `g c`: the calendar. Shows what is stored at once, and starts a
@@ -1172,21 +1252,25 @@ impl App {
         if arriving {
             self.calendar.go_next_upcoming();
         }
+        let mut actions = Vec::new();
         if self.calendar.needs_fetch() {
             self.calendar.fetch_started(true);
-            return vec![Action::FetchEarnings(self.calendar.fetch_dates())];
+            actions.push(Action::FetchEarnings(self.calendar.fetch_dates()));
         }
-        vec![]
+        actions.extend(self.reactions_action());
+        actions
     }
 
-    /// A background earnings fetch finished.
+    /// A background earnings fetch finished. New reports may have come into
+    /// view, so their reactions are asked for.
     pub fn set_earnings_fetch(
         &mut self,
         result: Result<Vec<wickd_core::earnings_store::DayOutcome>, String>,
-    ) {
+    ) -> Vec<Action> {
         let listed = self.listed_symbols();
         self.calendar.fetch_finished(result, &listed);
         self.refresh_reports_soon();
+        self.reactions_action().into_iter().collect()
     }
 
     /// Re-read which stocks report today or on the next weekday (disk only).
@@ -1199,7 +1283,12 @@ impl App {
 
     fn exec_calendar(&mut self, cmd: Cmd) -> Vec<Action> {
         let page = self.calendar.page.get().saturating_sub(2).max(1) as isize;
+        if cmd != Cmd::ToggleSlate {
+            // Any other key cancels a pending slate removal.
+            self.calendar.pending_remove = None;
+        }
         match cmd {
+            Cmd::ToggleSlate => return self.toggle_slate(),
             Cmd::Back => {
                 // Back to the chart only while it is still open.
                 self.mode = match self.calendar.back_to {
@@ -1229,9 +1318,9 @@ impl App {
                 self.reload_calendar();
                 self.flash = Some(
                     if self.calendar.show_all {
-                        "showing everything"
+                        "showing everything that reports"
                     } else {
-                        "showing the important ones"
+                        "showing your watch"
                     }
                     .into(),
                 );
@@ -1252,7 +1341,9 @@ impl App {
                 } else {
                     self.reload_calendar();
                     self.calendar.fetch_started(false);
-                    return vec![Action::FetchEarnings(self.calendar.fetch_dates())];
+                    let mut actions = vec![Action::FetchEarnings(self.calendar.fetch_dates())];
+                    actions.extend(self.reactions_action());
+                    return actions;
                 }
             }
             _ => {}

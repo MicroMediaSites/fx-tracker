@@ -1,24 +1,41 @@
-//! The calendar screen's state (`g c`): what is coming that can move the
-//! market, for today and the six days after it.
+//! The calendar screen's state (`g c`): the earnings watch.
 //!
-//! Two stores feed it, both read from disk and never blocked on:
+//! The play is post-earnings drift, and it trades the reaction, not the
+//! report. So this screen is not a market calendar. By default it shows only
+//! what was picked ahead of time:
 //!
-//! - **economic events** from `~/.wickd/calendar/` (kept fresh by the
-//!   `com.openthink.wickd-calendar` job; this screen only reads it), shown
-//!   in the machine's local time;
-//! - **earnings** from `~/.wickd/earnings/` ([`wickd_core::earnings_store`]),
-//!   which this screen does refresh: opening it asks for a background fetch
-//!   when a shown weekday has no file or the files are more than six hours
-//!   old ([`CalendarState::needs_fetch`]), and `r` forces one.
+//! - the **slate** ([`crate::slate`]): companies chosen to watch through
+//!   their reports, each with why and what is expected, written before the
+//!   report;
+//! - any **watchlist or list** symbol that reports;
+//! - **high-impact US economic releases**, the few things that move
+//!   everything.
+//!
+//! It looks back three weekdays so a report and the stock's reaction to it
+//! ([`wickd_core::earnings_reaction`]) stay in view, and ahead six days.
+//! `a` switches to browsing everything that reports, to add to the slate
+//! from. Watch, then react: nothing here places a trade.
 //!
 //! Each day is one list of events in time order: a row says whether it is
 //! an economic release or an earnings report, and nothing separates the two.
-//! [`build`] turns the two stores into display rows and is a pure function
-//! of its inputs (the clock and the time zone are passed in), so everything
-//! the screen shows is unit-tested without a terminal or a network.
+//!
+//! Sources, all read from disk and never blocked on:
+//!
+//! - economic events from `~/.wickd/calendar/` (kept fresh by the
+//!   `com.openthink.wickd-calendar` job; this screen only reads it), shown
+//!   in the machine's local time;
+//! - earnings from `~/.wickd/earnings/` ([`wickd_core::earnings_store`]),
+//!   which this screen does refresh: opening it asks for a background fetch
+//!   when a shown weekday has no file or the coming days' files are more
+//!   than six hours old ([`CalendarState::needs_fetch`]), and `r` forces one;
+//! - the slate from `~/.wickd/slate.json`, re-read when the file changes.
+//!
+//! [`build`] turns those into display rows and is a pure function of its
+//! inputs (the clock and the time zone are passed in), so everything the
+//! screen shows is unit-tested without a terminal or a network.
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -29,12 +46,18 @@ use rust_decimal::Decimal;
 
 use wickd_core::backtest::surprise::impact_rank;
 use wickd_core::calendar_store::{self, CalendarEvent};
+use wickd_core::earnings_reaction::{earliest_reaction_day, Reaction};
 use wickd_core::earnings_store::{self, clean_text, DayFile, DayOutcome, Session};
 
 use super::app::Mode;
+use crate::slate::Entry;
 
-/// Days on the screen: today and the six after it.
+/// Days ahead on the screen: today and the six after it.
 pub const DAYS: i64 = 7;
+
+/// Weekdays before today the watch keeps on screen, so a report and the
+/// stock's reaction to it stay in view.
+pub const LOOKBACK_WEEKDAYS: usize = 3;
 
 /// Earnings files older than this are fetched again when the screen opens.
 const STALE_HOURS: i64 = 6;
@@ -43,17 +66,14 @@ const STALE_HOURS: i64 = 6;
 /// that is down isn't asked again on every visit.
 const AUTO_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Companies worth at least this are shown by default ($10 billion).
-pub fn large_cap() -> Decimal {
-    Decimal::from(10_000_000_000u64)
-}
-
 /// The only currency this screen shows: it is a US stock calendar.
 const CURRENCY: &str = "USD";
 
 /// One economic release.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EconRow {
+    /// The local day it falls on.
+    pub date: NaiveDate,
     /// Local time, `6:30 AM`.
     pub time: String,
     /// Already happened.
@@ -69,13 +89,23 @@ pub struct EconRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EarnRow {
     pub symbol: String,
+    /// The company's name; empty for a slate entry the earnings store
+    /// doesn't have.
     pub name: String,
+    /// The report's market date.
+    pub date: NaiveDate,
     pub session: Session,
     pub eps_forecast: Option<Decimal>,
     pub last_year_eps: Option<Decimal>,
     pub market_cap: Option<Decimal>,
     /// On the watchlist or a `wickd list`.
     pub listed: bool,
+    /// On the slate for this report.
+    pub slate: bool,
+    /// The slate's one-line reason.
+    pub why: Option<String>,
+    /// The slate's expectation, written before the report.
+    pub expect: Option<String>,
     /// The report is already out ([`session_passed`]).
     pub past: bool,
 }
@@ -174,10 +204,12 @@ impl Clock {
     }
 }
 
-/// `Today · Wed Nov 18`, `Tomorrow · Thu Nov 19`, then `Fri Nov 20`.
+/// `Yesterday · Tue Nov 17`, `Today · Wed Nov 18`, `Tomorrow · Thu Nov 19`,
+/// and plain `Fri Nov 20` for any other day.
 pub fn day_label(day: NaiveDate, today: NaiveDate) -> String {
     let date = day.format("%a %b %-d");
     match (day - today).num_days() {
+        -1 => format!("Yesterday · {date}"),
         0 => format!("Today · {date}"),
         1 => format!("Tomorrow · {date}"),
         _ => date.to_string(),
@@ -293,30 +325,49 @@ pub struct Inputs<'a> {
     pub econ: &'a [CalendarEvent],
     /// Stored earnings days inside the window.
     pub earnings: &'a [DayFile],
+    /// The slate: companies picked to watch through their reports.
+    pub slate: &'a [Entry],
     /// Symbols on the watchlist or a list.
     pub listed: &'a HashSet<String>,
-    /// Show every impact and every company.
+    /// Browse everything that reports and every US release, instead of the
+    /// watch.
     pub show_all: bool,
+}
+
+/// The first day on screen: [`LOOKBACK_WEEKDAYS`] weekdays before `today`,
+/// so a report and the stock's reaction to it stay in view.
+pub fn watch_start(today: NaiveDate) -> NaiveDate {
+    let mut d = today;
+    let mut back = 0;
+    while back < LOOKBACK_WEEKDAYS {
+        d -= Duration::days(1);
+        if !is_weekend(d) {
+            back += 1;
+        }
+    }
+    d
 }
 
 /// The screen's rows: a heading per day, then everything on that day as one
 /// list in time order, economic releases and earnings together. Each row
 /// says which it is; there are no captions between them.
 ///
+/// **The watch (default).** Only what was picked: companies on the slate,
+/// any watchlist or list symbol that reports, and high-impact US releases.
+/// Nothing is shown because of a company's size. Days with nothing on them
+/// are left out (today always shows), and the days before today show only
+/// the watched companies, so a report and its reaction stay in view.
+///
+/// **Everything (`show_all`).** From today on, every company that reports
+/// and every US release, with notes saying what isn't stored.
+///
 /// Order within a day: reports due before the open, then releases by time
 /// up to the 4:00 PM Eastern close, then reports due after the close, then
-/// any later releases, then reports with no time given. Companies in the
-/// same session run largest first.
-///
-/// By default only US releases of medium impact and up are shown, and only
-/// companies worth [`large_cap`] or more, plus every listed symbol whatever
-/// its size. A weekend day with nothing on it is left out.
+/// any later releases, then reports with no time given. Watched companies
+/// come first within a session, then the rest largest first.
 pub fn build(inp: &Inputs) -> Vec<Row> {
     let now = inp.clock.now();
     let today = inp.clock.today();
-    // Each economic row with its instant and local time. How far the store
-    // reaches (any currency) tells "not published yet" from "nothing
-    // scheduled".
     let econ_all: Vec<(DateTime<Utc>, NaiveDateTime, &CalendarEvent)> = inp
         .econ
         .iter()
@@ -325,32 +376,47 @@ pub fn build(inp: &Inputs) -> Vec<Row> {
             Some((at, inp.clock.local(at), e))
         })
         .collect();
+    // How far the economic store reaches (any currency): a day past it is
+    // "not published yet", not "nothing scheduled".
     let econ_through = econ_all.iter().map(|(_, t, _)| t.date()).max();
 
     let mut rows = Vec::new();
-    for i in 0..DAYS {
-        let day = today + Duration::days(i);
+    if !inp.show_all && inp.slate.is_empty() {
+        rows.push(Row::Note(
+            "Your slate is empty. Press a to browse who reports and s to add a company, or use `wickd earnings slate add`."
+                .into(),
+        ));
+        rows.push(Row::Blank);
+    }
+    let mut unstored = 0usize;
+    let mut day = watch_start(today);
+    let last = today + Duration::days(DAYS - 1);
+    while day <= last {
+        let this = day;
+        day += Duration::days(1);
+        let ahead = this >= today;
+
         let econ: Vec<&(DateTime<Utc>, NaiveDateTime, &CalendarEvent)> = econ_all
             .iter()
             .filter(|(_, t, e)| {
-                t.date() == day
+                ahead
+                    && t.date() == this
                     && e.currency.eq_ignore_ascii_case(CURRENCY)
                     && (inp.show_all
-                        || impact_rank(&e.impact) >= 2
+                        || impact_rank(&e.impact) >= 3
                         || e.impact.eq_ignore_ascii_case("holiday"))
             })
             .collect();
-        let file = inp.earnings.iter().find(|d| d.date == day);
-        let reporting = file.map_or(0, |f| f.rows.len());
-        if is_weekend(day) && econ.is_empty() && reporting == 0 {
-            continue;
+        let file = inp.earnings.iter().find(|d| d.date == this);
+        if ahead && file.is_none() && !is_weekend(this) {
+            unstored += 1;
         }
-        rows.push(Row::Day(day_label(day, today)));
 
-        // (slot in the day, instant, size (largest first), name) → row.
-        type Key = (u8, i64, std::cmp::Reverse<Option<Decimal>>, String);
+        // (slot in the day, instant, watched first, size (largest first),
+        // name) → row.
+        type Key = (u8, i64, bool, std::cmp::Reverse<Option<Decimal>>, String);
         let mut items: Vec<(Key, Row)> = Vec::new();
-        let close = eastern_instant(day, 16, 0);
+        let close = eastern_instant(this, 16, 0);
         for (at, local, e) in &econ {
             let slot = if close.is_some_and(|c| *at >= c) {
                 3
@@ -361,10 +427,12 @@ pub fn build(inp: &Inputs) -> Vec<Row> {
                 (
                     slot,
                     at.timestamp(),
+                    false,
                     std::cmp::Reverse(None),
                     e.event.clone(),
                 ),
                 Row::Econ(EconRow {
+                    date: this,
                     time: clock_text(*local),
                     past: *at < now,
                     impact: e.impact.to_lowercase(),
@@ -374,74 +442,121 @@ pub fn build(inp: &Inputs) -> Vec<Row> {
                 }),
             ));
         }
-        let shown: Vec<&earnings_store::EarningsRow> = file
-            .map(|f| {
-                f.rows
-                    .iter()
-                    .filter(|r| {
-                        inp.show_all
-                            || inp.listed.contains(&r.symbol)
-                            || r.market_cap.is_some_and(|c| c >= large_cap())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        for r in &shown {
-            let slot = match r.session {
+
+        let on_slate = |sym: &str| inp.slate.iter().find(|s| s.symbol == sym && s.date == this);
+        let mut earn = |symbol: &str,
+                        name: &str,
+                        session: Session,
+                        eps: Option<Decimal>,
+                        last_year: Option<Decimal>,
+                        cap: Option<Decimal>| {
+            let pick = on_slate(symbol);
+            let slot = match session {
                 Session::PreMarket => 0,
                 Session::AfterHours => 2,
                 Session::Unknown => 4,
             };
+            let listed = inp.listed.contains(symbol);
             items.push((
-                (slot, 0, std::cmp::Reverse(r.market_cap), r.symbol.clone()),
+                (
+                    slot,
+                    0,
+                    !(pick.is_some() || listed),
+                    std::cmp::Reverse(cap),
+                    symbol.to_string(),
+                ),
                 Row::Earn(EarnRow {
-                    symbol: r.symbol.clone(),
-                    name: r.name.clone(),
-                    session: r.session,
-                    eps_forecast: r.eps_forecast,
-                    last_year_eps: r.last_year_eps,
-                    market_cap: r.market_cap,
-                    listed: inp.listed.contains(&r.symbol),
-                    past: session_passed(day, r.session, now),
+                    symbol: symbol.to_string(),
+                    name: name.to_string(),
+                    date: this,
+                    session,
+                    eps_forecast: eps,
+                    last_year_eps: last_year,
+                    market_cap: cap,
+                    listed,
+                    slate: pick.is_some(),
+                    why: pick.and_then(|p| p.why.clone()),
+                    expect: pick.and_then(|p| p.expect.clone()),
+                    past: session_passed(this, session, now),
                 }),
             ));
+        };
+        let stored = file.map_or(&[][..], |f| &f.rows[..]);
+        let mut shown = 0usize;
+        for r in stored {
+            let watched = on_slate(&r.symbol).is_some() || inp.listed.contains(&r.symbol);
+            if watched || (inp.show_all && ahead) {
+                // The slate's own session wins: it may have been corrected.
+                let session = on_slate(&r.symbol).map_or(r.session, |p| p.session);
+                earn(
+                    &r.symbol,
+                    &r.name,
+                    session,
+                    r.eps_forecast,
+                    r.last_year_eps,
+                    r.market_cap,
+                );
+                shown += 1;
+            }
         }
+        // A slate entry the store doesn't have for this day (dated by hand,
+        // or the day isn't stored) still shows.
+        for p in inp.slate.iter().filter(|p| p.date == this) {
+            if !stored.iter().any(|r| r.symbol == p.symbol) {
+                earn(&p.symbol, "", p.session, None, None, None);
+            }
+        }
+
+        // The watch leaves empty days out; today is always there.
+        if items.is_empty() && !(this == today || (inp.show_all && ahead && !is_weekend(this))) {
+            continue;
+        }
+        if inp.show_all && is_weekend(this) && items.is_empty() {
+            continue;
+        }
+        rows.push(Row::Day(day_label(this, today)));
         items.sort_by(|a, b| a.0.cmp(&b.0));
+        let none = items.is_empty();
         rows.extend(items.into_iter().map(|(_, row)| row));
 
-        // What isn't there, said plainly under the day's events.
-        if econ.is_empty() {
-            rows.push(Row::Note(match econ_through {
-                Some(through) if day <= through => "No US economic releases.".into(),
-                _ => "Economic events for this day aren't published yet (the feed covers the current week).".into(),
-            }));
-        }
-        let plural = |n: usize| if n == 1 { "company" } else { "companies" };
-        match file {
-            None if is_weekend(day) => {}
-            None => rows.push(Row::Note(
-                "No earnings stored for this day yet. Press r to fetch.".into(),
-            )),
-            Some(f) if f.rows.is_empty() => rows.push(Row::Note("No company reports.".into())),
-            Some(f) => {
-                let hidden = f.rows.len() - shown.len();
-                if shown.is_empty() {
-                    rows.push(Row::Note(format!(
-                        "No large company reports. {hidden} smaller {} · a shows everything",
-                        plural(hidden)
-                    )));
-                } else if hidden > 0 {
-                    rows.push(Row::Note(format!(
-                        "+ {hidden} smaller {} · a shows everything",
-                        plural(hidden)
-                    )));
-                }
+        if inp.show_all && ahead {
+            // Browsing: say what isn't there.
+            if econ.is_empty() {
+                rows.push(Row::Note(match econ_through {
+                    Some(through) if this <= through => "No US economic releases.".into(),
+                    _ => "Economic events for this day aren't published yet (the feed covers the current week).".into(),
+                }));
             }
+            match file {
+                None => rows.push(Row::Note(
+                    "No earnings stored for this day yet. Press r to fetch.".into(),
+                )),
+                Some(f) if f.rows.is_empty() => rows.push(Row::Note("No company reports.".into())),
+                Some(_) => {}
+            }
+        } else if none {
+            rows.push(Row::Note("Nothing you're watching.".into()));
+        } else if ahead && stored.len() > shown {
+            let n = stored.len() - shown;
+            rows.push(Row::Note(format!(
+                "{n} other {} · a shows everything",
+                if n == 1 {
+                    "company reports"
+                } else {
+                    "companies report"
+                }
+            )));
         }
         rows.push(Row::Blank);
     }
     while rows.last() == Some(&Row::Blank) {
         rows.pop();
+    }
+    if !inp.show_all && unstored > 0 {
+        rows.push(Row::Blank);
+        rows.push(Row::Note(format!(
+            "Earnings aren't stored for {unstored} of the coming weekdays, so a watched company could be missing. Press r to fetch."
+        )));
     }
     rows
 }
@@ -452,6 +567,8 @@ pub struct CalendarState {
     pub econ_dir: Option<PathBuf>,
     /// `~/.wickd/earnings`.
     pub earn_dir: Option<PathBuf>,
+    /// `~/.wickd/slate.json`.
+    pub slate_path: Option<PathBuf>,
     pub clock: Clock,
     pub rows: Vec<Row>,
     /// The row under the cursor (index into `rows`; always selectable when
@@ -461,7 +578,7 @@ pub struct CalendarState {
     pub scroll: Cell<usize>,
     /// Body rows on screen, as last measured by the renderer.
     pub page: Cell<usize>,
-    /// Every impact and every company, instead of the important ones.
+    /// Browse everything, instead of the watch.
     pub show_all: bool,
     /// An earnings fetch is in flight.
     pub loading: bool,
@@ -469,23 +586,44 @@ pub struct CalendarState {
     pub error: Option<String>,
     /// Why the last earnings fetch fell short (stored data is still shown).
     pub fetch_error: Option<String>,
-    /// The oldest fetch time among the shown earnings days.
+    /// The oldest fetch time among the coming days' earnings files.
     pub earnings_as_of: Option<DateTime<Utc>>,
     /// When the economic store was last written.
     pub econ_as_of: Option<SystemTime>,
     /// A shown weekday has no earnings file.
     pub missing_days: bool,
+    /// The slate as last read.
+    pub slate: Vec<Entry>,
+    /// When the slate file was last seen written.
+    slate_seen: Option<SystemTime>,
+    /// How each watched stock reacted, by symbol and report date.
+    pub reactions: HashMap<(String, NaiveDate), Reaction>,
+    /// A reaction fetch is in flight.
+    pub reactions_loading: bool,
+    /// Why the last reaction fetch failed (rows simply show no figures).
+    pub reactions_error: Option<String>,
+    /// A slate entry with text on it that `s` was pressed on once: a second
+    /// `s` removes it.
+    pub pending_remove: Option<String>,
     /// Where `esc` returns to.
     pub back_to: Mode,
     /// When the last automatic fetch was started.
     last_auto: Option<Instant>,
 }
 
+/// One reaction to ask for: the symbol, its report date and session.
+pub type ReactionAsk = (String, NaiveDate, Session);
+
 impl CalendarState {
-    pub fn new(econ_dir: Option<PathBuf>, earn_dir: Option<PathBuf>) -> Self {
+    pub fn new(
+        econ_dir: Option<PathBuf>,
+        earn_dir: Option<PathBuf>,
+        slate_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             econ_dir,
             earn_dir,
+            slate_path,
             clock: Clock::default(),
             rows: Vec::new(),
             selected: 0,
@@ -498,6 +636,12 @@ impl CalendarState {
             earnings_as_of: None,
             econ_as_of: None,
             missing_days: false,
+            slate: Vec::new(),
+            slate_seen: None,
+            reactions: HashMap::new(),
+            reactions_loading: false,
+            reactions_error: None,
+            pending_remove: None,
             back_to: Mode::Watchlist,
             last_auto: None,
         }
@@ -508,23 +652,35 @@ impl CalendarState {
         Self::new(
             wickd_core::events::calendar_dir().ok(),
             earnings_store::earnings_dir().ok(),
+            crate::slate::slate_path().ok(),
         )
     }
 
-    /// The weekdays on screen, which are the days an earnings fetch asks for.
+    /// The weekdays on screen, which are the days an earnings fetch asks
+    /// for (the look-back days too: they carry the names of what reported).
     pub fn fetch_dates(&self) -> Vec<NaiveDate> {
-        earnings_store::weekdays_from(self.clock.today(), (DAYS - 1) as u32)
+        let today = self.clock.today();
+        let start = watch_start(today);
+        let span = (today - start).num_days() + DAYS - 1;
+        earnings_store::weekdays_from(start, span as u32)
     }
 
-    /// Read both stores and rebuild the rows, keeping the cursor on the same
-    /// row when it is still there.
+    /// Whether the slate file changed since it was last read (checked by
+    /// the event loop while the screen is open).
+    pub fn slate_changed(&self) -> bool {
+        self.slate_path.as_deref().and_then(file_mtime) != self.slate_seen
+    }
+
+    /// Read the stores and the slate, and rebuild the rows, keeping the
+    /// cursor on the same row when it is still there.
     pub fn reload(&mut self, listed: &HashSet<String>) {
         let keep = self
             .rows
             .get(self.selected)
             .filter(|r| r.selectable())
-            .cloned();
+            .map(row_key);
         let today = self.clock.today();
+        let start = watch_start(today);
         let last = today + Duration::days(DAYS - 1);
         self.error = None;
 
@@ -543,21 +699,39 @@ impl CalendarState {
         self.econ_as_of = self
             .econ_dir
             .as_deref()
-            .and_then(|d| newest_mtime(d, today));
+            .and_then(|d| file_mtime(&d.join(format!("{}.csv", today.format("%Y-%m")))));
 
         let earnings = match &self.earn_dir {
-            Some(dir) => earnings_store::read_days(dir, today, last).unwrap_or_else(|e| {
+            Some(dir) => earnings_store::read_days(dir, start, last).unwrap_or_else(|e| {
                 self.error = Some(e);
                 Vec::new()
             }),
             None => Vec::new(),
         };
-        let wanted = self.fetch_dates();
-        self.missing_days = wanted
+        self.missing_days = self
+            .fetch_dates()
             .iter()
             .any(|d| !earnings.iter().any(|f| f.date == *d));
-        self.earnings_as_of = earnings.iter().map(|f| f.fetched_at).min();
-        if self.econ_dir.is_none() || self.earn_dir.is_none() {
+        // Freshness is about what is still to come; a past day's file never
+        // needs fetching again.
+        self.earnings_as_of = earnings
+            .iter()
+            .filter(|f| f.date >= today)
+            .map(|f| f.fetched_at)
+            .min();
+
+        self.slate_seen = self.slate_path.as_deref().and_then(file_mtime);
+        self.slate = match &self.slate_path {
+            Some(path) => match crate::slate::load_at(path) {
+                Ok(file) => crate::slate::ordered(&file, today, false),
+                Err(e) => {
+                    self.error = Some(format!("{e:#}"));
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        if self.econ_dir.is_none() || self.earn_dir.is_none() || self.slate_path.is_none() {
             self.error
                 .get_or_insert_with(|| "couldn't find the wickd data folder".into());
         }
@@ -566,11 +740,14 @@ impl CalendarState {
             clock: self.clock,
             econ: &econ,
             earnings: &earnings,
+            slate: &self.slate,
             listed,
             show_all: self.show_all,
         });
+        // Reactions for reports that have left the screen are dropped.
+        self.reactions.retain(|(_, date), _| *date >= start);
         self.selected = keep
-            .and_then(|k| self.rows.iter().position(|r| *r == k))
+            .and_then(|k| self.rows.iter().position(|r| row_key(r) == k))
             .or_else(|| {
                 self.nearest_selectable(self.selected.min(self.rows.len().saturating_sub(1)))
             })
@@ -578,18 +755,22 @@ impl CalendarState {
     }
 
     /// Put the cursor on the next thing still to come (the first row that
-    /// hasn't happened yet), or on the first row when everything has.
+    /// hasn't happened yet), or on the last row when everything has.
     pub fn go_next_upcoming(&mut self) {
         self.selected = (0..self.rows.len())
             .find(|i| self.rows[*i].selectable() && !self.rows[*i].past())
-            .or_else(|| self.nearest_selectable(0))
+            .or_else(|| {
+                (0..self.rows.len())
+                    .rev()
+                    .find(|i| self.rows[*i].selectable())
+            })
             .unwrap_or(0);
     }
 
     /// Whether opening the screen should start a background fetch: a shown
-    /// weekday has no file, or the oldest file is more than six hours old.
-    /// Never while one is running, and not again within ten minutes of the
-    /// last automatic one.
+    /// weekday has no file, or the oldest coming day's file is more than
+    /// six hours old. Never while one is running, and not again within ten
+    /// minutes of the last automatic one.
     pub fn needs_fetch(&self) -> bool {
         if self.loading || self.earn_dir.is_none() {
             return false;
@@ -635,6 +816,74 @@ impl CalendarState {
         self.reload(listed);
     }
 
+    /// The watched reports whose first trading day afterwards has come (as
+    /// far as the calendar can tell): the reactions worth asking for.
+    pub fn reactions_wanted(&self) -> Vec<ReactionAsk> {
+        let market_today = earnings_store::market_date(self.clock.now());
+        let mut out: Vec<ReactionAsk> = Vec::new();
+        for row in &self.rows {
+            let Row::Earn(e) = row else { continue };
+            if !(e.slate || e.listed) || earliest_reaction_day(e.date, e.session) > market_today {
+                continue;
+            }
+            if !out.iter().any(|(s, d, _)| *s == e.symbol && *d == e.date) {
+                out.push((e.symbol.clone(), e.date, e.session));
+            }
+        }
+        out
+    }
+
+    /// Take a finished reaction fetch. A failure keeps the figures already
+    /// held.
+    pub fn reactions_finished(&mut self, result: Result<Vec<(ReactionAsk, Reaction)>, String>) {
+        self.reactions_loading = false;
+        match result {
+            Ok(got) => {
+                self.reactions_error = None;
+                for ((symbol, date, _), r) in got {
+                    self.reactions.insert((symbol, date), r);
+                }
+            }
+            Err(e) => self.reactions_error = Some(format!("couldn't fetch reactions: {e}")),
+        }
+    }
+
+    /// Put `symbol` on the slate for the report on `date` (locked write).
+    /// An entry already there keeps its notes and takes the date and
+    /// session.
+    pub fn slate_add(&self, symbol: &str, date: NaiveDate, session: Session) -> Result<(), String> {
+        let path = self
+            .slate_path
+            .as_deref()
+            .ok_or("couldn't find the wickd data folder")?;
+        let change = crate::slate::Change {
+            date: Some(date),
+            session: Some(session),
+            ..Default::default()
+        };
+        crate::slate::update_at(path, |f| {
+            crate::slate::add(f, &[symbol.to_string()], &change, |_| Ok(None), Utc::now())
+        })
+        .map(|_| ())
+        .map_err(|e| format!("{e:#}"))
+    }
+
+    /// Take `symbol` off the slate (locked write).
+    pub fn slate_remove(&self, symbol: &str) -> Result<(), String> {
+        let path = self
+            .slate_path
+            .as_deref()
+            .ok_or("couldn't find the wickd data folder")?;
+        crate::slate::update_at(path, |f| Ok(crate::slate::remove(f, &[symbol.to_string()])))
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    /// How a row's stock reacted, when that is known.
+    pub fn reaction_of(&self, e: &EarnRow) -> Option<&Reaction> {
+        self.reactions.get(&(e.symbol.clone(), e.date))
+    }
+
     fn nearest_selectable(&self, from: usize) -> Option<usize> {
         let after = (from..self.rows.len()).find(|i| self.rows[*i].selectable());
         after.or_else(|| (0..from).rev().find(|i| self.rows[*i].selectable()))
@@ -669,12 +918,17 @@ impl CalendarState {
             .unwrap_or(0);
     }
 
-    /// The ticker under the cursor, when it's an earnings row.
-    pub fn selected_symbol(&self) -> Option<&str> {
+    /// The earnings row under the cursor.
+    pub fn selected_earn(&self) -> Option<&EarnRow> {
         match self.rows.get(self.selected) {
-            Some(Row::Earn(e)) => Some(&e.symbol),
+            Some(Row::Earn(e)) => Some(e),
             _ => None,
         }
+    }
+
+    /// The ticker under the cursor, when it's an earnings row.
+    pub fn selected_symbol(&self) -> Option<&str> {
+        self.selected_earn().map(|e| e.symbol.as_str())
     }
 
     /// The first row to draw so the cursor is on screen in a body `page`
@@ -694,8 +948,8 @@ impl CalendarState {
             // On the last row, show as much of what is under it as fits.
             scroll = bottom.min(self.selected);
         } else if self.selected < scroll {
-            // Moving up: bring the row's day heading (and the captions
-            // under it) back with it when they fit on the page.
+            // Moving up: bring the row's day heading back with it when it
+            // fits on the page.
             let head = (0..=self.selected)
                 .rev()
                 .find(|i| matches!(self.rows[*i], Row::Day(_)))
@@ -715,11 +969,54 @@ impl CalendarState {
     }
 }
 
-/// When the economic store's file for `day`'s month was last written.
-fn newest_mtime(dir: &Path, day: NaiveDate) -> Option<SystemTime> {
-    std::fs::metadata(dir.join(format!("{}.csv", day.format("%Y-%m"))))
-        .and_then(|m| m.modified())
-        .ok()
+/// What makes a row "the same row" across a reload: an event's identity,
+/// not its changeable details (a row marked for the slate is still that
+/// row).
+fn row_key(r: &Row) -> (u8, String, String) {
+    match r {
+        Row::Earn(e) => (0, e.symbol.clone(), e.date.to_string()),
+        Row::Econ(e) => (1, e.event.clone(), format!("{} {}", e.date, e.time)),
+        Row::Day(l) => (2, l.clone(), String::new()),
+        Row::Note(n) => (3, n.clone(), String::new()),
+        Row::Blank => (4, String::new(), String::new()),
+    }
+}
+
+fn file_mtime(p: &Path) -> Option<SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// Fetch daily bars for `asks` in one batched request and work out each
+/// reaction. An ask whose reaction day hasn't traded yet is simply absent
+/// from the answer.
+pub async fn fetch_reactions(
+    client: &wickd_core::equities::alpaca::AlpacaClient,
+    asks: Vec<ReactionAsk>,
+    now: DateTime<Utc>,
+) -> Result<Vec<(ReactionAsk, Reaction)>, String> {
+    let mut symbols: Vec<String> = Vec::new();
+    for (s, _, _) in &asks {
+        if !symbols.contains(s) {
+            symbols.push(s.clone());
+        }
+    }
+    let Some(oldest) = asks.iter().map(|a| a.1).min() else {
+        return Ok(Vec::new());
+    };
+    // Far enough back for a prior close and the volume average.
+    let back = (wickd_core::earnings_reaction::VOLUME_SESSIONS as i64 + 2) * 7 / 5 + 10;
+    let start = oldest.and_time(chrono::NaiveTime::MIN).and_utc() - Duration::days(back);
+    let bars = client
+        .bars_on(&symbols, "1Day", start, "sip")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(asks
+        .into_iter()
+        .filter_map(|ask| {
+            let r = wickd_core::earnings_reaction::reaction(bars.get(&ask.0)?, ask.1, ask.2, now)?;
+            Some((ask, r))
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -779,6 +1076,17 @@ mod tests {
         }
     }
 
+    fn pick(symbol: &str, date: &str, session: Session, why: &str, expect: &str) -> Entry {
+        Entry {
+            symbol: symbol.into(),
+            date: d(date),
+            session,
+            why: (!why.is_empty()).then(|| why.to_string()),
+            expect: (!expect.is_empty()).then(|| expect.to_string()),
+            added: "2026-11-15T03:00:00Z".parse().unwrap(),
+        }
+    }
+
     fn econ() -> Vec<CalendarEvent> {
         vec![
             // 13:30 UTC = 6:30 AM MST.
@@ -823,20 +1131,52 @@ mod tests {
                 "medium",
                 "198K",
             ),
+            // Yesterday's big release: behind us, not on the watch.
+            ev(
+                "2026-11-17",
+                "13:30",
+                "USD",
+                "Retail Sales m/m",
+                "high",
+                "0.2%",
+            ),
             // The store reaches Friday the 20th and no further.
             ev(
                 "2026-11-20",
                 "15:00",
                 "USD",
-                "Revised UoM Consumer Sentiment",
-                "medium",
-                "51.7",
+                "Core PCE Price Index m/m",
+                "high",
+                "0.2%",
             ),
         ]
     }
 
     fn earnings() -> Vec<DayFile> {
         vec![
+            day(
+                "2026-11-17",
+                vec![
+                    er(
+                        "2026-11-17",
+                        "HD",
+                        Session::PreMarket,
+                        Some(dec!(347000000000)),
+                    ),
+                    er(
+                        "2026-11-17",
+                        "NVDA",
+                        Session::AfterHours,
+                        Some(dec!(3760000000000)),
+                    ),
+                    er(
+                        "2026-11-17",
+                        "DIS",
+                        Session::PreMarket,
+                        Some(dec!(205000000000)),
+                    ),
+                ],
+            ),
             day(
                 "2026-11-18",
                 vec![
@@ -877,22 +1217,39 @@ mod tests {
                 "2026-11-19",
                 vec![er(
                     "2026-11-19",
-                    "TINY",
+                    "WMT",
                     Session::PreMarket,
-                    Some(dec!(5000000)),
+                    Some(dec!(1020000000000)),
                 )],
             ),
             day("2026-11-20", vec![]),
         ]
     }
 
-    fn built(show_all: bool, listed: &[&str]) -> Vec<Row> {
+    /// NVDA (yesterday), TGT (today) and a hand-dated company the store
+    /// doesn't have.
+    fn slate() -> Vec<Entry> {
+        vec![
+            pick(
+                "NVDA",
+                "2026-11-17",
+                Session::AfterHours,
+                "sets the tone for AI",
+                "Beat and raise: +5%.",
+            ),
+            pick("TGT", "2026-11-18", Session::PreMarket, "consumer read", ""),
+            pick("XYZ", "2026-11-19", Session::AfterHours, "", "A guess."),
+        ]
+    }
+
+    fn built_with(show_all: bool, slate: &[Entry], listed: &[&str]) -> Vec<Row> {
         let listed: HashSet<String> = listed.iter().map(|s| s.to_string()).collect();
         build(&Inputs {
-            // Tuesday evening in Denver is already Wednesday in UTC.
+            // 15:00 UTC Wednesday = 8:00 AM in Denver, after the open.
             clock: mst("2026-11-18T15:00:00Z"),
             econ: &econ(),
             earnings: &earnings(),
+            slate,
             listed: &listed,
             show_all,
         })
@@ -916,7 +1273,11 @@ mod tests {
                         "" => "no-time",
                         t => t,
                     },
-                    if e.listed { "*" } else { "" },
+                    match (e.slate, e.listed) {
+                        (true, _) => "+",
+                        (false, true) => "*",
+                        _ => "",
+                    },
                     e.symbol,
                     if e.past { " (past)" } else { "" }
                 ),
@@ -927,61 +1288,154 @@ mod tests {
     }
 
     #[test]
-    fn a_day_is_one_list_in_time_order_with_the_default_filter() {
-        // 15:00 UTC Wednesday = 8:00 AM in Denver, after the 9:30 Eastern open.
-        let got = text(&built(false, &["MINE"]));
+    fn the_watch_shows_only_what_was_picked_and_looks_back() {
+        // Slate: NVDA, TGT, XYZ. On a list: MINE.
+        let got = text(&built_with(false, &slate(), &["MINE"]));
         assert_eq!(
             got,
             [
+                // Yesterday stays on screen for the reaction; only the watched
+                // company, and no releases.
+                "# Yesterday · Tue Nov 17",
+                "post-close +NVDA (past)",
+                "",
                 "# Today · Wed Nov 18",
-                // Due before the open, largest first; already out.
-                "pre-open TJX (past)",
-                "pre-open TGT (past)",
-                // The low-impact 6:30 release and the EUR one are filtered out.
+                "pre-open +TGT (past)",
+                // High impact only: the low and medium releases and the EUR one are gone.
                 "12:00 PM high FOMC Meeting Minutes",
-                // Due after the 4:00 PM Eastern close (2:00 PM here).
-                "post-close PANW",
-                // Tiny, but on a list: shown and marked.
+                // Tiny, but on a list.
                 "post-close *MINE",
-                // Stored under the 19th in UTC; shown on the 18th, local
-                // time, after the close.
-                "6:00 PM medium FOMC Member Speaks",
-                "~ + 2 smaller companies · a shows everything",
+                // TJX and PANW are far larger and not shown: size is not a reason.
+                "~ 4 other companies report · a shows everything",
                 "",
                 "# Tomorrow · Thu Nov 19",
-                "6:30 AM medium Unemployment Claims",
-                "~ No large company reports. 1 smaller company · a shows everything",
+                // On the slate with a hand-given date the store doesn't have.
+                "post-close +XYZ",
+                "~ 1 other company reports · a shows everything",
                 "",
                 "# Fri Nov 20",
-                "8:00 AM medium Revised UoM Consumer Sentiment",
-                "~ No company reports.",
+                "8:00 AM high Core PCE Price Index m/m",
                 "",
-                // The weekend is skipped: nothing on it.
-                "# Mon Nov 23",
-                "~ Economic events for this day aren't published yet (the feed covers the current week).",
-                "~ No earnings stored for this day yet. Press r to fetch.",
-                "",
-                "# Tue Nov 24",
-                "~ Economic events for this day aren't published yet (the feed covers the current week).",
-                "~ No earnings stored for this day yet. Press r to fetch.",
+                // Mon and Tue of next week have nothing watched: left out.
+                "~ Earnings aren't stored for 2 of the coming weekdays, so a watched company could be missing. Press r to fetch.",
             ]
         );
         // No caption rows: every row is a day, an event, a note or a gap.
-        assert!(built(false, &[]).iter().all(|r| matches!(
+        assert!(built_with(false, &slate(), &[]).iter().all(|r| matches!(
             r,
             Row::Day(_) | Row::Econ(_) | Row::Earn(_) | Row::Note(_) | Row::Blank
         )));
     }
 
     #[test]
-    fn everything_shows_low_impact_and_small_companies_and_marks_past_releases() {
-        let got = text(&built(true, &[]));
+    fn slate_rows_carry_their_why_and_expectation() {
+        let rows = built_with(false, &slate(), &["TGT"]);
+        let earn = |sym: &str| {
+            rows.iter()
+                .find_map(|r| match r {
+                    Row::Earn(e) if e.symbol == sym => Some(e.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let nvda = earn("NVDA");
         assert_eq!(
-            &got[..11],
+            (
+                nvda.slate,
+                nvda.why.as_deref(),
+                nvda.expect.as_deref(),
+                nvda.date
+            ),
+            (
+                true,
+                Some("sets the tone for AI"),
+                Some("Beat and raise: +5%."),
+                d("2026-11-17")
+            )
+        );
+        assert_eq!(nvda.name, "NVDA Corp", "the name comes from the store");
+        // On the slate and on a list: both are recorded.
+        let tgt = earn("TGT");
+        assert!(tgt.slate && tgt.listed && tgt.expect.is_none());
+        // Not in the store: no name or figures, the slate's own session.
+        let xyz = earn("XYZ");
+        assert_eq!(
+            (
+                xyz.name.as_str(),
+                xyz.session,
+                xyz.market_cap,
+                xyz.eps_forecast
+            ),
+            ("", Session::AfterHours, None, None)
+        );
+        // A slate entry for another day doesn't mark the same symbol's other report.
+        let other = [pick("WMT", "2026-11-25", Session::PreMarket, "", "")];
+        let rows = built_with(true, &other, &[]);
+        let wmt = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Earn(e) if e.symbol == "WMT" => Some(e.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!wmt.slate, "Thursday's report isn't the one on the slate");
+    }
+
+    #[test]
+    fn the_slates_session_wins_over_the_stores() {
+        // The store says PANW reports after the close; the slate was corrected.
+        let fixed = [pick("PANW", "2026-11-18", Session::PreMarket, "", "")];
+        let got = text(&built_with(false, &fixed, &[]));
+        assert!(
+            got.contains(&"pre-open +PANW (past)".to_string()),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_slate_says_how_to_start() {
+        let got = text(&built_with(false, &[], &[]));
+        assert_eq!(
+            got[..5],
             [
+                "~ Your slate is empty. Press a to browse who reports and s to add a company, or use `wickd earnings slate add`.",
+                "",
                 "# Today · Wed Nov 18",
+                "12:00 PM high FOMC Meeting Minutes",
+                "~ 6 other companies report · a shows everything",
+            ]
+        );
+        // A day with nothing at all on it still shows when it is today.
+        let listed = HashSet::new();
+        let rows = build(&Inputs {
+            clock: mst("2026-11-18T15:00:00Z"),
+            econ: &[],
+            earnings: &[day("2026-11-18", vec![])],
+            slate: &[],
+            listed: &listed,
+            show_all: false,
+        });
+        let got = text(&rows);
+        assert_eq!(
+            got[2..4],
+            ["# Today · Wed Nov 18", "~ Nothing you're watching."]
+        );
+    }
+
+    #[test]
+    fn everything_browses_the_full_feed_from_today_on() {
+        let got = text(&built_with(true, &slate(), &[]));
+        assert_eq!(
+            &got[..15],
+            [
+                // Past days still show only what was watched.
+                "# Yesterday · Tue Nov 17",
+                "post-close +NVDA (past)",
+                "",
+                "# Today · Wed Nov 18",
+                // Watched first within a session, then largest first.
+                "pre-open +TGT (past)",
                 "pre-open TJX (past)",
-                "pre-open TGT (past)",
                 "pre-open SMOL (past)",
                 "6:30 AM low Housing Starts (past)",
                 "12:00 PM high FOMC Meeting Minutes",
@@ -991,14 +1445,22 @@ mod tests {
                 // No time given: last in the day.
                 "no-time NOTIME",
                 "",
+                "# Tomorrow · Thu Nov 19",
             ]
         );
-        // Still US only.
-        assert!(!got.iter().any(|l| l.contains("Final CPI")));
+        // Still US only, and yesterday's release isn't brought back.
+        assert!(!got
+            .iter()
+            .any(|l| l.contains("Final CPI") || l.contains("Retail Sales")));
+        // Browsing says what isn't stored, day by day.
+        assert!(got.contains(&"~ No company reports.".to_string()));
         assert!(
-            !got.iter().any(|l| l.starts_with("~ +")),
-            "nothing is hidden"
+            got.contains(&"~ No earnings stored for this day yet. Press r to fetch.".to_string())
         );
+        assert!(got.contains(
+            &"~ Economic events for this day aren't published yet (the feed covers the current week).".to_string()
+        ));
+        assert!(!got.iter().any(|l| l.contains("other compan")));
     }
 
     #[test]
@@ -1035,37 +1497,26 @@ mod tests {
     }
 
     #[test]
-    fn in_the_evening_the_cursor_starts_on_the_next_thing_to_come() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut s = state(tmp.path());
-        // 6:30 PM Mountain on the 18th: the minutes, the 6:00 PM speaker,
-        // and all of today's timed reports are behind us.
-        s.clock = mst("2026-11-19T01:30:00Z");
-        s.show_all = true;
-        s.reload(&HashSet::new());
-        let got = text(&s.rows);
-        for past in [
-            "pre-open TJX (past)",
-            "6:30 AM low Housing Starts (past)",
-            "post-close PANW (past)",
-            "6:00 PM medium FOMC Member Speaks (past)",
-        ] {
-            assert!(got.contains(&past.to_string()), "{past} in {got:?}");
-        }
-        // No time given: not counted as out until the day ends.
-        assert!(got.contains(&"no-time NOTIME".to_string()));
-        s.go_next_upcoming();
-        assert_eq!(s.selected_symbol(), Some("NOTIME"));
-        // Before the open nothing has happened yet: the first row.
-        s.clock = mst("2026-11-18T12:00:00Z");
-        s.reload(&HashSet::new());
-        s.go_next_upcoming();
-        assert_eq!(text(&s.rows[s.selected..=s.selected]), ["pre-open TJX"]);
-        assert_eq!(s.selected, 1);
-        // An empty screen is fine.
-        let mut e = CalendarState::new(None, None);
-        e.go_next_upcoming();
-        assert_eq!(e.selected, 0);
+    fn the_watch_starts_three_weekdays_back() {
+        assert_eq!(watch_start(d("2026-11-18")), d("2026-11-13"), "Wed → Fri");
+        assert_eq!(watch_start(d("2026-11-16")), d("2026-11-11"), "Mon → Wed");
+        assert_eq!(watch_start(d("2026-11-21")), d("2026-11-18"), "Sat → Wed");
+        assert_eq!(watch_start(d("2026-11-20")), d("2026-11-17"), "Fri → Tue");
+    }
+
+    #[test]
+    fn labels_and_values_read_like_a_person_wrote_them() {
+        let today = d("2026-11-18");
+        assert_eq!(day_label(today, today), "Today · Wed Nov 18");
+        assert_eq!(day_label(d("2026-11-19"), today), "Tomorrow · Thu Nov 19");
+        assert_eq!(day_label(d("2026-11-17"), today), "Yesterday · Tue Nov 17");
+        assert_eq!(day_label(d("2026-11-16"), today), "Mon Nov 16");
+        assert_eq!(day_label(d("2026-12-01"), today), "Tue Dec 1");
+        assert_eq!(fmt_cap(dec!(3762974100000)), "$3.76T");
+        assert_eq!(fmt_cap(dec!(72832852000)), "$72.8B");
+        assert_eq!(fmt_cap(dec!(258701689000)), "$259B");
+        assert_eq!(fmt_cap(dec!(475001472)), "$475M");
+        assert_eq!(fmt_cap(dec!(950000)), "$950000");
     }
 
     #[test]
@@ -1129,93 +1580,68 @@ mod tests {
         assert!(!reports_soon(dir, today).contains_key("OLD"));
     }
 
-    #[test]
-    fn a_day_with_no_releases_inside_the_feed_says_so() {
-        let listed = HashSet::new();
-        let rows = build(&Inputs {
-            clock: mst("2026-11-18T15:00:00Z"),
-            // Only Friday has a release, so Wed and Thu are inside the feed
-            // and empty.
-            econ: &[ev("2026-11-20", "15:00", "USD", "Sentiment", "medium", "")],
-            earnings: &[],
-            listed: &listed,
-            show_all: false,
-        });
-        let got = text(&rows);
-        assert_eq!(got[1], "~ No US economic releases.");
-        assert_eq!(
-            got[2],
-            "~ No earnings stored for this day yet. Press r to fetch."
-        );
-    }
-
-    #[test]
-    fn labels_and_values_read_like_a_person_wrote_them() {
-        let today = d("2026-11-18");
-        assert_eq!(day_label(today, today), "Today · Wed Nov 18");
-        assert_eq!(day_label(d("2026-11-19"), today), "Tomorrow · Thu Nov 19");
-        assert_eq!(day_label(d("2026-12-01"), today), "Tue Dec 1");
-        assert_eq!(fmt_cap(dec!(3762974100000)), "$3.76T");
-        assert_eq!(fmt_cap(dec!(72832852000)), "$72.8B");
-        assert_eq!(fmt_cap(dec!(258701689000)), "$259B");
-        assert_eq!(fmt_cap(dec!(475001472)), "$475M");
-        assert_eq!(fmt_cap(dec!(950000)), "$950000");
-    }
-
-    /// A state reading two temp stores, at 8:00 AM MST on Wed Nov 18.
+    /// A state reading temp stores and a temp slate, at 8:00 AM MST on Wed
+    /// Nov 18.
     fn state(tmp: &Path) -> CalendarState {
         let econ_dir = tmp.join("calendar");
         let earn_dir = tmp.join("earnings");
+        let slate_path = tmp.join("slate.json");
         std::fs::create_dir_all(&econ_dir).unwrap();
         calendar_store::merge_into_store(&econ_dir, econ()).unwrap();
         for f in earnings() {
             earnings_store::write_day(&earn_dir, &f).unwrap();
         }
-        let mut s = CalendarState::new(Some(econ_dir), Some(earn_dir));
+        write_slate(&slate_path, slate());
+        let mut s = CalendarState::new(Some(econ_dir), Some(earn_dir), Some(slate_path));
         s.clock = mst("2026-11-18T15:00:00Z");
         s
     }
 
+    fn write_slate(path: &Path, entries: Vec<Entry>) {
+        let file = crate::slate::SlateFile {
+            version: 1,
+            entries,
+        };
+        std::fs::write(path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+    }
+
+    fn none() -> HashSet<String> {
+        HashSet::new()
+    }
+
     #[test]
-    fn the_state_reads_both_stores_and_the_cursor_skips_headings() {
+    fn the_state_reads_the_stores_and_the_slate_and_the_cursor_skips_headings() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = state(tmp.path());
-        s.reload(&HashSet::new());
+        s.reload(&none());
         assert!(s.error.is_none(), "{:?}", s.error);
         assert!(s.econ_as_of.is_some());
         assert_eq!(
             s.earnings_as_of,
             Some("2026-11-18T00:30:00Z".parse().unwrap())
         );
-        // The cursor starts on the first event, not on the day heading.
+        assert_eq!(s.slate.len(), 3);
+        // Rows: yesterday's NVDA, then today's TGT, minutes; tomorrow's XYZ; Friday's PCE.
         assert_eq!(s.selected, 1);
-        assert_eq!(s.selected_symbol(), Some("TJX"));
-        s.step(2); // TGT, then the Fed minutes
+        assert_eq!(s.selected_symbol(), Some("NVDA"));
+        s.step(1);
+        assert_eq!(
+            s.selected_symbol(),
+            Some("TGT"),
+            "over the gap and the heading"
+        );
+        s.step(1);
         assert_eq!(
             text(&s.rows[s.selected..=s.selected]),
             ["12:00 PM high FOMC Meeting Minutes"]
         );
         assert_eq!(s.selected_symbol(), None, "a release has no ticker");
-        s.step(1);
-        assert_eq!(s.selected_symbol(), Some("PANW"));
         s.step(-10);
         assert_eq!(s.selected, 1, "stops at the first row");
-        // Down from the day's last event skips the note, the gap and the
-        // next heading.
-        s.step(4);
-        assert_eq!(
-            text(&s.rows[s.selected..=s.selected]),
-            ["6:00 PM medium FOMC Member Speaks"]
-        );
-        s.step(1);
-        assert_eq!(
-            text(&s.rows[s.selected..=s.selected]),
-            ["6:30 AM medium Unemployment Claims"]
-        );
         s.go_end();
         assert_eq!(
             text(&s.rows[s.selected..=s.selected]),
-            ["8:00 AM medium Revised UoM Consumer Sentiment"]
+            ["8:00 AM high Core PCE Price Index m/m"]
         );
         s.step(5);
         assert!(
@@ -1224,29 +1650,119 @@ mod tests {
         );
         s.go_top();
         assert_eq!(s.selected, 1);
+        // Opening lands on the next thing to come, not on yesterday.
+        s.go_next_upcoming();
+        assert_eq!(
+            text(&s.rows[s.selected..=s.selected]),
+            ["12:00 PM high FOMC Meeting Minutes"]
+        );
     }
 
     #[test]
     fn toggling_everything_keeps_the_cursor_on_the_same_company() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = state(tmp.path());
-        s.reload(&HashSet::new());
-        s.step(3); // TJX → TGT → minutes → PANW
-        assert_eq!(s.selected_symbol(), Some("PANW"));
+        s.reload(&none());
+        s.step(1);
+        assert_eq!(s.selected_symbol(), Some("TGT"));
         s.show_all = true;
-        s.reload(&HashSet::new());
-        assert_eq!(s.selected_symbol(), Some("PANW"));
+        s.reload(&none());
+        assert_eq!(s.selected_symbol(), Some("TGT"));
+        // A company only visible when browsing: toggling back moves to a neighbour.
+        s.step(1);
+        assert_eq!(s.selected_symbol(), Some("TJX"));
         s.show_all = false;
-        s.reload(&HashSet::new());
-        assert_eq!(s.selected_symbol(), Some("PANW"));
+        s.reload(&none());
+        assert!(s.rows[s.selected].selectable());
+        assert_ne!(s.selected_symbol(), Some("TJX"));
+    }
+
+    #[test]
+    fn a_change_to_the_slate_file_is_picked_up_and_keeps_the_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = state(tmp.path());
+        s.reload(&none());
+        assert!(!s.slate_changed());
+        s.step(1); // TGT
+                   // An agent adds PANW and writes TGT's expectation.
+        let mut entries = slate();
+        entries[1].expect = Some("Margins are the question.".into());
+        entries.push(pick(
+            "PANW",
+            "2026-11-18",
+            Session::AfterHours,
+            "first software report",
+            "",
+        ));
+        let path = s.slate_path.clone().unwrap();
+        write_slate(&path, entries);
+        let later = SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(s.slate_changed());
+        s.reload(&none());
+        assert!(!s.slate_changed());
+        // Same row under the cursor, though its text changed.
+        let tgt = s.selected_earn().unwrap();
+        assert_eq!(
+            (tgt.symbol.as_str(), tgt.expect.as_deref()),
+            ("TGT", Some("Margins are the question."))
+        );
+        assert!(text(&s.rows).contains(&"post-close +PANW".to_string()));
+        // A slate that can't be read: said, and the screen still draws.
+        std::fs::write(&path, b"not json").unwrap();
+        s.reload(&none());
+        assert!(
+            s.error.as_deref().unwrap().contains("slate.json"),
+            "{:?}",
+            s.error
+        );
+        assert!(s.slate.is_empty());
+    }
+
+    #[test]
+    fn in_the_evening_the_cursor_starts_on_the_next_thing_to_come() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = state(tmp.path());
+        // 6:30 PM Mountain on the 18th: the minutes and today's timed
+        // reports are behind us.
+        s.clock = mst("2026-11-19T01:30:00Z");
+        s.reload(&none());
+        let got = text(&s.rows);
+        for past in [
+            "pre-open +TGT (past)",
+            "12:00 PM high FOMC Meeting Minutes (past)",
+        ] {
+            assert!(got.contains(&past.to_string()), "{past} in {got:?}");
+        }
+        s.go_next_upcoming();
+        assert_eq!(s.selected_symbol(), Some("XYZ"), "tomorrow's report");
+        // When everything on screen has happened, the cursor rests on the last row.
+        s.clock = mst("2026-11-21T03:00:00Z"); // Friday evening
+        s.reload(&none());
+        s.go_next_upcoming();
+        assert!(s.rows[s.selected].selectable() && s.rows[s.selected].past());
+        assert_eq!(
+            s.nearest_selectable(s.selected + 1),
+            Some(s.selected),
+            "nothing after it"
+        );
+        // An empty screen is fine.
+        let mut e = CalendarState::new(None, None, None);
+        e.go_next_upcoming();
+        assert_eq!(e.selected, 0);
     }
 
     #[test]
     fn a_fetch_is_wanted_for_missing_or_old_days_but_not_twice_in_a_row() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = state(tmp.path());
-        s.reload(&HashSet::new());
-        // Mon and Tue of next week have no file.
+        s.reload(&none());
+        // The look-back days and next week's have no file.
         assert!(s.missing_days && s.needs_fetch());
         assert_eq!(
             s.fetch_dates()
@@ -1254,6 +1770,9 @@ mod tests {
                 .map(|d| d.to_string())
                 .collect::<Vec<_>>(),
             [
+                "2026-11-13",
+                "2026-11-16",
+                "2026-11-17",
                 "2026-11-18",
                 "2026-11-19",
                 "2026-11-20",
@@ -1271,7 +1790,7 @@ mod tests {
             f.fetched_at = "2026-11-18T12:00:00Z".parse().unwrap();
             earnings_store::write_day(&dir, &f).unwrap();
         }
-        s.fetch_finished(Ok(vec![]), &HashSet::new());
+        s.fetch_finished(Ok(vec![]), &none());
         assert!(!s.loading && !s.missing_days && s.fetch_error.is_none());
         s.last_auto = None;
         assert!(!s.needs_fetch(), "all days stored and under six hours old");
@@ -1279,7 +1798,7 @@ mod tests {
         s.clock = mst("2026-11-18T19:00:00Z");
         assert!(s.needs_fetch(), "more than six hours old");
         s.fetch_started(true);
-        s.fetch_finished(Err("offline".into()), &HashSet::new());
+        s.fetch_finished(Err("offline".into()), &none());
         assert_eq!(
             s.fetch_error.as_deref(),
             Some("couldn't fetch earnings: offline")
@@ -1288,6 +1807,29 @@ mod tests {
             !s.needs_fetch(),
             "not again within ten minutes of an automatic try"
         );
+    }
+
+    #[test]
+    fn an_old_file_for_a_past_day_does_not_make_the_data_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = state(tmp.path());
+        let dir = s.earn_dir.clone().unwrap();
+        for date in s.fetch_dates() {
+            let mut f = day(&date.to_string(), vec![]);
+            // Past days were fetched a week ago; today onward an hour ago.
+            f.fetched_at = if date < d("2026-11-18") {
+                "2026-11-11T12:00:00Z".parse().unwrap()
+            } else {
+                "2026-11-18T14:00:00Z".parse().unwrap()
+            };
+            earnings_store::write_day(&dir, &f).unwrap();
+        }
+        s.reload(&none());
+        assert_eq!(
+            s.earnings_as_of,
+            Some("2026-11-18T14:00:00Z".parse().unwrap())
+        );
+        assert!(!s.needs_fetch());
     }
 
     #[test]
@@ -1308,7 +1850,7 @@ mod tests {
             kept_stored: false,
             error: Some("HTTP 503".into()),
         };
-        s.fetch_finished(Ok(vec![ok, bad]), &HashSet::new());
+        s.fetch_finished(Ok(vec![ok, bad]), &none());
         assert_eq!(
             s.fetch_error.as_deref(),
             Some("couldn't fetch earnings for 1 of 2 days (HTTP 503); showing what is stored")
@@ -1316,12 +1858,70 @@ mod tests {
         assert!(!s.rows.is_empty(), "the stored days are still shown");
     }
 
+    fn reacted(day: &str, change: f64) -> Reaction {
+        Reaction {
+            day: d(day),
+            complete: true,
+            prior_close: 100.0,
+            open: 100.0 + change / 2.0,
+            close: 100.0 + change,
+            gap_pct: change / 2.0,
+            change_pct: change,
+            close_in_range: Some(80.0),
+            rel_volume: Some(2.5),
+        }
+    }
+
+    #[test]
+    fn reactions_are_asked_for_watched_reports_whose_day_has_come() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = state(tmp.path());
+        // MINE (after today's close) is on a list.
+        let listed: HashSet<String> = ["MINE".to_string()].into_iter().collect();
+        s.reload(&listed);
+        // 8:00 AM Wednesday. NVDA reported Tuesday after the close: its
+        // reaction day is today. TGT reported this morning: today. MINE and
+        // XYZ report after a close still to come.
+        assert_eq!(
+            s.reactions_wanted(),
+            vec![
+                ("NVDA".to_string(), d("2026-11-17"), Session::AfterHours),
+                ("TGT".to_string(), d("2026-11-18"), Session::PreMarket),
+            ]
+        );
+        // Browsing everything doesn't ask about companies nobody picked.
+        s.show_all = true;
+        s.reload(&listed);
+        assert_eq!(s.reactions_wanted().len(), 2);
+        s.show_all = false;
+        s.reload(&listed);
+
+        s.reactions_loading = true;
+        let nvda = ("NVDA".to_string(), d("2026-11-17"), Session::AfterHours);
+        s.reactions_finished(Ok(vec![(nvda.clone(), reacted("2026-11-18", 4.0))]));
+        assert!(!s.reactions_loading && s.reactions_error.is_none());
+        let row = s.selected_earn().cloned().unwrap();
+        assert_eq!(row.symbol, "NVDA");
+        assert_eq!(s.reaction_of(&row).map(|r| r.change_pct), Some(4.0));
+        // A failed fetch keeps what is held and says so.
+        s.reactions_finished(Err("rate limited".into()));
+        assert_eq!(
+            s.reactions_error.as_deref(),
+            Some("couldn't fetch reactions: rate limited")
+        );
+        assert!(s.reaction_of(&row).is_some());
+        // Once the report scrolls out of the look-back, its reaction is dropped.
+        s.clock = mst("2026-11-25T15:00:00Z");
+        s.reload(&listed);
+        assert!(s.reactions.is_empty());
+    }
+
     #[test]
     fn scrolling_keeps_the_cursor_on_screen_and_the_first_heading_visible() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = state(tmp.path());
         s.show_all = true;
-        s.reload(&HashSet::new());
+        s.reload(&none());
         assert_eq!(s.settle_scroll(8), 0);
         s.go_end();
         let scroll = s.settle_scroll(8);
@@ -1349,19 +1949,22 @@ mod tests {
         let mut s = CalendarState::new(
             Some(tmp.path().join("no-cal")),
             Some(tmp.path().join("no-earn")),
+            Some(tmp.path().join("no-slate.json")),
         );
         s.clock = mst("2026-11-18T15:00:00Z");
-        s.reload(&HashSet::new());
-        assert!(s.error.is_none());
+        s.reload(&none());
+        assert!(s.error.is_none(), "{:?}", s.error);
         assert!(s.missing_days && s.needs_fetch());
         assert!(s.rows.iter().all(|r| !r.selectable()));
+        assert!(text(&s.rows)[0].starts_with("~ Your slate is empty."));
         s.step(1);
         s.go_end();
         assert_eq!(s.selected_symbol(), None);
+        assert!(s.reactions_wanted().is_empty());
         // No data home at all: said plainly, and no fetch is attempted.
-        let mut s = CalendarState::new(None, None);
+        let mut s = CalendarState::new(None, None, None);
         s.clock = mst("2026-11-18T15:00:00Z");
-        s.reload(&HashSet::new());
+        s.reload(&none());
         assert_eq!(
             s.error.as_deref(),
             Some("couldn't find the wickd data folder")
