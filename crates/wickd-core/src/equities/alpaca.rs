@@ -467,6 +467,53 @@ impl AlpacaClient {
             .await?;
         Ok(r.news)
     }
+
+    /// The bodies (summary and full content) of the headlines for `symbols`
+    /// published from `start` up to `end`, oldest first, at most `limit`
+    /// (capped at 5: a body can be a whole press release, so this is for
+    /// reading one known item, with a window drawn tightly around it).
+    pub async fn news_bodies(
+        &self,
+        symbols: &[String],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<NewsBody>, AlpacaError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            news: Vec<NewsBody>,
+        }
+        if symbols.is_empty() || end <= start {
+            return Ok(Vec::new());
+        }
+        let url = format!("{}/v1beta1/news", self.data_base);
+        let r: Resp = self
+            .get(
+                &url,
+                &[
+                    ("symbols", symbols.join(",")),
+                    ("start", start.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                    ("end", end.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                    ("limit", limit.clamp(1, 5).to_string()),
+                    ("sort", "asc".to_string()),
+                    ("include_content", "true".to_string()),
+                ],
+            )
+            .await?;
+        Ok(r.news)
+    }
+}
+
+/// A news item's text: untrusted, possibly long, possibly HTML.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct NewsBody {
+    pub id: i64,
+    #[serde(default)]
+    pub summary: String,
+    /// The article itself, usually HTML. Empty when the feed carries none.
+    #[serde(default)]
+    pub content: String,
 }
 
 /// Top movers for the session.

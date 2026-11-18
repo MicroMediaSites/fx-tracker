@@ -8,6 +8,7 @@
 //! letter *prefix* opens a category, and the next key picks the action:
 //!
 //!   g  go to       g g top · g e end · g w watchlist · g i in play · g j journal · g c calendar · g <n> g row n
+//!                  (calendar) g a / g s the selected report's source article, in the reader window
 //!   w  watchlist   w a add · w d remove · w u undo · w j / w k move
 //!   t  time range  t d 1D · t w 5D · t m 1M · t 6 6M · t y 1Y · t 5 5Y · t a MAX
 //!   v  view        v c candles · v l line · v t table · v e extended hours
@@ -90,6 +91,9 @@ pub enum Cmd {
     GoLists,
     Info,
     GoForex,
+    /// Calendar: open the selected report's source article (the press
+    /// release) in the reader window.
+    GoSource,
     Find,
     FocusNews,
     FocusRight,
@@ -330,6 +334,13 @@ pub static BINDINGS: &[Binding] = &[
     pre('g', &[K::Char('l')], Cmd::GoLists, "lists (wickd list)", W),
     pre('g', &[K::Char('s')], Cmd::GoStocks, "stocks section", W),
     pre('g', &[K::Char('x')], Cmd::GoForex, "forex section", W),
+    pre(
+        'g',
+        &[K::Char('a'), K::Char('s')],
+        Cmd::GoSource,
+        "source article (the release)",
+        C,
+    ),
     pre(
         'g',
         &[K::Char('f')],
@@ -685,6 +696,21 @@ mod tests {
         assert_eq!(run(Ctx::Watchlist, &[c('z')]), vec![Step::None]);
         // Esc with nothing pending on the watchlist does nothing (no accidental quit).
         assert_eq!(run(Ctx::Watchlist, &[K::Esc]), vec![Step::None]);
+    }
+
+    #[test]
+    fn go_source_is_calendar_only() {
+        for k in ['a', 's'] {
+            assert_eq!(
+                run(Ctx::Calendar, &[c('g'), c(k)]),
+                vec![Step::Pending, Step::Act(Cmd::GoSource, None)]
+            );
+        }
+        // `g s` stays the stocks section on the watchlist.
+        assert_eq!(
+            run(Ctx::Watchlist, &[c('g'), c('s')]),
+            vec![Step::Pending, Step::Act(Cmd::GoStocks, None)]
+        );
     }
 
     #[test]
