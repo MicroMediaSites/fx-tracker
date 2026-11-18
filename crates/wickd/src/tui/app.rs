@@ -435,6 +435,9 @@ pub struct App {
     pub journal: super::journal::JournalState,
     /// The calendar screen (`g c`).
     pub calendar: super::calendar::CalendarState,
+    /// Stocks that report earnings today or on the next weekday, from the
+    /// earnings store (rows and the chart header flag them).
+    pub reports_soon: HashMap<String, super::calendar::Soon>,
     /// Active `g f` filter on the watchlist / in-play list.
     pub find: Option<FindState>,
     /// The chart's `p` prompt: digits typed so far for the price line.
@@ -484,6 +487,7 @@ impl App {
             detail: None,
             journal: super::journal::JournalState::new(super::journal::default_dir()),
             calendar: super::calendar::CalendarState::at_data_home(),
+            reports_soon: HashMap::new(),
             find: None,
             price_input: None,
             inplay: InPlayState::default(),
@@ -1182,6 +1186,15 @@ impl App {
     ) {
         let listed = self.listed_symbols();
         self.calendar.fetch_finished(result, &listed);
+        self.refresh_reports_soon();
+    }
+
+    /// Re-read which stocks report today or on the next weekday (disk only).
+    pub fn refresh_reports_soon(&mut self) {
+        self.reports_soon = match &self.calendar.earn_dir {
+            Some(dir) => super::calendar::reports_soon(dir, self.calendar.clock.today()),
+            None => HashMap::new(),
+        };
     }
 
     fn exec_calendar(&mut self, cmd: Cmd) -> Vec<Action> {

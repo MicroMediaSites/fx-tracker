@@ -905,6 +905,41 @@ fn header_row(left: &[&str], right: &[&str], trailing: &[&str]) -> Row<'static> 
     Row::new(cells).style(Style::default().fg(DIM).add_modifier(Modifier::BOLD))
 }
 
+/// Width of the EARNINGS column (`today post-close`).
+const REPORTS_W: u16 = 16;
+
+/// A report today stands out; one on the next weekday is quieter.
+fn reports_style(today: bool) -> Style {
+    if today {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
+}
+
+/// The EARNINGS cell for a symbol: when it reports, if that is today or the
+/// next weekday; empty otherwise.
+fn reports_cell(app: &App, sym: &str) -> Cell<'static> {
+    let today = app.calendar.clock.today();
+    match app.reports_soon.get(sym) {
+        Some(soon) => Cell::from(soon.short(today)).style(reports_style(soon.date == today)),
+        None => Cell::from(""),
+    }
+}
+
+/// Whether a table `width` columns wide shows the EARNINGS column: only
+/// when one of its symbols reports soon, and only when there is room for it
+/// without taking space from the columns already there (`needed` is the
+/// table's width without it).
+fn shows_reports<'a>(
+    app: &App,
+    width: u16,
+    needed: u16,
+    mut symbols: impl Iterator<Item = &'a str>,
+) -> bool {
+    width >= needed + REPORTS_W + 2 && symbols.any(|s| app.reports_soon.contains_key(s))
+}
+
 // ── watchlist ───────────────────────────────────────────────────────────────
 
 fn quote_cells(snap: Option<&Snapshot>) -> (String, String, String, Color) {
@@ -1104,7 +1139,19 @@ fn render_list_table(
     sel: Option<usize>,
     title: String,
 ) {
-    let header = header_row(&["SYMBOL", "NAME", "NOTE"], &["LAST", "CHG%"], &[]);
+    // SYMBOL 8 + NAME 28 + NOTE's minimum 20 + LAST 10 + CHG% 8, four gaps
+    // of 2 and the border.
+    let reports = shows_reports(
+        app,
+        area.width,
+        8 + 28 + 20 + 10 + 8 + 4 * 2 + 2,
+        rows.iter().filter_map(|&r| app.row_symbol(r)),
+    );
+    let header = if reports {
+        header_row(&["SYMBOL", "NAME", "EARNINGS", "NOTE"], &["LAST", "CHG%"], &[])
+    } else {
+        header_row(&["SYMBOL", "NAME", "NOTE"], &["LAST", "CHG%"], &[])
+    };
     let body = rows.iter().filter_map(|&r| {
         let sym = app.row_symbol(r)?.to_string();
         let note = app.row_note(r).unwrap_or_default().to_string();
@@ -1128,22 +1175,30 @@ fn render_list_table(
             let (last, _, pct, color) = quote_cells(app.snapshots.get(&sym));
             (last, pct, color, format!("{sym}:last"))
         };
-        Some(Row::new(vec![
+        let mut cells = vec![
             Cell::from(sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
             Cell::from(name),
+        ];
+        if reports {
+            cells.push(reports_cell(app, &sym));
+        }
+        cells.extend([
             Cell::from(note).style(Style::default().fg(Color::Gray)),
             Cell::from(Line::from(last).alignment(Alignment::Right)).style(tick_style(app, &key)),
             Cell::from(Line::from(pct).alignment(Alignment::Right))
                 .style(Style::default().fg(color)),
-        ]))
+        ]);
+        Some(Row::new(cells))
     });
-    let widths = [
-        Constraint::Length(8),
-        Constraint::Length(28),
+    let mut widths = vec![Constraint::Length(8), Constraint::Length(28)];
+    if reports {
+        widths.push(Constraint::Length(REPORTS_W));
+    }
+    widths.extend([
         Constraint::Min(20),
         Constraint::Length(10),
         Constraint::Length(8),
-    ];
+    ]);
     let table = Table::new(body, widths)
         .header(header)
         .block(
@@ -1167,11 +1222,27 @@ fn render_stock_table(
     title: String,
 ) {
     let spark_w: usize = 24;
-    let header = header_row(
-        &["SYMBOL", "NAME"],
-        &["LAST", "CHG", "CHG%", "DAY RANGE", "VOLUME"],
-        &["TODAY"],
+    // SYMBOL 7 + NAME's minimum 12 + LAST 10 + CHG 9 + CHG% 8 + DAY RANGE 19
+    // + VOLUME 8 + the sparkline, seven gaps of 2 and the border.
+    let reports = shows_reports(
+        app,
+        area.width,
+        7 + 12 + 10 + 9 + 8 + 19 + 8 + spark_w as u16 + 7 * 2 + 2,
+        rows.iter().map(|&i| app.watchlist[i].as_str()),
     );
+    let header = if reports {
+        header_row(
+            &["SYMBOL", "NAME", "EARNINGS"],
+            &["LAST", "CHG", "CHG%", "DAY RANGE", "VOLUME"],
+            &["TODAY"],
+        )
+    } else {
+        header_row(
+            &["SYMBOL", "NAME"],
+            &["LAST", "CHG", "CHG%", "DAY RANGE", "VOLUME"],
+            &["TODAY"],
+        )
+    };
     let rows = rows.iter().map(|&i| {
         let sym = &app.watchlist[i];
         let snap = app.snapshots.get(sym);
@@ -1193,9 +1264,14 @@ fn render_stock_table(
             .get(sym)
             .map(|v| sparkline(v, spark_w))
             .unwrap_or_default();
-        Row::new(vec![
+        let mut cells = vec![
             Cell::from(sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
             Cell::from(name),
+        ];
+        if reports {
+            cells.push(reports_cell(app, sym));
+        }
+        cells.extend([
             Cell::from(Line::from(last).alignment(Alignment::Right))
                 .style(tick_style(app, &format!("{sym}:last"))),
             Cell::from(Line::from(chg).alignment(Alignment::Right))
@@ -1205,18 +1281,21 @@ fn render_stock_table(
             Cell::from(Line::from(range).alignment(Alignment::Right)),
             Cell::from(Line::from(vol).alignment(Alignment::Right)),
             Cell::from(spark).style(Style::default().fg(color)),
-        ])
+        ]);
+        Row::new(cells)
     });
-    let widths = [
-        Constraint::Length(7),
-        Constraint::Min(12),
+    let mut widths = vec![Constraint::Length(7), Constraint::Min(12)];
+    if reports {
+        widths.push(Constraint::Length(REPORTS_W));
+    }
+    widths.extend([
         Constraint::Length(10),
         Constraint::Length(9),
         Constraint::Length(8),
         Constraint::Length(19),
         Constraint::Length(8),
         Constraint::Length(spark_w as u16),
-    ];
+    ]);
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -1718,6 +1797,13 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, d: &DetailState) {
     }
     if app.in_watchlist(&d.symbol) {
         title.push(Span::styled("  ★ watchlist", Style::default().fg(ACCENT)));
+    }
+    if let Some(soon) = app.reports_soon.get(&d.symbol) {
+        let today = app.calendar.clock.today();
+        title.push(Span::styled(
+            format!("  {}", soon.long(today)),
+            reports_style(soon.date == today),
+        ));
     }
     let fxq = app.fx_quotes.get(&d.symbol);
     let (price_line, stats_line) = if fx::is_fx(&d.symbol) {
@@ -3354,8 +3440,16 @@ mod tests {
         shoot(&app, "1-opening-fetch-in-flight", w, h);
         app.set_earnings_fetch(Ok(vec![]));
         shoot(&app, "2-default-view", w, h);
-        for _ in 0..4 {
+        // Down to the first company row after the next economic release.
+        for _ in 0..40 {
             press(&mut app, KeyCode::Char('j'));
+            let at = app.calendar.selected;
+            let after_release = app.calendar.rows[..at]
+                .iter()
+                .any(|r| matches!(r, crate::tui::calendar::Row::Econ(e) if !e.past));
+            if after_release && app.calendar.selected_symbol().is_some() {
+                break;
+            }
         }
         shoot(&app, "3-cursor-on-a-company", w, h);
         press(&mut app, KeyCode::Char('J'));
@@ -3396,6 +3490,230 @@ mod tests {
         let rows = screen(&app, w, h);
         assert!(rows[2].contains("Today · Wed Nov 18"), "{}", rows.join("\n"));
         assert!(rows[8].contains(" top "), "{}", rows[8]);
+    }
+
+    /// `sample_app` (watchlist SPY, NVDA, XYZ) with a day list, at 8:00 AM
+    /// Mountain on Wed Nov 18, 2026: NVDA reports today after the close and
+    /// TGT tomorrow before the open.
+    fn reports_app() -> App {
+        use crate::tui::calendar::{Clock, Soon};
+        use wickd_core::earnings_store::Session;
+        let mut app = sample_app();
+        let mut lists = crate::lists::ListsFile::default();
+        for (sym, note) in [
+            ("NVDA", "No trade (day one after its report)"),
+            ("TGT", "No trade, watch only; reports about 4:30 a.m."),
+            ("SPY", "No trade; above 739.76 = buyers in control"),
+        ] {
+            crate::lists::add(
+                &mut lists,
+                "wed-11-18",
+                &[sym.to_string()],
+                &crate::lists::Fields::note(note),
+                Utc::now(),
+            );
+        }
+        app.set_lists(lists);
+        app.selected = 0;
+        app.calendar.clock = Clock::mst("2026-11-18T15:00:00Z");
+        app.reports_soon.insert(
+            "NVDA".into(),
+            Soon {
+                date: "2026-11-18".parse().unwrap(),
+                session: Session::AfterHours,
+            },
+        );
+        app.reports_soon.insert(
+            "TGT".into(),
+            Soon {
+                date: "2026-11-19".parse().unwrap(),
+                session: Session::PreMarket,
+            },
+        );
+        app
+    }
+
+    #[test]
+    fn rows_say_when_a_stock_reports_today_or_next() {
+        let app = reports_app();
+        let rows = screen(&app, 140, 30);
+        let all = rows.join("\n");
+        let line = |needle: &str| {
+            rows.iter()
+                .find(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?} in\n{all}"))
+                .clone()
+        };
+        // Both tables are wide enough: the list and the watchlist.
+        assert_eq!(all.matches("EARNINGS").count(), 2, "{all}");
+        let nvda = line("No trade (day one");
+        assert!(nvda.contains("NVDA") && nvda.contains("today post-close"), "{nvda}");
+        let tgt = line("reports about 4:30");
+        assert!(tgt.contains("Thu pre-open"), "{tgt}");
+        // SPY doesn't report: an empty cell, and its note is where the others' are.
+        let spy = line("buyers in control");
+        assert!(!spy.contains("today") && !spy.contains("Thu"), "{spy}");
+        assert_eq!(
+            spy.find("No trade; above"),
+            nvda.find("No trade (day one"),
+            "notes share a column"
+        );
+        // The watchlist's own NVDA row carries it too.
+        let watch_nvda = rows
+            .iter()
+            .filter(|r| r.contains("NVDA") && r.contains("today post-close"))
+            .count();
+        assert_eq!(watch_nvda, 2, "{all}");
+    }
+
+    #[test]
+    fn the_earnings_column_gives_way_on_a_narrow_terminal_and_hides_when_empty() {
+        let mut app = reports_app();
+        // 120 wide: room in the list (needs 102), not in the watchlist (127).
+        let all = screen(&app, 120, 30).join("\n");
+        assert_eq!(all.matches("EARNINGS").count(), 1, "{all}");
+        assert!(all.contains("today post-close"));
+        // 100 wide: neither, and the notes are untouched.
+        let all = screen(&app, 100, 30).join("\n");
+        assert!(!all.contains("EARNINGS") && !all.contains("post-close"), "{all}");
+        assert!(all.contains("No trade (day one after its report)"), "{all}");
+        // Exactly at the list's threshold the column is there; one short, not.
+        assert!(screen(&app, 102, 30).join("\n").contains("EARNINGS"));
+        assert!(!screen(&app, 101, 30).join("\n").contains("EARNINGS"));
+        // Nobody reports soon: no column at any width.
+        app.reports_soon.clear();
+        let all = screen(&app, 160, 30).join("\n");
+        assert!(!all.contains("EARNINGS"), "{all}");
+    }
+
+    #[test]
+    fn the_chart_header_says_when_the_stock_reports() {
+        let mut app = reports_app();
+        press(&mut app, KeyCode::Enter); // the list's first row: NVDA
+        assert_eq!(app.mode, Mode::Detail);
+        let rows = screen(&app, 140, 30);
+        assert!(
+            rows[1].contains("NVDA") && rows[1].contains("reports today after the close"),
+            "{}",
+            rows[1]
+        );
+        // A stock that doesn't report soon says nothing.
+        app.reports_soon.clear();
+        assert!(!screen(&app, 140, 30).join("\n").contains("reports"));
+    }
+
+    #[test]
+    fn report_markers_come_from_the_store_and_follow_a_fetch() {
+        use wickd_core::earnings_store::{write_day, DayFile, EarningsRow, Session};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        // calendar_app stores Wed Nov 18 with PANW after the close.
+        app.refresh_reports_soon();
+        let today = app.calendar.clock.today();
+        assert_eq!(app.reports_soon["PANW"].short(today), "today post-close");
+        assert_eq!(app.reports_soon["TGT"].short(today), "today pre-open");
+        assert_eq!(app.reports_soon.len(), 4);
+        // A fetch lands with tomorrow's file: the markers pick it up.
+        write_day(
+            app.calendar.earn_dir.as_ref().unwrap(),
+            &DayFile {
+                date: "2026-11-19".parse().unwrap(),
+                fetched_at: Utc::now(),
+                source: "nasdaq".into(),
+                rows: vec![EarningsRow {
+                    date: "2026-11-19".parse().unwrap(),
+                    symbol: "WMT".into(),
+                    name: "Walmart Inc.".into(),
+                    session: Session::PreMarket,
+                    eps_forecast: None,
+                    estimates: None,
+                    market_cap: None,
+                    last_year_eps: None,
+                    fiscal_quarter: String::new(),
+                }],
+            },
+        )
+        .unwrap();
+        app.set_earnings_fetch(Ok(vec![]));
+        assert_eq!(app.reports_soon["WMT"].short(today), "Thu pre-open");
+        // No data folder: no markers, no panic.
+        app.calendar.earn_dir = None;
+        app.refresh_reports_soon();
+        assert!(app.reports_soon.is_empty());
+    }
+
+    /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_reports_soon -- --ignored`
+    /// writes HTML renders of the EARNINGS column and the chart header from
+    /// the real lists, watchlist and earnings store under the wickd data
+    /// home (`WICKD_HOME`). Company names come from the earnings store; no
+    /// quotes are fetched, so prices show as `…`.
+    #[test]
+    #[ignore]
+    fn snapshot_reports_soon() {
+        let dir = std::env::var("WICKD_TUI_SNAPSHOT_DIR").expect("set WICKD_TUI_SNAPSHOT_DIR");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shoot = |app: &App, name: &str, w: u16, h: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, app)).unwrap();
+            std::fs::write(
+                format!("{dir}/{name}.html"),
+                to_html(term.backend().buffer(), name),
+            )
+            .unwrap();
+        };
+        let mut app = App::new(
+            crate::tui::store::load_watchlist().unwrap_or_default(),
+            "iex",
+        );
+        if let Ok(f) = crate::lists::lists_path().and_then(|p| crate::lists::load_at(&p)) {
+            app.set_lists(f);
+        }
+        app.refresh_reports_soon();
+        // Names for the rows that report, from the store itself.
+        let today = app.calendar.clock.today();
+        let names: Vec<Asset> = app
+            .calendar
+            .earn_dir
+            .as_ref()
+            .and_then(|d| {
+                wickd_core::earnings_store::read_days(
+                    d,
+                    today,
+                    crate::tui::calendar::next_weekday(today),
+                )
+                .ok()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|d| d.rows)
+            .map(|r| Asset {
+                symbol: r.symbol,
+                name: r.name,
+                exchange: "NASDAQ".into(),
+                tradable: true,
+            })
+            .collect();
+        app.set_assets(names);
+        // Open the newest day list.
+        app.expanded = app.lists.len().saturating_sub(1);
+        app.selected = 0;
+        app.flash = None;
+        shoot(&app, "1-list-and-watchlist-wide", 160, 45);
+        shoot(&app, "2-list-only-at-120", 120, 45);
+        shoot(&app, "3-narrow-no-column", 100, 45);
+        // A chart of the first stock on the list that reports soon.
+        let sym = app
+            .lists
+            .get(app.expanded)
+            .and_then(|(_, e)| e.iter().find(|e| app.reports_soon.contains_key(&e.symbol)))
+            .map(|e| e.symbol.clone());
+        if let Some(sym) = sym {
+            if let Some(i) = (0..app.total_rows()).find(|i| app.row_symbol(*i) == Some(sym.as_str())) {
+                app.selected = i;
+                press(&mut app, KeyCode::Enter);
+                shoot(&app, "4-chart-header", 160, 20);
+            }
+        }
     }
 
     /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_journal -- --ignored`

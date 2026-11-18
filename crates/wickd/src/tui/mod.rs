@@ -486,6 +486,10 @@ fn run_loop(
     // Journal files are written by an editor or an agent while the TUI runs:
     // re-read the folder and the open entry while that screen is up.
     let mut journal_check = Every::new(Duration::from_secs(2));
+    // Which stocks report today or next: re-read from the earnings store
+    // (disk only) at start and every minute, so the markers follow a sync
+    // made elsewhere and the change of day.
+    let mut reports_check = Every::new(Duration::from_secs(60));
     // Rebuild the in-play list every minute while it's on screen.
     let mut inplay_timer = Every::new(Duration::from_secs(60));
 
@@ -558,6 +562,10 @@ fn run_loop(
                     }
                 }
             }
+        }
+
+        if reports_check.due() {
+            app.refresh_reports_soon();
         }
 
         // Keep the live feed's filter in step with the pairs on screen.

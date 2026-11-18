@@ -205,6 +205,77 @@ fn is_weekend(d: NaiveDate) -> bool {
     matches!(d.weekday(), Weekday::Sat | Weekday::Sun)
 }
 
+/// A stock's next earnings report, when it is today or on the next weekday:
+/// what the watchlist, the lists and the chart header warn about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Soon {
+    pub date: NaiveDate,
+    pub session: Session,
+}
+
+impl Soon {
+    fn day(&self, today: NaiveDate) -> String {
+        if self.date == today {
+            "today".into()
+        } else {
+            self.date.format("%a").to_string()
+        }
+    }
+
+    /// For a table cell: `today pre-open`, `Thu post-close`, `today`.
+    pub fn short(&self, today: NaiveDate) -> String {
+        let day = self.day(today);
+        match self.session {
+            Session::PreMarket => format!("{day} pre-open"),
+            Session::AfterHours => format!("{day} post-close"),
+            Session::Unknown => day,
+        }
+    }
+
+    /// For a sentence: `reports today before the open`.
+    pub fn long(&self, today: NaiveDate) -> String {
+        let day = self.day(today);
+        match self.session {
+            Session::PreMarket => format!("reports {day} before the open"),
+            Session::AfterHours => format!("reports {day} after the close"),
+            Session::Unknown => format!("reports {day}"),
+        }
+    }
+}
+
+/// The weekday after `d` (Friday → Monday). Market holidays aren't known
+/// here, so the day before one points at the holiday, where nobody reports.
+pub fn next_weekday(d: NaiveDate) -> NaiveDate {
+    let mut n = d + Duration::days(1);
+    while is_weekend(n) {
+        n += Duration::days(1);
+    }
+    n
+}
+
+/// Every symbol that reports today or on the next weekday, from the store
+/// only. A symbol on both days keeps today's. A day that is missing or
+/// unreadable contributes nothing: no marker is better than a wrong one.
+pub fn reports_soon(dir: &Path, today: NaiveDate) -> std::collections::HashMap<String, Soon> {
+    let mut out = std::collections::HashMap::new();
+    for date in [today, next_weekday(today)] {
+        // The file's own date must match: a stale or misnamed file is ignored.
+        let Ok(Some(day)) = earnings_store::read_day(dir, date) else {
+            continue;
+        };
+        if day.date != date {
+            continue;
+        }
+        for r in day.rows {
+            out.entry(r.symbol).or_insert(Soon {
+                date,
+                session: r.session,
+            });
+        }
+    }
+    out
+}
+
 /// What [`build`] reads.
 pub struct Inputs<'a> {
     pub clock: Clock,
@@ -965,6 +1036,67 @@ mod tests {
         let mut e = CalendarState::new(None, None);
         e.go_next_upcoming();
         assert_eq!(e.selected, 0);
+    }
+
+    #[test]
+    fn reports_soon_covers_today_and_the_next_weekday_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let write = |date: &str, rows: Vec<EarningsRow>| {
+            earnings_store::write_day(dir, &day(date, rows)).unwrap();
+        };
+        // Friday the 20th: today, Monday the 23rd, and days that must not count.
+        write(
+            "2026-11-19",
+            vec![er("2026-11-19", "OLD", Session::PreMarket, None)],
+        );
+        write(
+            "2026-11-20",
+            vec![
+                er("2026-11-20", "FRI", Session::PreMarket, None),
+                er("2026-11-20", "BOTH", Session::Unknown, None),
+            ],
+        );
+        write(
+            "2026-11-23",
+            vec![
+                er("2026-11-23", "MON", Session::AfterHours, None),
+                er("2026-11-23", "BOTH", Session::PreMarket, None),
+            ],
+        );
+        write(
+            "2026-11-24",
+            vec![er("2026-11-24", "TUE", Session::PreMarket, None)],
+        );
+        let today = d("2026-11-20");
+        let soon = reports_soon(dir, today);
+        let mut syms: Vec<&str> = soon.keys().map(String::as_str).collect();
+        syms.sort_unstable();
+        assert_eq!(syms, ["BOTH", "FRI", "MON"]);
+        assert_eq!(soon["FRI"].short(today), "today pre-open");
+        assert_eq!(soon["FRI"].long(today), "reports today before the open");
+        // Across the weekend, by weekday name.
+        assert_eq!(soon["MON"].short(today), "Mon post-close");
+        assert_eq!(soon["MON"].long(today), "reports Mon after the close");
+        // On both days: today's wins, and no time given reads plainly.
+        assert_eq!(soon["BOTH"].short(today), "today");
+        assert_eq!(soon["BOTH"].long(today), "reports today");
+        assert_eq!(next_weekday(d("2026-11-18")), d("2026-11-19"));
+        assert_eq!(next_weekday(d("2026-11-21")), d("2026-11-23"));
+
+        // Nothing stored, an unreadable day, or a file holding another
+        // day's rows: no markers, no panic.
+        assert!(reports_soon(&dir.join("nope"), today).is_empty());
+        std::fs::write(dir.join("2026-11-20.json"), b"not json").unwrap();
+        let soon = reports_soon(dir, today);
+        assert!(!soon.contains_key("FRI") && soon.contains_key("MON"));
+        let wrong = serde_json::to_vec(&day(
+            "2026-11-19",
+            vec![er("2026-11-19", "OLD", Session::PreMarket, None)],
+        ))
+        .unwrap();
+        std::fs::write(dir.join("2026-11-20.json"), wrong).unwrap();
+        assert!(!reports_soon(dir, today).contains_key("OLD"));
     }
 
     #[test]

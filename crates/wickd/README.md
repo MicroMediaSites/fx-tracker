@@ -113,6 +113,15 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
     six hours old. `r` fetches now. The header says how fresh each store is.
     A failed fetch keeps the stored rows and says so along the bottom edge.
     The earnings source is unofficial (see `wickd earnings`).
+- **Earnings markers.** A stock that reports today or on the next weekday
+  says so where you'd otherwise miss it: an `EARNINGS` column on the open
+  list and on the watchlist's stocks (`today pre-open`, `Thu post-close`;
+  today's in yellow), and `reports today after the close` in the chart's
+  header. The column only appears when a row on that table reports soon and
+  the terminal is wide enough to fit it without squeezing the other columns
+  (about 102 columns for a list, 127 for the watchlist). It reads the
+  earnings store only, re-checked every minute. Market holidays aren't
+  known, so "next weekday" can be a day the market is shut.
 - **Info** (`i`). On any row (lists, stocks, forex, in play) or a symbol
   screen, `i` opens a card saying what the symbol is: the Wikipedia summary
   (`o` opens the article in the reader window), the lists it's on with their
