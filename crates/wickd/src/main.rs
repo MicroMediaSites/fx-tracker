@@ -46,6 +46,7 @@ mod output;
 mod pending {
     pub use wickd_core::pending::*;
 }
+mod playbooks;
 mod prompt;
 mod risk;
 mod signal_alert;
@@ -78,6 +79,7 @@ use commands::info::InfoArgs;
 use commands::instruments::InstrumentsArgs;
 use commands::login::{LoginArgs, LogoutArgs};
 use commands::pending::PendingArgs;
+use commands::playbook::PlaybookArgs;
 use commands::queue::QueueArgs;
 use commands::strategy::StrategyArgs;
 use commands::stream::StreamArgs;
@@ -129,6 +131,9 @@ enum Command {
     /// Named symbol lists with notes (agent-writable; TUI watchlist sections):
     /// ls | show | add | rm | clear | delete.
     List(ListArgs),
+    /// Plain-language strategy playbooks the agent looks up on demand:
+    /// add | ls | show | rm | search.
+    Playbook(PlaybookArgs),
     /// Daily stock prices (last bar, previous close, change; --days N) as JSON.
     Quote(QuoteArgs),
     /// List built-in strategies, or run one over candles → JSON signals.
@@ -187,6 +192,7 @@ async fn main() {
         Command::Dashboard(args) => commands::dashboard::run(args, out).await,
         Command::Tui(args) => commands::tui::run(args, out).await,
         Command::List(args) => commands::list::run(args, out).await,
+        Command::Playbook(args) => commands::playbook::run(args, out).await,
         Command::Quote(args) => commands::quote::run(args, out).await,
         Command::Info(args) => commands::info::run(args, out).await,
         Command::Alpaca(args) => commands::alpaca::run(args, out).await,

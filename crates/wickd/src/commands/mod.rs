@@ -18,6 +18,7 @@ pub mod list;
 pub mod quote;
 pub mod login;
 pub mod pending;
+pub mod playbook;
 pub mod queue;
 pub mod scripted;
 pub mod slate;
