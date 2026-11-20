@@ -4,7 +4,8 @@
 //! move left/right (chart cursor; list ↔ headlines pane), and the shifted
 //! letters take bigger steps (**J/K** a page, **H/L** half a chart screen).
 //!
-//! Bare keys do the everyday things: move, open, back, search, quit. A
+//! Bare keys do the everyday things: move, open, back, search, quit, and
+//! `a` opens the agent panel over any screen. A
 //! letter *prefix* opens a category, and the next key picks the action:
 //!
 //!   g  go to       g g top · g e end · g w watchlist · g i in play · g j journal · g c calendar · g <n> g row n
@@ -78,6 +79,8 @@ pub enum Cmd {
     GoCalendar,
     /// Calendar: the watch ↔ everything that reports.
     ToggleAll,
+    /// Open the agent panel over the current screen (every screen).
+    Agent,
     /// Calendar: put the company under the cursor on the slate, or take
     /// it off.
     ToggleSlate,
@@ -239,6 +242,8 @@ const fn pre(
 /// Every binding. Order is display order within a group.
 pub static BINDINGS: &[Binding] = &[
     // ── bare ──
+    // First, so the footer always has room for it.
+    bare(&[K::Char('a')], Cmd::Agent, "ask the agent", ALL),
     bare(&[K::Down, K::Char('j')], Cmd::Down, "down", WIJC),
     bare(&[K::Up, K::Char('k')], Cmd::Up, "up", WIJC),
     bare(
@@ -277,7 +282,7 @@ pub static BINDINGS: &[Binding] = &[
         C,
     ),
     bare(
-        &[K::Char('a')],
+        &[K::Char('e')],
         Cmd::ToggleAll,
         "your watch ↔ everything",
         C,
@@ -850,7 +855,8 @@ mod tests {
         assert_eq!(run(cal, &[c('j')]), vec![Step::Act(Cmd::Down, None)]);
         assert_eq!(run(cal, &[c('K')]), vec![Step::Act(Cmd::PageUp, None)]);
         assert_eq!(run(cal, &[K::Enter]), vec![Step::Act(Cmd::Open, None)]);
-        assert_eq!(run(cal, &[c('a')]), vec![Step::Act(Cmd::ToggleAll, None)]);
+        assert_eq!(run(cal, &[c('e')]), vec![Step::Act(Cmd::ToggleAll, None)]);
+        assert_eq!(run(cal, &[c('a')]), vec![Step::Act(Cmd::Agent, None)]);
         assert_eq!(run(cal, &[c('s')]), vec![Step::Act(Cmd::ToggleSlate, None)]);
         assert_eq!(run(cal, &[c('r')]), vec![Step::Act(Cmd::Refresh, None)]);
         for k in [K::Esc, c('q'), K::Backspace] {
@@ -870,6 +876,38 @@ mod tests {
         assert_eq!(
             prefixes_in(cal).iter().map(|p| p.0).collect::<String>(),
             "g"
+        );
+    }
+
+    /// `a` opens the agent panel on every screen; the calendar's watch ↔
+    /// everything toggle lives on `e` (wickd-learn D-19).
+    #[test]
+    fn a_opens_the_agent_everywhere() {
+        for ctx in [
+            Ctx::Watchlist,
+            Ctx::Detail,
+            Ctx::InPlay,
+            Ctx::Journal,
+            Ctx::Calendar,
+        ] {
+            assert_eq!(run(ctx, &[c('a')]), vec![Step::Act(Cmd::Agent, None)], "{ctx:?}");
+            assert!(
+                bare_entries(ctx).iter().any(|e| e.keys == "a" && e.label.contains("agent")),
+                "{ctx:?}: help lists the agent key"
+            );
+        }
+        // `e` toggles only on the calendar; it isn't bare anywhere else.
+        for ctx in [Ctx::Watchlist, Ctx::Detail, Ctx::InPlay, Ctx::Journal] {
+            assert_eq!(run(ctx, &[c('e')]), vec![Step::None], "{ctx:?}");
+        }
+        // Prefixed `a`s are untouched.
+        assert_eq!(
+            run(Ctx::Watchlist, &[c('w'), c('a')]),
+            vec![Step::Pending, Step::Act(Cmd::WatchAdd, None)]
+        );
+        assert_eq!(
+            run(Ctx::Calendar, &[c('g'), c('a')]),
+            vec![Step::Pending, Step::Act(Cmd::GoSource, None)]
         );
     }
 

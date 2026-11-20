@@ -13,7 +13,7 @@
 //!
 //! It looks back three weekdays so a report and the stock's reaction to it
 //! ([`wickd_core::earnings_reaction`]) stay in view, and ahead six days.
-//! `a` switches to browsing everything that reports, to add to the slate
+//! `e` switches to browsing everything that reports, to add to the slate
 //! from. Watch, then react: nothing here places a trade.
 //!
 //! Each day is one list of events in time order: a row says whether it is
@@ -392,7 +392,7 @@ pub fn build(inp: &Inputs) -> Vec<Row> {
     let mut rows = Vec::new();
     if !inp.show_all && inp.slate.is_empty() {
         rows.push(Row::Note(
-            "Your slate is empty. Press a to browse who reports and s to add a company, or use `wickd earnings slate add`."
+            "Your slate is empty. Press e to browse who reports and s to add a company, or use `wickd earnings slate add`."
                 .into(),
         ));
         rows.push(Row::Blank);
@@ -549,7 +549,7 @@ pub fn build(inp: &Inputs) -> Vec<Row> {
         } else if ahead && stored.len() > shown {
             let n = stored.len() - shown;
             rows.push(Row::Note(format!(
-                "{n} other {} · a shows everything",
+                "{n} other {} · e shows everything",
                 if n == 1 {
                     "company reports"
                 } else {
@@ -1603,12 +1603,12 @@ mod tests {
                 // Tiny, but on a list.
                 "post-close *MINE",
                 // TJX and PANW are far larger and not shown: size is not a reason.
-                "~ 4 other companies report · a shows everything",
+                "~ 4 other companies report · e shows everything",
                 "",
                 "# Tomorrow · Thu Nov 19",
                 // On the slate with a hand-given date the store doesn't have.
                 "post-close +XYZ",
-                "~ 1 other company reports · a shows everything",
+                "~ 1 other company reports · e shows everything",
                 "",
                 "# Fri Nov 20",
                 "8:00 AM high Core PCE Price Index m/m",
@@ -1695,11 +1695,11 @@ mod tests {
         assert_eq!(
             got[..5],
             [
-                "~ Your slate is empty. Press a to browse who reports and s to add a company, or use `wickd earnings slate add`.",
+                "~ Your slate is empty. Press e to browse who reports and s to add a company, or use `wickd earnings slate add`.",
                 "",
                 "# Today · Wed Nov 18",
                 "12:00 PM high FOMC Meeting Minutes",
-                "~ 6 other companies report · a shows everything",
+                "~ 6 other companies report · e shows everything",
             ]
         );
         // A day with nothing at all on it still shows when it is today.
