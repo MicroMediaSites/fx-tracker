@@ -97,7 +97,7 @@ impl Timeframe {
 /// Ichimoku at one bar. "Plotted" is what the chart draws over that bar;
 /// "computed" is what the bar itself produces (drawn [`ICHI_SHIFT`] bars
 /// later).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
 pub struct IchimokuAt {
     /// Tenkan-sen: (9-bar high + low) / 2, ending at this bar.
     pub tenkan: Option<f64>,
@@ -151,19 +151,44 @@ pub struct IchimokuSettings {
     pub shift: usize,
 }
 
+/// Where the bars come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    /// A stock (Alpaca).
+    Stock,
+    /// A forex pair like `EUR_USD` (OANDA practice).
+    Pair,
+}
+
+/// Which hours the bars cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Session {
+    /// Intraday stock bars, 09:30-16:00 ET only.
+    Regular,
+    /// Intraday stock bars including pre/post-market.
+    Extended,
+    /// Forex pairs: every bar, Sunday evening to Friday evening.
+    #[serde(rename = "24/5")]
+    TwentyFourFive,
+    /// Daily and longer bars.
+    All,
+}
+
 /// What a chart shows, as numbers.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChartContext {
     pub symbol: String,
     /// `stock` (Alpaca) or `pair` (OANDA).
-    pub kind: &'static str,
+    pub kind: Kind,
     /// Bar size: `5m`, `15m`, `1h`, `1d`, `1w`, `1mo`.
     pub timeframe: &'static str,
     /// The chart range that shows this timeframe (`1D`, `5D`, `1M`, …).
     pub range: &'static str,
     /// `regular` / `extended` hours (intraday stocks), `24/5` (pairs) or
     /// `all` (daily and longer bars).
-    pub session: &'static str,
+    pub session: Session,
     /// Indicators with values in `bars` (the ones the chart can draw here).
     pub indicators: Vec<&'static str>,
     pub ichimoku_settings: IchimokuSettings,
@@ -251,29 +276,39 @@ pub fn build(
     extended: bool,
     n: usize,
 ) -> ChartContext {
+    let mut ctx = build_all(symbol, range, warmup, bars, extended);
+    ctx.bars.drain(..ctx.bars.len().saturating_sub(n));
+    ctx
+}
+
+/// [`build`] with every visible bar.
+fn build_all(
+    symbol: &str,
+    range: HistoryRange,
+    warmup: &[Bar],
+    bars: &[Bar],
+    extended: bool,
+) -> ChartContext {
     let is_fx = fx::is_fx(symbol);
-    let (warm, vis) = chart::indicator_bars(warmup, bars, range, extended || is_fx);
-    let (_, ext) = chart::session_bars(bars, range, extended || is_fx);
-    let (mut all, cloud_ahead, ma) = all_bars(range, &warm, &vis);
-    let available = all.len();
-    all.drain(..available.saturating_sub(n));
+    let (warm, vis, ext) = chart::indicator_bars(warmup, bars, range, extended || is_fx);
+    let (all, cloud_ahead, ma) = all_bars(range, &warm, &vis);
     let mut indicators = vec!["ichimoku"];
     if ma {
         indicators.extend(["ma50", "ma200"]);
     }
     ChartContext {
         symbol: symbol.to_string(),
-        kind: if is_fx { "pair" } else { "stock" },
+        kind: if is_fx { Kind::Pair } else { Kind::Stock },
         timeframe: Timeframe::of_range(range).label,
         range: range.label(),
         session: if is_fx {
-            "24/5"
+            Session::TwentyFourFive
         } else if !range.intraday() {
-            "all"
+            Session::All
         } else if ext {
-            "extended"
+            Session::Extended
         } else {
-            "regular"
+            Session::Regular
         },
         indicators,
         ichimoku_settings: IchimokuSettings {
@@ -282,7 +317,7 @@ pub fn build(
             senkou_b: ICHI_SENKOU_B,
             shift: ICHI_SHIFT,
         },
-        bars_available: available,
+        bars_available: all.len(),
         bars: all,
         cloud_ahead,
     }
@@ -290,7 +325,7 @@ pub fn build(
 
 // ── the chart the TUI has open ──────────────────────────────────────────────
 
-// Attached by the agent panel (a later ticket); until then only tests use it.
+// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
 #[allow(dead_code)]
 /// The candle under the chart's cursor (merged candles cover several bars).
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -315,7 +350,7 @@ pub struct CursorContext {
     pub ichimoku: IchimokuAt,
 }
 
-// Attached by the agent panel (a later ticket); until then only tests use it.
+// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ReferenceLine {
@@ -324,7 +359,7 @@ pub struct ReferenceLine {
     pub price: f64,
 }
 
-// Attached by the agent panel (a later ticket); until then only tests use it.
+// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LevelLine {
@@ -335,7 +370,7 @@ pub struct LevelLine {
     pub touches: usize,
 }
 
-// Attached by the agent panel (a later ticket); until then only tests use it.
+// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
 #[allow(dead_code)]
 /// The horizontal lines on the chart.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -348,7 +383,7 @@ pub struct PriceLines {
     pub levels: Vec<LevelLine>,
 }
 
-// Attached by the agent panel (a later ticket); until then only tests use it.
+// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
 #[allow(dead_code)]
 /// What's toggled on the open chart.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -361,7 +396,7 @@ pub struct ViewState {
     pub bars_per_candle: usize,
 }
 
-// Attached by the agent panel (a later ticket); until then only tests use it.
+// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
 #[allow(dead_code)]
 /// [`ChartContext`] for the chart the TUI has open, with its cursor and
 /// price lines.
@@ -374,7 +409,7 @@ pub struct OpenChartContext {
     pub view: ViewState,
 }
 
-// Attached by the agent panel (a later ticket); until then only tests use it.
+// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
 #[allow(dead_code)]
 /// The context of the chart open in the TUI (`None` when no chart is open or
 /// its history hasn't loaded), with the newest `n` bars.
@@ -382,17 +417,14 @@ pub fn open_chart(app: &App, n: usize) -> Option<OpenChartContext> {
     let d = app.detail.as_ref()?;
     let bars = d.bars()?;
     let warm = d.warmup.get(&d.range).map_or(&[][..], Vec::as_slice);
-    let extended = d.show_extended();
-    let chart_ctx = build(&d.symbol, d.range, warm, bars, extended, n);
-    // Per-bar values for every visible bar, so the cursor's last bar can be
-    // read even when it's older than the newest N.
-    let (iwarm, ivis) = chart::indicator_bars(warm, bars, d.range, extended);
-    let (per_bar, _, _) = all_bars(d.range, &iwarm, &ivis);
+    // The same builder as the CLI, once, over every visible bar (so the
+    // cursor's bar can be read even when it's older than the newest N).
+    let mut chart_ctx = build_all(&d.symbol, d.range, warm, bars, d.show_extended());
     let (candles, _) = d.candles()?;
     let cursor = (!candles.is_empty()).then(|| {
         let i = d.chart.cursor_idx(candles.len());
         let c = &candles[i];
-        let bar = per_bar.get(c.end);
+        let bar = chart_ctx.bars.get(c.end);
         CursorContext {
             index: i,
             latest: i + 1 == candles.len(),
@@ -405,20 +437,11 @@ pub fn open_chart(app: &App, n: usize) -> Option<OpenChartContext> {
             change_pct: c.change_pct(),
             bars_merged: c.bars,
             bar_time: bar.map_or(c.time, |b| b.time),
-            ichimoku: bar.map_or(
-                IchimokuAt {
-                    tenkan: None,
-                    kijun: None,
-                    span_a_plotted: None,
-                    span_b_plotted: None,
-                    span_a_computed: None,
-                    span_b_computed: None,
-                    chikou: None,
-                },
-                |b| b.ichimoku,
-            ),
+            ichimoku: bar.map_or_else(IchimokuAt::default, |b| b.ichimoku),
         }
     });
+    let n_all = chart_ctx.bars.len();
+    chart_ctx.bars.drain(..n_all.saturating_sub(n));
     let (reference, last_price) = super::ui::chart_price_refs(app, d, app.snapshots.get(&d.symbol));
     let levels = if d.chart.levels {
         let (s, e) = d.chart.window(candles.len(), d.chart.visible.get());
@@ -511,11 +534,11 @@ mod tests {
         let vis = bars(78, "2026-11-06T14:30:00Z");
         let ctx = build("SPY", range, &warm, &vis, false, usize::MAX);
         assert_eq!(ctx.bars.len(), 78);
-        assert_eq!(ctx.kind, "stock");
-        assert_eq!(ctx.session, "regular");
+        assert_eq!(ctx.kind, Kind::Stock);
+        assert_eq!(ctx.session, Session::Regular);
 
         // What the chart draws, from the same inputs.
-        let (cw, cv) = chart::indicator_bars(&warm, &vis, range, false);
+        let (cw, cv, _) = chart::indicator_bars(&warm, &vis, range, false);
         for k in [1, 3] {
             let candles = chart::build(&cv, k);
             let (ov, cloud, fut) = chart::ichimoku_overlays(&cw, &cv, &candles);
@@ -577,7 +600,7 @@ mod tests {
         let vis = bars(30, "2026-01-01T05:00:00Z");
         let ctx = build("SPY", HistoryRange::Year1, &warm, &vis, false, 30);
         assert_eq!(ctx.indicators, vec!["ichimoku", "ma50", "ma200"]);
-        assert_eq!(ctx.session, "all");
+        assert_eq!(ctx.session, Session::All);
         let ov = chart::moving_averages(&warm, &vis, &chart::build(&vis, 1));
         assert_eq!(ctx.bars[29].ma50, ov[0].values[29]);
         assert_eq!(ctx.bars[29].ma200, ov[1].values[29]);
@@ -596,7 +619,7 @@ mod tests {
         );
         assert_eq!(
             (ctx.kind, ctx.session, ctx.timeframe),
-            ("pair", "24/5", "1h")
+            (Kind::Pair, Session::TwentyFourFive, "1h")
         );
         // Pre-market-hours bars are kept for pairs.
         assert_eq!(ctx.bars.len(), 5);
@@ -605,6 +628,7 @@ mod tests {
         // Serialises without panicking.
         let json = serde_json::to_value(&ctx).unwrap();
         assert_eq!(json["kind"], "pair");
+        assert_eq!(json["session"], "24/5");
         assert!(json["bars"][0]["ichimoku"]
             .as_object()
             .unwrap()

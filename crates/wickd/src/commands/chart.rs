@@ -58,8 +58,9 @@ pub async fn run(args: ChartArgs, out: Out) -> ! {
 }
 
 async fn run_context(args: ContextArgs, out: Out) -> ! {
+    // `validate` returns the normalized symbol (upper case, `/` → `_`).
     let symbol = match crate::info::validate(&args.symbol) {
-        Ok(_) => crate::lists::normalize_symbol(&args.symbol),
+        Ok(s) => s,
         Err(e) => out.fail(exit::VALIDATION, "invalid_symbol", format!("{e:#}")),
     };
     let Some(tf) = Timeframe::parse(&args.tf) else {
@@ -73,7 +74,7 @@ async fn run_context(args: ContextArgs, out: Out) -> ! {
         out.fail(
             exit::VALIDATION,
             "invalid_bars",
-            format!("--bars must be 1..={MAX_BARS}"),
+            format!("--bars must be 1..={MAX_BARS} (got {})", args.bars),
         );
     }
     let now = Utc::now();
@@ -109,7 +110,15 @@ async fn run_context(args: ContextArgs, out: Out) -> ! {
         out.fail(
             exit::GENERIC,
             "no_data",
-            format!("no {} bars for {symbol}", tf.label),
+            format!(
+                "no {} bars for {symbol} — check the symbol, or try a longer --tf{}",
+                tf.label,
+                if tf.range.intraday() && !fx::is_fx(&symbol) {
+                    " or --extended (before the open there are no regular-hours bars)"
+                } else {
+                    ""
+                }
+            ),
         );
     }
     out.ok(&ctx);

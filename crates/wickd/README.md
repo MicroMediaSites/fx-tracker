@@ -381,8 +381,9 @@ practice credentials.
   also carry `ma50` and `ma200`.
 - `cloud_ahead`: the 26 projected cloud slots after the newest bar.
 
-Exit 2 means missing or unreadable keys, exit 3 an OANDA failure, exit 4 a
-bad symbol, timeframe or bar count; every failure is the usual JSON error.
+Exit 1 means an Alpaca history failure or no bars, exit 2 missing or
+unreadable keys, exit 3 an OANDA failure, exit 4 a bad symbol, timeframe or
+bar count; every failure is the usual JSON error.
 
 ## `wickd quote` — daily stock prices
 

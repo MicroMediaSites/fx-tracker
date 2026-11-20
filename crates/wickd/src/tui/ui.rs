@@ -2481,7 +2481,7 @@ fn render_chart_view(
     // cloud spans the whole chart on every range.
     let (cloud, future) = match (d.chart.ichimoku, d.bars()) {
         (true, Some(bars)) => {
-            let (warm, vis) = chart::indicator_bars(warm, bars, range, d.show_extended());
+            let (warm, vis, _) = chart::indicator_bars(warm, bars, range, d.show_extended());
             let (ov, cloud, fut) = chart::ichimoku_overlays(&warm, &vis, &candles);
             overlays.extend(ov);
             (Some(cloud), fut)
