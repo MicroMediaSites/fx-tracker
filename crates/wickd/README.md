@@ -28,6 +28,7 @@ feature — meant to be followed together by you and an agent.
 | `tui` | Stock ticker TUI: watchlist, symbol search, price-history drill-down (US equities) |
 | `list` | Named symbol lists (agent-writable; TUI watchlist sections) |
 | `playbook` | Plain-language strategy playbooks: add / ls / show / rm / search (JSON) |
+| `chart context` | What the TUI chart shows, as numbers: bars + every indicator value it draws (JSON) |
 | `quote` | Daily stock prices: last bar, previous close, change (JSON) |
 | `earnings sync` / `upcoming` | Earnings calendar: who reports on a day, before or after the market, and the expected EPS (JSON) |
 | `alpaca login` / `status` / `logout` | Store / inspect / remove the Alpaca market-data keys `tui` uses |
@@ -352,6 +353,37 @@ wickd playbook rm rahagod
   matches first (the words as a phrase, then under a heading naming them).
 - An unknown name or an invalid one exits 4; an empty store lists as
   `{"playbooks":[]}`.
+
+## `wickd chart context` — the chart, as numbers
+
+What the TUI chart shows for any stock or pair, as JSON, built by the same
+code the chart draws with (same history, same session hours, same indicator
+math). Values only: no rule checks or verdicts.
+
+```sh
+wickd chart context AAPL --tf 1d --bars 30
+wickd chart context EUR_USD --tf 1h --bars 30
+wickd chart context SPY --tf 5m --extended   # include pre/post-market bars
+```
+
+`--tf` is one of the chart's bar sizes: `5m` (1D), `15m` (5D), `1h` (1M),
+`1d` (1Y), `1w` (5Y), `1mo` (MAX). `--bars` (default 60, max 1000) keeps the
+newest N bars. Stocks need the `wickd tui` Alpaca keys; pairs the OANDA
+practice credentials.
+
+- `symbol`, `kind` (`stock` / `pair`), `timeframe`, `range`, `session`
+  (`regular` / `extended` / `24/5` / `all`), `indicators`, `bars_available`.
+- `bars`, oldest first: `time`, `open`, `high`, `low`, `close`, `volume`,
+  and `ichimoku` (9/26/52, shift 26): `tenkan`, `kijun`, `span_a_plotted` /
+  `span_b_plotted` (the cloud drawn at that bar), `span_a_computed` /
+  `span_b_computed` (what that bar produces, drawn 26 bars later) and
+  `chikou` (the close 26 bars later, null for the newest 26). Daily bars
+  also carry `ma50` and `ma200`.
+- `cloud_ahead`: the 26 projected cloud slots after the newest bar.
+
+Exit 1 means an Alpaca history failure or no bars, exit 2 missing or
+unreadable keys, exit 3 an OANDA failure, exit 4 a bad symbol, timeframe or
+bar count; every failure is the usual JSON error.
 
 ## `wickd quote` — daily stock prices
 

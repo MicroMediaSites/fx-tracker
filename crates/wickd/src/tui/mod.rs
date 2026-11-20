@@ -31,6 +31,7 @@
 
 pub mod app;
 pub mod chart;
+pub mod context;
 pub mod fx;
 pub mod inplay;
 pub mod calendar;
@@ -170,9 +171,36 @@ async fn build_inplay(
     ))
 }
 
+/// History for a stock chart, split into (warm-up, visible): one fetch that
+/// also covers history before the window when the range has warm-up (MA
+/// warm-up on daily ranges, Ichimoku warm-up on intraday ones); otherwise
+/// just the range, with no warm-up. The chart and `wickd chart context` both
+/// load stock history through here.
+pub async fn stock_history(
+    client: &AlpacaClient,
+    sym: &str,
+    range: HistoryRange,
+    now: chrono::DateTime<Utc>,
+) -> Result<(Vec<Bar>, Vec<Bar>), String> {
+    if chart::warmup_days(range) > 0 {
+        let start = range.start(now);
+        let from = start - chrono::Duration::days(chart::warmup_days(range));
+        let sym = sym.to_string();
+        let all = client
+            .bars(std::slice::from_ref(&sym), range.timeframe(), from)
+            .await
+            .map(|mut m| m.remove(&sym).unwrap_or_default())
+            .map_err(err_string)?;
+        Ok(chart::split_warmup(range, start, all))
+    } else {
+        let vis = client.history(sym, range, now).await.map_err(err_string)?;
+        Ok((Vec::new(), vis))
+    }
+}
+
 /// The OANDA practice client for forex data (wickd-forex D-4: read-only
 /// prices; the default practice account's stored credentials).
-fn oanda_client() -> Result<OandaClient, String> {
+pub fn oanda_client() -> Result<OandaClient, String> {
     let (_, client) = crate::commands::client::resolve(
         "practice",
         crate::vault_store::DEFAULT_ACCOUNT,
@@ -329,33 +357,17 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                             .map_err(err_string);
                         Reply::Sparks(r)
                     }
-                    Request::History(sym, range) if chart::warmup_days(range) > 0 => {
-                        // One fetch that also covers history before the
-                        // window (MA warm-up on daily ranges, Ichimoku
-                        // warm-up on intraday ones).
-                        let now = Utc::now();
-                        let start = range.start(now);
-                        let from = start - chrono::Duration::days(chart::warmup_days(range));
-                        let r = client
-                            .bars(std::slice::from_ref(&sym), range.timeframe(), from)
-                            .await
-                            .map(|mut m| m.remove(&sym).unwrap_or_default())
-                            .map_err(err_string);
-                        match r {
-                            Ok(all) => {
-                                let (warm, vis) = chart::split_warmup(range, start, all);
-                                let _ = replies.send(Reply::Warmup(sym.clone(), range, warm));
+                    Request::History(sym, range) => {
+                        match stock_history(&client, &sym, range, Utc::now()).await {
+                            Ok((warm, vis)) => {
+                                // Ranges without warm-up never sent one.
+                                if chart::warmup_days(range) > 0 {
+                                    let _ = replies.send(Reply::Warmup(sym.clone(), range, warm));
+                                }
                                 Reply::History(sym, range, Ok(vis))
                             }
                             Err(e) => Reply::History(sym, range, Err(e)),
                         }
-                    }
-                    Request::History(sym, range) => {
-                        let r = client
-                            .history(&sym, range, Utc::now())
-                            .await
-                            .map_err(err_string);
-                        Reply::History(sym, range, r)
                     }
                     Request::Assets => {
                         let now = Utc::now();

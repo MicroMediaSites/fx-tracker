@@ -73,6 +73,7 @@ use commands::books::BooksArgs;
 use commands::calendar::CalendarArgs;
 use commands::earnings::EarningsArgs;
 use commands::candles::CandlesArgs;
+use commands::chart::ChartArgs;
 use commands::dashboard::DashboardArgs;
 use commands::feed::FeedArgs;
 use commands::info::InfoArgs;
@@ -124,6 +125,9 @@ enum Command {
     Dashboard(DashboardArgs),
     /// Stock ticker TUI: watchlist, symbol search, price-history drill-down (Alpaca data).
     Tui(TuiArgs),
+    /// What the TUI chart shows, as numbers: `context SYM --tf 1d --bars N` → JSON
+    /// bars + every indicator value the chart draws (Ichimoku, daily MAs).
+    Chart(ChartArgs),
     /// What a stock or forex pair is: summary, facts, industry → JSON.
     Info(InfoArgs),
     /// Alpaca market-data keys for `wickd tui`: login | status | logout.
@@ -194,6 +198,7 @@ async fn main() {
         Command::List(args) => commands::list::run(args, out).await,
         Command::Playbook(args) => commands::playbook::run(args, out).await,
         Command::Quote(args) => commands::quote::run(args, out).await,
+        Command::Chart(args) => commands::chart::run(args, out).await,
         Command::Info(args) => commands::info::run(args, out).await,
         Command::Alpaca(args) => commands::alpaca::run(args, out).await,
         Command::Strategy(args) => commands::strategy::run(args, out).await,

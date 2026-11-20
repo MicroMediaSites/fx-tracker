@@ -337,6 +337,26 @@ pub fn ichimoku_series(bars: &[Bar]) -> IchimokuSeries {
     }
 }
 
+/// The (warm-up, visible) bars the chart computes Ichimoku from: `bars` cut
+/// to the chart's session hours ([`session_bars`]) and the warm-up filtered
+/// to the same hours, so the indicator runs on exactly the bars the candles
+/// are built from. Also returns whether extended hours are included (as
+/// [`session_bars`]). Shared by the TUI chart and `wickd chart context`.
+pub fn indicator_bars(
+    warmup: &[Bar],
+    bars: &[Bar],
+    range: HistoryRange,
+    extended: bool,
+) -> (Vec<Bar>, Vec<Bar>, bool) {
+    let (vis, ext) = session_bars(bars, range, extended);
+    let warm: Vec<Bar> = warmup
+        .iter()
+        .filter(|b| ext || !range.intraday() || is_regular_session(b.time))
+        .cloned()
+        .collect();
+    (warm, vis, ext)
+}
+
 /// Ichimoku overlays + cloud for `candles` built from `visible` bars (with
 /// `warmup` bars before them), and how many projected slots they need to
 /// the right of the newest candle (26 bars, in candle units when merged).

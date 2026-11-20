@@ -2425,23 +2425,18 @@ fn axis_boundary(
     }
 }
 
-fn render_chart_view(
-    frame: &mut Frame,
-    area: Rect,
+/// The chart's reference line and last-price line: on 1D the previous close
+/// for stocks, the trading day's open (17:00 New York) for pairs; the last
+/// price from the snapshot (stocks) or the live OANDA mid (pairs). Shared
+/// with the chart context the agent gets (`tui::context::open_chart`).
+pub fn chart_price_refs(
     app: &App,
     d: &DetailState,
     snap: Option<&Snapshot>,
-    style: Style2,
-) {
-    let range = d.range;
+) -> (Option<f64>, Option<f64>) {
     let is_fx = fx::is_fx(&d.symbol);
     let fxq = app.fx_quotes.get(&d.symbol);
-    let fmt_price = price_fmt(&d.symbol);
-    // Pairs stream live from OANDA: never "delayed".
-    let delayed = app.history_delayed && !is_fx;
-    // 1D reference line: previous close for stocks, the trading day's open
-    // (17:00 New York) for pairs.
-    let reference = if range != HistoryRange::Day1 {
+    let reference = if d.range != HistoryRange::Day1 {
         None
     } else if is_fx {
         fxq.and_then(|q| q.open).and_then(|o| o.to_f64())
@@ -2453,6 +2448,23 @@ fn render_chart_view(
     } else {
         snap.and_then(Snapshot::last)
     };
+    (reference, last_price)
+}
+
+fn render_chart_view(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    d: &DetailState,
+    snap: Option<&Snapshot>,
+    style: Style2,
+) {
+    let range = d.range;
+    let is_fx = fx::is_fx(&d.symbol);
+    let fmt_price = price_fmt(&d.symbol);
+    // Pairs stream live from OANDA: never "delayed".
+    let delayed = app.history_delayed && !is_fx;
+    let (reference, last_price) = chart_price_refs(app, d, snap);
     let Some((candles, extended)) = d.candles() else {
         return;
     };
@@ -2469,12 +2481,7 @@ fn render_chart_view(
     // cloud spans the whole chart on every range.
     let (cloud, future) = match (d.chart.ichimoku, d.bars()) {
         (true, Some(bars)) => {
-            let (vis, ext) = chart::session_bars(bars, range, d.show_extended());
-            let warm: Vec<Bar> = warm
-                .iter()
-                .filter(|b| ext || !range.intraday() || chart::is_regular_session(b.time))
-                .cloned()
-                .collect();
+            let (warm, vis, _) = chart::indicator_bars(warm, bars, range, d.show_extended());
             let (ov, cloud, fut) = chart::ichimoku_overlays(&warm, &vis, &candles);
             overlays.extend(ov);
             (Some(cloud), fut)
