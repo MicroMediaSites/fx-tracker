@@ -27,6 +27,7 @@ feature — meant to be followed together by you and an agent.
 | `trade report` / `trade baseline` | Account P&L since a recorded per-account baseline |
 | `tui` | Stock ticker TUI: watchlist, symbol search, price-history drill-down (US equities) |
 | `list` | Named symbol lists (agent-writable; TUI watchlist sections) |
+| `playbook` | Plain-language strategy playbooks: add / ls / show / rm / search (JSON) |
 | `quote` | Daily stock prices: last bar, previous close, change (JSON) |
 | `earnings sync` / `upcoming` | Earnings calendar: who reports on a day, before or after the market, and the expected EPS (JSON) |
 | `alpaca login` / `status` / `logout` | Store / inspect / remove the Alpaca market-data keys `tui` uses |
@@ -325,6 +326,32 @@ wickd list delete mon-11-9
 - Names: `a-z`, `0-9`, `-`, `_` (max 32).
 - Safe to run while the TUI is open or from several agents at once: every write
   re-reads the file under a lock and replaces it atomically.
+
+## `wickd playbook` — plain-language strategies
+
+Playbooks are markdown strategy docs written for a person, kept in
+`~/.wickd/playbooks/<name>.md` (or under `WICKD_HOME`). The agent looks one
+up when a conversation needs it and reads it as loose guidance, not a
+checklist; playbooks are never attached to every prompt.
+
+```sh
+wickd playbook add ~/strategies/rahagod.md --name rahagod   # copy it in
+wickd playbook ls                       # name, title, size of each
+wickd playbook show rahagod             # the full text
+wickd playbook search tenkan close      # matching sections
+wickd playbook rm rahagod
+```
+
+- Names follow the list rule (`a-z`, `0-9`, `-`, `_`, max 32). Without
+  `--name`, `add` uses the file's stem (`My Strategy.md` → `my-strategy`).
+  Re-adding a name replaces it (`replaced: true`).
+- The title is the file's first `# ` heading, else the name.
+- `search` is case-insensitive and finds sections containing every word.
+  Each playbook that matches comes back with `matches` (how many sections)
+  and up to 5 `sections`: the nearest heading and its paragraph, best
+  matches first (the words as a phrase, then under a heading naming them).
+- An unknown name or an invalid one exits 4; an empty store lists as
+  `{"playbooks":[]}`.
 
 ## `wickd quote` — daily stock prices
 
