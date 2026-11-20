@@ -8,6 +8,7 @@ pub mod backtest;
 pub mod books;
 pub mod calendar;
 pub mod candles;
+pub mod chart;
 pub mod client;
 pub mod dashboard;
 pub mod earnings;
