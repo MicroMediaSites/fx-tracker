@@ -133,7 +133,8 @@ pub fn add_at(dir: &Path, name: &str, text: &str) -> Result<bool> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = file_for(dir, name);
     let replaced = path.exists();
-    let tmp = dir.join(format!(".{name}.md.tmp"));
+    // Per-process tmp name, so concurrent adds never share one.
+    let tmp = dir.join(format!(".{name}.md.{}.tmp", std::process::id()));
     std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(replaced)
@@ -267,17 +268,18 @@ pub fn matching_sections(text: &str, words: &[String]) -> Vec<Section> {
 /// Split markdown into (heading, paragraphs) groups. Paragraphs are runs of
 /// non-blank lines; code fences are kept whole and never read as headings.
 fn split_sections(text: &str) -> Vec<(String, Vec<String>)> {
-    let mut groups: Vec<(String, Vec<String>)> = vec![(String::new(), Vec::new())];
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    // The group being filled: its heading and paragraphs.
+    let mut head = String::new();
+    let mut paras: Vec<String> = Vec::new();
     let mut para: Vec<&str> = Vec::new();
     let mut fence = false;
-    fn flush(groups: &mut [(String, Vec<String>)], para: &mut Vec<&str>) {
-        if !para.is_empty() {
-            let p = para.join("\n").trim().to_string();
-            if !p.is_empty() {
-                groups.last_mut().expect("one group").1.push(p);
-            }
-            para.clear();
+    fn flush(paras: &mut Vec<String>, para: &mut Vec<&str>) {
+        let p = para.join("\n").trim().to_string();
+        if !p.is_empty() {
+            paras.push(p);
         }
+        para.clear();
     }
     for line in text.lines() {
         let t = line.trim_start();
@@ -291,15 +293,17 @@ fn split_sections(text: &str) -> Vec<(String, Vec<String>)> {
             continue;
         }
         if let Some(h) = heading(t) {
-            flush(&mut groups, &mut para);
-            groups.push((h.to_string(), Vec::new()));
+            flush(&mut paras, &mut para);
+            let prev = std::mem::replace(&mut head, h.to_string());
+            groups.push((prev, std::mem::take(&mut paras)));
         } else if t.is_empty() {
-            flush(&mut groups, &mut para);
+            flush(&mut paras, &mut para);
         } else {
             para.push(line);
         }
     }
-    flush(&mut groups, &mut para);
+    flush(&mut paras, &mut para);
+    groups.push((head, paras));
     groups
         .into_iter()
         .filter(|(h, p)| !h.is_empty() || !p.is_empty())
