@@ -3,6 +3,8 @@
 //!
 //! Layout of the module:
 //! - [`app`]    — pure state machine (keys → state + [`app::Action`]s)
+//! - [`agent`]  — the agent panel (`a`): chat over `wickd agent ask`
+//! - [`context`] — what's on screen, as numbers, for the agent
 //! - [`ui`]     — rendering
 //! - [`search`] — local symbol ranking over the cached asset list
 //! - [`inplay`] — the "in play today" list (movers, actives, rvol, news)
@@ -29,6 +31,7 @@
 //! snapshot call every 15s, one batched sparkline-bars call and one clock
 //! call per minute, history on demand — well under 10/min at rest.
 
+pub mod agent;
 pub mod app;
 pub mod chart;
 pub mod context;
@@ -87,6 +90,11 @@ enum Request {
     Headlines(std::path::PathBuf, Vec<calendar::ReactionAsk>),
     /// Fetch what these companies reported into the results folder.
     Results(std::path::PathBuf, Vec<String>),
+    /// Ask the agent: `wickd agent ask`, with the screen's context.
+    Agent {
+        question: String,
+        context: Option<String>,
+    },
 }
 
 /// Results coming back to the run loop.
@@ -107,6 +115,10 @@ enum Reply {
     Earnings(Result<Vec<wickd_core::earnings_store::DayOutcome>, String>),
     Results(Result<Vec<wickd_core::earnings_results::ResultOutcome>, String>),
     Headlines((usize, usize, Option<String>)),
+    /// One `wickd agent ask` event, as it arrives.
+    AgentEvent(serde_json::Value),
+    /// The ask's process ended.
+    AgentDone(Result<(), String>),
     Reactions(
         Result<
             Vec<(
@@ -255,6 +267,21 @@ fn spawn_worker(client: AlpacaClient, replies: mpsc::Sender<Reply>) -> Unbounded
                     })
                 };
                 let reply = match req {
+                    // Streams: each event is sent on as it arrives, then
+                    // the exit.
+                    Request::Agent { question, context } => {
+                        let r = match std::env::current_exe() {
+                            Ok(exe) => {
+                                let tx = replies.clone();
+                                agent::run_ask(&exe, &question, context, move |ev| {
+                                    let _ = tx.send(Reply::AgentEvent(ev));
+                                })
+                                .await
+                            }
+                            Err(e) => Err(format!("couldn't find the wickd binary: {e}")),
+                        };
+                        Reply::AgentDone(r)
+                    }
                     Request::Snapshots(syms) => {
                         let syms = stocks(syms);
                         if syms.is_empty() {
@@ -492,6 +519,7 @@ pub async fn run(client: AlpacaClient, watchlist: Vec<String>, opts: Options) ->
     app.history_delayed = history_delayed;
     app.api_budget = Some(budget);
     app.refresh_secs = opts.refresh.as_secs();
+    app.agent = agent::Panel::at_data_home();
     tokio::task::spawn_blocking(move || run_loop(app, requests, reader_tx, reply_rx, wanted, opts))
         .await
         .context("tui task panicked")?
@@ -599,6 +627,8 @@ fn run_loop(
                 Reply::InPlay(r) => actions.extend(app.set_inplay(r)),
                 Reply::News(sym, r) => app.set_news(sym, r),
                 Reply::Reader(ev) => actions.extend(app.set_reader(ev)),
+                Reply::AgentEvent(ev) => app.agent.apply(&ev),
+                Reply::AgentDone(r) => app.agent.finished(r),
             }
         }
 
@@ -794,6 +824,9 @@ fn run_loop(
                     }
                 }
                 Action::FetchInfo(sym) => send(Request::Info(sym)),
+                Action::AgentAsk { question, context } => {
+                    send(Request::Agent { question, context })
+                }
                 Action::RemoveFromList { list, symbol } => {
                     // Locked read-modify-write: never clobbers an agent's edits.
                     let r = crate::lists::lists_path().and_then(|p| {

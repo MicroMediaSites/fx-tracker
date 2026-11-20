@@ -93,6 +93,11 @@ pub enum Action {
     },
     /// Take a company off the slate.
     SlateRemove(String),
+    /// Ask the agent (`wickd agent ask`), with the screen's context as JSON.
+    AgentAsk {
+        question: String,
+        context: Option<String>,
+    },
     Quit,
 }
 
@@ -476,6 +481,8 @@ pub struct App {
     pub api_budget: Option<wickd_core::equities::alpaca::RateLimitCell>,
     /// History runs ~15 min behind (any plan without real-time SIP).
     pub history_delayed: bool,
+    /// The agent panel (`a`), drawn over the current screen.
+    pub agent: super::agent::Panel,
 }
 
 impl App {
@@ -516,6 +523,7 @@ impl App {
             feed_label,
             history_delayed: true,
             api_budget: None,
+            agent: super::agent::Panel::default(),
         }
     }
 
@@ -908,6 +916,9 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return vec![Action::Quit];
         }
+        if self.agent.open {
+            return self.on_agent_key(key);
+        }
         if self.show_help {
             // Any key closes help.
             self.show_help = false;
@@ -933,6 +944,11 @@ impl App {
         let (pending, step) = keymap::step(ctx, self.pending.as_ref(), tok);
         self.pending = pending;
         match step {
+            // Every screen: the panel opens over it and leaves it as it is.
+            Step::Act(Cmd::Agent, _) => {
+                self.agent.open();
+                vec![]
+            }
             Step::Act(cmd, n) => match ctx {
                 Ctx::Watchlist => self.exec_watchlist(cmd, n),
                 Ctx::Detail => self.exec_detail(cmd),
@@ -941,6 +957,26 @@ impl App {
                 Ctx::Calendar => self.exec_calendar(cmd),
             },
             Step::Pending | Step::Cancel | Step::None => vec![],
+        }
+    }
+
+    /// Keys while the agent panel is open: all of them go to the panel.
+    fn on_agent_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        match self.agent.on_key(key) {
+            super::agent::PanelKey::Nothing => vec![],
+            super::agent::PanelKey::Close => {
+                self.agent.open = false;
+                vec![]
+            }
+            super::agent::PanelKey::Send(s) => {
+                let context = s
+                    .attach
+                    .then(|| super::context::screen(self).to_string());
+                vec![Action::AgentAsk {
+                    question: s.question,
+                    context,
+                }]
+            }
         }
     }
 

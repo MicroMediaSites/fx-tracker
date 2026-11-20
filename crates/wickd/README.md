@@ -53,6 +53,17 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
 - **Find** (`g f`): on any list, type to filter by ticker or company name
   (case-insensitive). `↑`/`↓` pick among the matches, `enter` jumps the
   cursor to that line in the full list, and `esc` cancels.
+- **Agent** (`a`, on every screen): a chat panel over the screen with the
+  saved `wickd agent` session. Each message carries what's on screen: on a
+  chart its symbol, timeframe, recent bars, Ichimoku (and the daily
+  averages), cursor candle and price lines; on a list or the calendar its
+  rows; elsewhere the screen's name. The answer streams in (a quiet
+  "thinking…" while it looks things up), `enter` sends, `↑`/`↓` and
+  `pgup`/`pgdn` scroll, `esc` closes and leaves the screen as it was.
+  While it's open every key types into the panel. `/clear` and `/compact`
+  do what they do in `wickd agent`. The conversation reappears when you
+  reopen the panel, and after a restart (`~/.wickd/agent/transcript.json`;
+  `/clear` empties it).
 - **Keys** are Helix-style. Bare keys move (`j`/`k`, arrows), open (`enter`),
   back out (`esc`), search (`/`), refresh (`r`) and quit (`q`). A prefix letter
   opens a category, and a panel lists the next keys:
@@ -134,9 +145,9 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
     screen opens, only for watched companies whose report is out and that
     have none stored, and no more than once every half hour per report.
     Nothing is fetched for companies nobody picked.
-  - **Everything** (`a`). From today on, every company that reports and
+  - **Everything** (`e`). From today on, every company that reports and
     every US release, watched companies first in each session, then largest
-    first. This is where you browse to add to the slate. `a` again returns
+    first. This is where you browse to add to the slate. `e` again returns
     to the watch.
   - **Keys.** `s` puts the company under the cursor on the slate for that
     report, or takes it off; an entry with a why or an expectation written
@@ -405,8 +416,9 @@ calls the `wickd` on `PATH`, so keep the installed binary current
 
 ## `wickd agent` — the saved, read-only agent session
 
-The engine behind the chat: one conversation that survives restarts, gives
-market reads (judgment with reasons, playbooks as loose guidance, news and
+The engine behind the chat (`a` in `wickd tui` runs `wickd agent ask
+--context -` with the screen attached): one conversation that survives
+restarts, gives market reads (judgment with reasons, playbooks as loose guidance, news and
 sentiment), never orders. It runs the `claude` CLI on the subscription login
 (same binary and `CLAUDE_CONFIG_DIR` resolution as `wickd feed ask`) and
 resumes the saved session on every ask.

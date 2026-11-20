@@ -171,6 +171,11 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.show_help {
         render_help(frame, frame.area(), app.mode);
     }
+    if app.agent.open {
+        let sees = super::context::screen_label(app);
+        let left = app.mode == Mode::Detail;
+        super::agent::render(frame, chunks[1], &app.agent, &sees, left);
+    }
 }
 
 /// The journal (`g j`): one markdown entry, laid out for the page width and
@@ -3112,6 +3117,9 @@ mod tests {
                 if cell.modifier.contains(Modifier::DIM) {
                     style.push_str("opacity:.55;");
                 }
+                if cell.modifier.contains(Modifier::ITALIC) {
+                    style.push_str("font-style:italic;");
+                }
                 let sym = cell
                     .symbol()
                     .replace('&', "&amp;")
@@ -3762,7 +3770,7 @@ mod tests {
         assert!(line("Palo Alto").contains("★ PANW"), "{}", line("Palo Alto"));
         // Bigger than anything shown, and not picked: not here.
         assert!(!all.contains("TJX Companies") && !all.contains("HUYA"));
-        assert!(all.contains("2 other companies report · a shows everything"));
+        assert!(all.contains("2 other companies report · e shows everything"));
         // Event titles and tickers start in the same column.
         let column = |line: &str, needle: &str| line[..line.find(needle).unwrap()].chars().count();
         assert_eq!(
@@ -4037,7 +4045,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = calendar_app(tmp.path());
         open_calendar(&mut app);
-        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('e'));
         assert_eq!(app.flash.as_deref(), Some("showing everything that reports"));
         app.flash = None;
         let rows = screen(&app, 130, 34);
@@ -4074,7 +4082,7 @@ mod tests {
             "{more:?}"
         );
         // Back on the watch, it is there.
-        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('e'));
         let all = screen(&app, 130, 30).join("\n");
         assert!(all.contains("◆ TJX") && !all.contains("HUYA"), "{all}");
     }
@@ -4301,7 +4309,7 @@ mod tests {
         // Back to the top, then a different row set: the heading is back.
         press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Char('g'));
-        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('e'));
         let rows = screen(&app, w, h);
         assert!(rows[3].contains("Yesterday · Tue Nov 17"), "{}", rows.join("\n"));
     }
@@ -4327,7 +4335,7 @@ mod tests {
         let earn = tmp.path().join("no-earnings");
         std::fs::create_dir_all(&earn).unwrap();
         std::fs::write(earn.join("2026-11-18.json"), b"not json").unwrap();
-        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('e'));
         let all = screen(&app, 130, 30).join("\n");
         assert!(all.contains("couldn't read the calendar"), "{all}");
         assert!(all.contains("2026-11-18.json"), "{all}");
@@ -4408,10 +4416,10 @@ mod tests {
         }
         press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Char('g'));
-        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('e'));
         app.flash = None;
         shoot(&app, "5-everything", w, h);
-        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('e'));
         app.calendar.go_next_upcoming();
         app.flash = None;
         shoot(&app, "6-narrow-100", 100, 40);
@@ -5063,5 +5071,320 @@ mod tests {
             short_name("SPDR S&P 500 ETF Trust"),
             "SPDR S&P 500 ETF Trust"
         );
+    }
+
+    // ── the agent panel (AGT-2549) ──────────────────────────────────────────
+
+    /// `a`, a typed key, then `esc`: the panel opens over the screen, keys go
+    /// to its input, and closing leaves the screen exactly as it was.
+    fn agent_round_trip(app: &mut App, sees: &str) {
+        let mode = app.mode;
+        let before = screen(app, 140, 30);
+        assert!(press(app, KeyCode::Char('a')).is_empty());
+        assert!(app.agent.open, "{mode:?}");
+        let open = screen(app, 140, 30).join("\n");
+        assert!(open.contains(&format!("agent · sees {sees}")), "{mode:?}: {open}");
+        assert!(open.contains("ask about this screen…"), "{open}");
+        // `q`, `j` and `?` type; they don't go back, move or open help.
+        for c in ['q', 'j', '?'] {
+            assert!(press(app, KeyCode::Char(c)).is_empty());
+        }
+        assert_eq!(app.agent.input.text, "qj?");
+        assert!(!app.show_help);
+        assert!(screen(app, 140, 30).join("\n").contains("› qj?"));
+        for _ in 0..3 {
+            press(app, KeyCode::Backspace);
+        }
+        press(app, KeyCode::Esc);
+        assert!(!app.agent.open);
+        assert_eq!(app.mode, mode);
+        assert_eq!(screen(app, 140, 30), before, "{mode:?}");
+    }
+
+    #[test]
+    fn agent_panel_opens_over_every_screen_and_esc_leaves_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("journal")).unwrap();
+        std::fs::write(tmp.path().join("journal/2026-11-18.md"), "# Wednesday\n\nplan").unwrap();
+        app.journal = crate::tui::journal::JournalState::new(tmp.path().join("journal"));
+        assert_eq!(app.mode, Mode::Watchlist);
+        agent_round_trip(&mut app, "the watchlist");
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('i'));
+        agent_round_trip(&mut app, "in play today");
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('j'));
+        agent_round_trip(&mut app, "journal 2026-11-18");
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Detail);
+        let sym = app.detail.as_ref().unwrap().symbol.clone();
+        agent_round_trip(&mut app, &format!("{sym} 5m chart"));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('c'));
+        open_calendar(&mut app);
+        agent_round_trip(&mut app, "the calendar (your watch)");
+        // The watch ↔ everything toggle is on `e` now.
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.calendar.show_all);
+        app.flash = None;
+        agent_round_trip(&mut app, "the calendar (everything)");
+    }
+
+    #[test]
+    fn agent_panel_streams_an_answer_over_the_chart_and_keeps_it() {
+        use crate::tui::app::Action;
+        let mut app = sample_app();
+        press(&mut app, KeyCode::Enter); // SPY
+        app.set_history("SPY", HistoryRange::Day1, Ok(walk(78, 684.0)));
+        draw(&app, 150, 30);
+        press(&mut app, KeyCode::Char('a'));
+        for c in "is SPY above the cloud?".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let acts = press(&mut app, KeyCode::Enter);
+        let [Action::AgentAsk { question, context: Some(ctx) }] = acts.as_slice() else {
+            panic!("{acts:?}");
+        };
+        assert_eq!(question, "is SPY above the cloud?");
+        let ctx: serde_json::Value = serde_json::from_str(ctx).unwrap();
+        assert_eq!(ctx["screen"], "chart");
+        assert_eq!(ctx["symbol"], "SPY");
+        assert_eq!(ctx["timeframe"], "5m");
+        assert_eq!(ctx["bars"].as_array().unwrap().len(), 60);
+        assert!(ctx["cursor"]["close"].is_number() && ctx["price_lines"].is_object());
+        assert!(ctx["bars"][59]["ichimoku"].is_object());
+
+        app.agent.apply(&serde_json::json!({"type":"status","status":"requesting"}));
+        let s = draw(&app, 150, 30);
+        assert!(s.contains("› is SPY above the cloud?") && s.contains("thinking…"), "{s}");
+        app.agent.apply(&serde_json::json!({"type":"text","delta":"Yes, **just**: price sits"}));
+        let s = draw(&app, 150, 30);
+        assert!(s.contains("Yes, just: price sits") && !s.contains("thinking…"), "{s}");
+        // The chart is still there, left of the panel.
+        assert!(s.contains("SPY"), "{s}");
+        app.agent.apply(&serde_json::json!({"type":"text","delta":" above both spans."}));
+        app.agent.apply(&serde_json::json!({
+            "type": "done",
+            "answer": "Yes, **just**: price sits above both spans.",
+            "session_id": "s",
+            "turns": 1,
+        }));
+        if std::env::var("WICKD_TUI_DUMP").is_ok() {
+            println!("{}\n", draw(&app, 150, 30));
+        }
+        press(&mut app, KeyCode::Esc);
+        assert!(!draw(&app, 150, 30).contains("above both spans"));
+        press(&mut app, KeyCode::Char('a'));
+        let s = draw(&app, 150, 30);
+        assert!(s.contains("price sits above both spans."), "reopens with the conversation: {s}");
+        // Narrow terminals get the full width.
+        let s = draw(&app, 90, 20);
+        assert!(s.lines().nth(1).unwrap().starts_with("┌ agent"), "{s}");
+    }
+
+    #[test]
+    fn agent_context_carries_list_and_calendar_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        let mut lists = crate::lists::ListsFile::default();
+        let fields = crate::lists::Fields {
+            note: Some("buy above 185".into()),
+            plan: Some("+3% by Fri".into()),
+        };
+        crate::lists::add(&mut lists, "thu-11-19", &["NVDA".to_string()], &fields, Utc::now());
+        app.set_lists(lists);
+        let ctx = crate::tui::context::screen(&app);
+        assert_eq!(ctx["screen"], "watchlist");
+        assert_eq!(ctx["list"]["name"], "thu-11-19");
+        let row = &ctx["list"]["rows"][0];
+        assert_eq!(row["symbol"], "NVDA");
+        assert_eq!(row["note"], "buy above 185");
+        assert_eq!(row["plan"], "+3% by Fri");
+        assert!(ctx["watchlist"].is_array());
+        assert_eq!(crate::tui::context::screen_label(&app), "the thu-11-19 list and watchlist");
+
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('c'));
+        open_calendar(&mut app);
+        let ctx = crate::tui::context::screen(&app);
+        assert_eq!(ctx["screen"], "calendar");
+        assert_eq!(ctx["showing"], "your watch");
+        let rows = ctx["rows"].as_array().unwrap();
+        let earn = rows.iter().find(|r| r["type"] == "earnings").expect("an earnings row");
+        for k in ["symbol", "session", "day"] {
+            assert!(earn[k].is_string(), "{k}: {earn}");
+        }
+        assert!(rows.iter().any(|r| r["type"] == "economic" && r["event"].is_string()), "{rows:?}");
+        assert_eq!(ctx["selected"].as_str(), app.calendar.selected_symbol());
+
+        // In play and search say what they are.
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(crate::tui::context::screen(&app)["screen"], "in play today");
+    }
+
+    #[test]
+    fn help_and_footer_list_the_agent_key_and_the_calendar_toggle_on_e() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(tmp.path());
+        let foot = screen(&app, 220, 20).join("\n");
+        assert!(foot.contains("a ask the agent"), "{foot}");
+        press(&mut app, KeyCode::Char('?'));
+        let help = screen(&app, 120, 50).join("\n");
+        assert!(help.contains("ask the agent"), "{help}");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('c'));
+        open_calendar(&mut app);
+        let foot = screen(&app, 220, 30);
+        let foot = foot.last().unwrap();
+        assert!(foot.contains("e your watch ↔ everything"), "{foot}");
+        assert!(foot.contains("a ask the agent"), "{foot}");
+        press(&mut app, KeyCode::Char('?'));
+        let help = screen(&app, 120, 34);
+        let line = |k: &str, label: &str| {
+            let row = format!("  {k:<14}{label}");
+            help.iter().any(|l| l.contains(&row))
+        };
+        assert!(line("e", "your watch ↔ everything"), "{}", help.join("\n"));
+        assert!(line("a", "ask the agent"), "{}", help.join("\n"));
+        // Wide enough for the whole key bar, at the real width.
+        press(&mut app, KeyCode::Esc);
+        let foot = screen(&app, 160, 30);
+        assert!(foot.last().unwrap().contains("a ask the agent"), "{}", foot.last().unwrap());
+    }
+
+    /// The agent panel's screenshots (AGT-2549):
+    /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_agent_panel -- --ignored`
+    /// writes HTML renders of the panel over the EUR_USD 1h chart (live
+    /// OANDA bars), over the calendar (the real stores under the wickd data
+    /// home, read only), its first-open state, and the calendar's keys.
+    /// With `WICKD_SNAPSHOT_ASK=1` the chart's first answer is a real `wickd
+    /// agent ask` through the panel's own code path (the debug wickd binary,
+    /// with `WICKD_HOME` pointed at a scratch folder so the real session is
+    /// untouched); otherwise the conversation is a written stand-in.
+    #[tokio::test]
+    #[ignore]
+    async fn snapshot_agent_panel() {
+        use serde_json::json;
+        let dir = std::env::var("WICKD_TUI_SNAPSHOT_DIR").expect("set WICKD_TUI_SNAPSHOT_DIR");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shoot = |app: &App, name: &str, w: u16, h: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, app)).unwrap();
+            term.draw(|f| render(f, app)).unwrap();
+            std::fs::write(
+                format!("{dir}/{name}.html"),
+                to_html(term.backend().buffer(), name),
+            )
+            .unwrap();
+        };
+        let (w, h) = (160u16, 45u16);
+        let events = |app: &mut App, evs: &[serde_json::Value]| {
+            for e in evs {
+                app.agent.apply(e);
+            }
+        };
+        let ask = |app: &mut App, q: &str| -> Option<String> {
+            for c in q.chars() {
+                press(app, KeyCode::Char(c));
+            }
+            match press(app, KeyCode::Enter).pop() {
+                Some(crate::tui::app::Action::AgentAsk { context, .. }) => context,
+                other => panic!("{other:?}"),
+            }
+        };
+
+        // 1. EUR_USD on the 1h chart (the 1M range), live bars.
+        let client = super::super::oanda_client().expect("OANDA practice credentials");
+        let now = Utc::now();
+        let sym = "EUR_USD";
+        let mut app = App::new(vec![sym.to_string()], "IEX");
+        app.set_fx_assets(fx::instruments(&client).await.unwrap());
+        app.fx_quotes = fx::quotes(&client, &[sym.to_string()], now).await.unwrap();
+        app.fx_live = true;
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('3'));
+        let (warm, vis) = fx::history(&client, sym, HistoryRange::Month1, now).await.unwrap();
+        app.set_warmup(sym, HistoryRange::Month1, warm);
+        app.set_history(sym, HistoryRange::Month1, Ok(vis));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('i'));
+        app.flash = None;
+        shoot(&app, "0-eur_usd-1h-chart-before", w, h);
+        press(&mut app, KeyCode::Char('a'));
+        shoot(&app, "3-first-open-empty-over-chart", w, h);
+        let q1 = "Where is price against the cloud on this chart, and what would change your read?";
+        let ctx = ask(&mut app, q1);
+        if std::env::var("WICKD_SNAPSHOT_ASK").is_ok() {
+            let scratch = tempfile::tempdir().unwrap();
+            std::env::set_var("WICKD_HOME", scratch.path());
+            let exe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/debug/wickd");
+            let got = std::sync::Mutex::new(Vec::new());
+            let r = crate::tui::agent::run_ask(&exe, q1, ctx, |ev| got.lock().unwrap().push(ev))
+                .await;
+            let got = got.into_inner().unwrap();
+            let lines: String = got.iter().map(|e| format!("{e}\n")).collect();
+            std::fs::write(format!("{dir}/ask-events.jsonl"), lines).unwrap();
+            // Replay up to the middle of the answer for a mid-stream shot.
+            let texts = got.iter().filter(|e| e["type"] == "text").count();
+            let mut seen = 0;
+            for e in &got {
+                if e["type"] == "text" {
+                    seen += 1;
+                    if seen == texts / 2 {
+                        shoot(&app, "1a-chart-answer-streaming", w, h);
+                    }
+                }
+                app.agent.apply(e);
+            }
+            app.agent.finished(r);
+        } else {
+            events(&mut app, &[
+                json!({"type":"status","status":"requesting"}),
+                json!({"type":"tool","name":"Bash","input":{"command":"wickd playbook search ichimoku"}}),
+            ]);
+            shoot(&app, "1a-chart-thinking-with-lookup", w, h);
+            events(&mut app, &[
+                json!({"type":"text","delta":"Price is **above the cloud** on the 1h, but only just: the last few candles closed a few pips over span A, with the Kijun flat beneath them.\n\n"}),
+                json!({"type":"text","delta":"- Tenkan has crossed back over the Kijun, a mild bullish turn.\n- The cloud ahead is thin and twists within a day, so support there is weak.\n"}),
+            ]);
+            shoot(&app, "1b-chart-answer-streaming", w, h);
+            events(&mut app, &[
+                json!({"type":"text","delta":"\nWhat would change my read: a close back inside the cloud, or Chikou dropping under price from 26 bars ago."}),
+                json!({"type":"done","answer":"","session_id":"s","turns":1}),
+            ]);
+        }
+        shoot(&app, "1-panel-over-eur_usd-1h-chart", w, h);
+
+        // 2. The calendar, real stores (read only).
+        let mut app = App::new(crate::tui::store::load_watchlist().unwrap_or_default(), "iex");
+        if let Ok(f) = crate::lists::lists_path().and_then(|p| crate::lists::load_at(&p)) {
+            app.set_lists(f);
+        }
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('c'));
+        app.set_earnings_fetch(Ok(vec![]));
+        app.set_headlines(Ok((0, 0, None)));
+        app.set_results(Ok(vec![]));
+        app.calendar.reactions_loading = false;
+        app.flash = None;
+        // 4. The calendar's keys: the toggle on `e`, the agent on `a`.
+        shoot(&app, "4a-calendar-key-bar", w, h);
+        press(&mut app, KeyCode::Char('?'));
+        shoot(&app, "4b-calendar-help-e-toggle-a-agent", w, h);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('a'));
+        let _ = ask(&mut app, "Which of these reports matters most for my watchlist this week?");
+        events(&mut app, &[
+            json!({"type":"tool","name":"Bash","input":{"command":"wickd earnings slate ls"}}),
+            json!({"type":"text","delta":"Of what's on screen, the slate names carry the most for you: their expectations are written down, so the reaction is something you can check against."}),
+            json!({"type":"done","answer":"","session_id":"s","turns":2}),
+        ]);
+        shoot(&app, "2-panel-over-calendar", w, h);
     }
 }

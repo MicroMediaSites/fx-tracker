@@ -8,16 +8,19 @@
 //! renders from, so `wickd chart context` and the chart never disagree.
 //!
 //! [`open_chart`] returns the same structure for the chart the TUI has open,
-//! plus its cursor bar and price lines, for the agent panel to attach.
+//! plus its cursor bar and price lines, and [`screen`] wraps it (or a list's
+//! or the calendar's rows) for the agent panel to attach to every message.
 //!
 //! Values only: nothing here judges a setup or checks a rule (D-20).
 
 use chrono::{DateTime, Utc};
+use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
+use serde_json::{json, Value};
 
 use wickd_core::equities::{Bar, HistoryRange};
 
-use super::app::App;
+use super::app::{App, Mode};
 use super::chart::{self, LevelKind, ICHI_KIJUN, ICHI_SENKOU_B, ICHI_SHIFT, ICHI_TENKAN};
 use super::fx;
 
@@ -325,8 +328,6 @@ fn build_all(
 
 // ── the chart the TUI has open ──────────────────────────────────────────────
 
-// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
-#[allow(dead_code)]
 /// The candle under the chart's cursor (merged candles cover several bars).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CursorContext {
@@ -350,28 +351,33 @@ pub struct CursorContext {
     pub ichimoku: IchimokuAt,
 }
 
-// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
-#[allow(dead_code)]
+/// Which reference line a chart draws on 1D.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Reference {
+    /// Stocks: the previous session's close.
+    #[serde(rename = "prev close")]
+    PrevClose,
+    /// Pairs: the trading day's open (17:00 New York).
+    #[serde(rename = "day open")]
+    DayOpen,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ReferenceLine {
     /// `prev close` (stocks) or `day open` (pairs), on 1D only.
-    pub label: &'static str,
+    pub label: Reference,
     pub price: f64,
 }
 
-// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LevelLine {
     /// `support` or `resistance`.
-    pub kind: &'static str,
+    pub kind: LevelKind,
     pub price: f64,
     /// Swing points that formed it.
     pub touches: usize,
 }
 
-// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
-#[allow(dead_code)]
 /// The horizontal lines on the chart.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PriceLines {
@@ -383,8 +389,6 @@ pub struct PriceLines {
     pub levels: Vec<LevelLine>,
 }
 
-// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
-#[allow(dead_code)]
 /// What's toggled on the open chart.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ViewState {
@@ -396,8 +400,6 @@ pub struct ViewState {
     pub bars_per_candle: usize,
 }
 
-// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
-#[allow(dead_code)]
 /// [`ChartContext`] for the chart the TUI has open, with its cursor and
 /// price lines.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -409,8 +411,6 @@ pub struct OpenChartContext {
     pub view: ViewState,
 }
 
-// AGT-2547 AC4: the agent panel ticket attaches this; until then only tests call it.
-#[allow(dead_code)]
 /// The context of the chart open in the TUI (`None` when no chart is open or
 /// its history hasn't loaded), with the newest `n` bars.
 pub fn open_chart(app: &App, n: usize) -> Option<OpenChartContext> {
@@ -448,10 +448,7 @@ pub fn open_chart(app: &App, n: usize) -> Option<OpenChartContext> {
         chart::swing_levels(&candles[s..e], 3)
             .into_iter()
             .map(|l| LevelLine {
-                kind: match l.kind {
-                    LevelKind::Support => "support",
-                    LevelKind::Resistance => "resistance",
-                },
+                kind: l.kind,
                 price: l.price,
                 touches: l.touches,
             })
@@ -466,9 +463,9 @@ pub fn open_chart(app: &App, n: usize) -> Option<OpenChartContext> {
             price_line: d.chart.price,
             reference: reference.map(|price| ReferenceLine {
                 label: if fx::is_fx(&d.symbol) {
-                    "day open"
+                    Reference::DayOpen
                 } else {
-                    "prev close"
+                    Reference::PrevClose
                 },
                 price,
             }),
@@ -482,6 +479,241 @@ pub fn open_chart(app: &App, n: usize) -> Option<OpenChartContext> {
             fit: d.chart.fit,
             bars_per_candle: candles.iter().map(|c| c.bars).max().unwrap_or(1),
         },
+    })
+}
+
+// ── the whole screen, for the agent panel ──────────────────────────────────
+
+/// Bars of the open chart attached to an agent message (the same default as
+/// `wickd chart context --bars`).
+pub const SCREEN_CHART_BARS: usize = 60;
+
+/// Calendar rows attached at most (the watch is a few dozen; "everything"
+/// can run to hundreds).
+const SCREEN_CALENDAR_ROWS: usize = 150;
+
+/// Journal text attached at most, in characters.
+const SCREEN_JOURNAL_CHARS: usize = 8_000;
+
+/// What's on the current screen, attached to every message the agent panel
+/// sends (D-21): the open chart's [`OpenChartContext`], a list's or the
+/// calendar's rows, the open journal entry, or at least the screen's name.
+/// Values only, like the rest of this module.
+pub fn screen(app: &App) -> Value {
+    match app.mode {
+        Mode::Detail => match open_chart(app, SCREEN_CHART_BARS) {
+            Some(c) => tagged("chart", serde_json::to_value(c).unwrap_or(Value::Null)),
+            None => {
+                let d = app.detail.as_ref();
+                json!({
+                    "screen": "chart",
+                    "symbol": d.map(|d| d.symbol.clone()),
+                    "range": d.map(|d| d.range.label()),
+                    "loading": true,
+                })
+            }
+        },
+        Mode::Watchlist => watchlist_screen(app),
+        Mode::InPlay => inplay_screen(app),
+        Mode::Calendar => calendar_screen(app),
+        Mode::Journal => {
+            let j = &app.journal;
+            json!({
+                "screen": "journal",
+                "entry": j.current().map(|e| e.name.clone()),
+                "text": j.text.chars().take(SCREEN_JOURNAL_CHARS).collect::<String>(),
+            })
+        }
+        Mode::Search => json!({ "screen": "search", "query": app.search.query }),
+    }
+}
+
+/// What [`screen`] attaches, in a few words for the panel's title:
+/// `EUR_USD 1h chart`, `the calendar (your watch)`.
+pub fn screen_label(app: &App) -> String {
+    match app.mode {
+        Mode::Detail => match &app.detail {
+            Some(d) => format!("{} {} chart", d.symbol, Timeframe::of_range(d.range).label),
+            None => "the chart".into(),
+        },
+        Mode::Watchlist => match app.lists.get(app.expanded) {
+            Some((name, _)) => format!("the {name} list and watchlist"),
+            None => "the watchlist".into(),
+        },
+        Mode::InPlay => "in play today".into(),
+        Mode::Calendar => format!(
+            "the calendar ({})",
+            if app.calendar.show_all { "everything" } else { "your watch" }
+        ),
+        Mode::Journal => match app.journal.current() {
+            Some(e) => format!("journal {}", e.name),
+            None => "the journal".into(),
+        },
+        Mode::Search => "search".into(),
+    }
+}
+
+/// `{"screen": name, ...fields}`.
+fn tagged(name: &str, body: Value) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("screen".into(), json!(name));
+    if let Value::Object(m) = body {
+        out.extend(m);
+    }
+    Value::Object(out)
+}
+
+/// A symbol's last price and change today, as the rows show them.
+fn quote_fields(app: &App, sym: &str) -> (Option<String>, Option<f64>) {
+    if fx::is_fx(sym) {
+        match app.fx_quotes.get(sym) {
+            Some(q) => (
+                Some(q.mid().to_string()),
+                q.change_pct().and_then(|c| c.to_f64()),
+            ),
+            None => (None, None),
+        }
+    } else {
+        match app.snapshots.get(sym) {
+            Some(s) => (s.last().map(|p| p.to_string()), s.change_pct()),
+            None => (None, None),
+        }
+    }
+}
+
+fn name_of(app: &App, sym: &str) -> Option<String> {
+    app.asset(sym).map(|a| a.name.clone())
+}
+
+/// The watchlist screen: the open list's rows (symbol, name, note, plan),
+/// the other lists by name, and the watchlist with prices.
+fn watchlist_screen(app: &App) -> Value {
+    let list = app.lists.get(app.expanded).map(|(name, entries)| {
+        let rows: Vec<Value> = entries
+            .iter()
+            .map(|e| {
+                json!({
+                    "symbol": e.symbol,
+                    "name": name_of(app, &e.symbol),
+                    "note": e.note,
+                    "plan": e.plan,
+                })
+            })
+            .collect();
+        json!({ "name": name, "rows": rows })
+    });
+    let other_lists: Vec<&str> = app
+        .lists
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != app.expanded)
+        .map(|(_, (n, _))| n.as_str())
+        .collect();
+    let watchlist: Vec<Value> = app
+        .watchlist
+        .iter()
+        .map(|sym| {
+            let (last, change_pct) = quote_fields(app, sym);
+            json!({
+                "symbol": sym,
+                "name": name_of(app, sym),
+                "last": last,
+                "change_pct": change_pct,
+            })
+        })
+        .collect();
+    json!({
+        "screen": "watchlist",
+        "selected": app.selected_symbol(),
+        "list": list,
+        "other_lists": other_lists,
+        "watchlist": watchlist,
+    })
+}
+
+/// The in-play screen: its rows as filtered and sorted on screen.
+fn inplay_screen(app: &App) -> Value {
+    let rows: Vec<Value> = app
+        .inplay
+        .visible()
+        .iter()
+        .map(|r| {
+            let tags: Vec<&str> = r.tags.iter().map(|t| t.label()).collect();
+            json!({
+                "symbol": r.symbol,
+                "name": name_of(app, &r.symbol),
+                "last": r.last,
+                "change_pct": r.chg_pct,
+                "from_open_pct": r.from_open_pct,
+                "volume": r.volume,
+                "relative_volume": r.rvol,
+                "tags": tags,
+                "headlines": r.news_count,
+            })
+        })
+        .collect();
+    json!({
+        "screen": "in play today",
+        "selected": app.inplay.selected_symbol(),
+        "rows": rows,
+    })
+}
+
+/// The calendar screen: every row it shows, each with the day it falls
+/// under.
+fn calendar_screen(app: &App) -> Value {
+    use super::calendar::Row;
+    let cal = &app.calendar;
+    let mut day = String::new();
+    let mut rows: Vec<Value> = Vec::new();
+    for row in &cal.rows {
+        let v = match row {
+            Row::Day(label) => {
+                day = label.clone();
+                continue;
+            }
+            Row::Blank => continue,
+            Row::Note(text) => json!({ "day": day, "note": text }),
+            Row::Econ(e) => json!({
+                "day": day,
+                "type": "economic",
+                "time": e.time,
+                "event": e.event,
+                "impact": e.impact,
+                "forecast": e.forecast,
+                "previous": e.previous,
+                "past": e.past,
+            }),
+            Row::Earn(e) => json!({
+                "day": day,
+                "type": "earnings",
+                "symbol": e.symbol,
+                "name": e.name,
+                "date": e.date,
+                "session": super::calendar::session_text(e.session),
+                "eps_forecast": e.eps_forecast.map(|d| d.to_string()),
+                "last_year_eps": e.last_year_eps.map(|d| d.to_string()),
+                "market_cap": e.market_cap.map(|d| d.to_string()),
+                "on_slate": e.slate,
+                "on_a_list": e.listed,
+                "why": e.why,
+                "expect": e.expect,
+                "result": e.result,
+                "reported": cal.reported_of(e),
+                "reaction": cal.reaction_of(e),
+                "past": e.past,
+            }),
+        };
+        rows.push(v);
+        if rows.len() == SCREEN_CALENDAR_ROWS {
+            break;
+        }
+    }
+    json!({
+        "screen": "calendar",
+        "showing": if cal.show_all { "everything that reports" } else { "your watch" },
+        "selected": cal.selected_symbol(),
+        "rows": rows,
     })
 }
 

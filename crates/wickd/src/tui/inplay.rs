@@ -44,6 +44,16 @@ impl Tag {
             Tag::Watch => "★",
         }
     }
+
+    /// Why the row is on the list, in words (the agent panel's context).
+    pub fn label(self) -> &'static str {
+        match self {
+            Tag::Gainer => "top gainer",
+            Tag::Loser => "top loser",
+            Tag::Active => "most active",
+            Tag::Watch => "on the watchlist",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
