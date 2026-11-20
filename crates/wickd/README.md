@@ -441,8 +441,8 @@ wickd agent status                # {"session": {...}} or {"session": null}
   `session_id`, `turns`, `cost_usd`). A failure ends with
   `{"type":"error","code","message"}` and a non-zero exit.
 - `--context <json|->` attaches what's on the screen (e.g. `wickd chart
-  context` output), fenced as data. `--model` (default `sonnet`, like `feed
-  ask`), `--claude <path>`, `--timeout-secs` (default 300).
+  context` output), fenced as data. `--model` (default `fable`),
+  `--claude <path>`, `--timeout-secs` (default 300).
 - The session id lives in `~/.wickd/agent/session.json` (under `WICKD_HOME`
   when set); that directory is also the `claude` working directory, which is
   what `--resume` keys on. `/clear` deletes the file. `/compact` runs Claude
