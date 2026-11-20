@@ -403,6 +403,48 @@ Copy the directory instead of linking if the checkout moves. The session
 calls the `wickd` on `PATH`, so keep the installed binary current
 (`cargo install --path crates/wickd`) when the commands change.
 
+## `wickd agent` — the saved, read-only agent session
+
+The engine behind the chat: one conversation that survives restarts, gives
+market reads (judgment with reasons, playbooks as loose guidance, news and
+sentiment), never orders. It runs the `claude` CLI on the subscription login
+(same binary and `CLAUDE_CONFIG_DIR` resolution as `wickd feed ask`) and
+resumes the saved session on every ask.
+
+```sh
+wickd agent ask "what's EUR_USD doing on the 1h chart?"
+wickd agent ask "how does it fit the rahagod playbook?" --context screen.json
+wickd agent ask /compact          # or: wickd agent compact
+wickd agent ask /clear            # or: wickd agent clear
+wickd agent status                # {"session": {...}} or {"session": null}
+```
+
+- `ask` prints JSON lines: `session` (id, `resumed`), `text` (`delta`, the
+  streamed answer), `tool` (a lookup it ran), `denied`, `status`,
+  `compacted`, `notice`, then `done` (`answer` = the whole turn's text,
+  `session_id`, `turns`, `cost_usd`). A failure ends with
+  `{"type":"error","code","message"}` and a non-zero exit.
+- `--context <json|->` attaches what's on the screen (e.g. `wickd chart
+  context` output), fenced as data. `--model` (default `sonnet`, like `feed
+  ask`), `--claude <path>`, `--timeout-secs` (default 300).
+- The session id lives in `~/.wickd/agent/session.json` (under `WICKD_HOME`
+  when set); that directory is also the `claude` working directory, which is
+  what `--resume` keys on. `/clear` deletes the file. `/compact` runs Claude
+  Code's own `/compact` on the session (same id, a `compacted` event);
+  Claude Code also compacts on its own when the conversation gets long. A
+  saved id Claude Code no longer has starts a new conversation with a
+  `notice`. Other `/` commands are refused.
+- Tools: every read-only wickd command (`agent::COMMANDS` classifies each
+  command as Read, Write or Excluded; a test fails when a new command isn't
+  classified), web search and fetch, and reads under `~/trading-journal`.
+  No trade, approve, order, login, list/slate/playbook edits, strategy
+  runs or file writes; `--store`, `--url` and `--follow` are denied on every
+  command. `claude` runs with `--restricted --safe-mode --strict-mcp-config
+  --permission-mode dontAsk`, so your own Claude settings, CLAUDE.md, hooks
+  and MCP servers don't apply and anything not allowed is denied.
+- The agent calls the `wickd` that is running `agent ask` (its directory is
+  put first on the child's `PATH`).
+
 ## `wickd quote` — daily stock prices
 
 The numbers a plan needs ("buy above 268.60", not "above Friday's close"),
