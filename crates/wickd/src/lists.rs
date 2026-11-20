@@ -297,14 +297,37 @@ pub fn normalize_symbol(s: &str) -> String {
 /// Check `symbols` against the known stock + pair symbols (`None` = no
 /// symbol cache yet: accept, the caller reports them as unverified).
 pub fn check_known(symbols: &[String], known: Option<&HashSet<String>>) -> Result<()> {
+    reject_unknown(&not_in_cache(symbols, known))
+}
+
+/// The `symbols` missing from the symbol cache (`None` = no cache yet: none
+/// are reported). The cache is only refreshed by the TUI, so a symbol that
+/// started trading after it was saved (an IPO) is missing until then.
+pub fn not_in_cache(symbols: &[String], known: Option<&HashSet<String>>) -> Vec<String> {
     let Some(known) = known else {
-        return Ok(());
+        return Vec::new();
     };
-    let unknown: Vec<&str> = symbols
-        .iter()
-        .filter(|s| !known.contains(*s))
-        .map(String::as_str)
-        .collect();
+    symbols.iter().filter(|s| !known.contains(*s)).cloned().collect()
+}
+
+/// Of the symbols the cache doesn't know, keep those `is_listed` can't find
+/// either (a live check, so a stale cache never rejects a real ticker).
+pub async fn still_unknown<F, Fut>(candidates: Vec<String>, is_listed: F) -> Vec<String>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut out = Vec::new();
+    for s in candidates {
+        if !is_listed(s.clone()).await {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// A validation error naming `unknown`, if there are any.
+pub fn reject_unknown(unknown: &[String]) -> Result<()> {
     if !unknown.is_empty() {
         return Err(invalid(format!(
             "unknown symbol(s): {} (stocks use their ticker, pairs OANDA names like EUR_USD)",
@@ -494,6 +517,22 @@ mod tests {
         std::fs::write(&path, "{ invalid json").unwrap();
         assert!(load_at(&path).unwrap_err().downcast_ref::<ValidationError>().is_none());
         assert!(check_known(&["ANY".into()], None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stale_cache_defers_to_the_live_check() {
+        let known: HashSet<String> = ["NVDA"].iter().map(|s| s.to_string()).collect();
+        let symbols: Vec<String> = vec!["NVDA".into(), "ANT".into(), "NVDAA".into()];
+        assert!(not_in_cache(&symbols, None).is_empty());
+        let missing = not_in_cache(&symbols, Some(&known));
+        assert_eq!(missing, vec!["ANT".to_string(), "NVDAA".to_string()]);
+        // ANT listed after the cache was saved: the live check finds it.
+        let unknown = still_unknown(missing, |s| async move { s == "ANT" }).await;
+        assert_eq!(unknown, vec!["NVDAA".to_string()]);
+        let e = reject_unknown(&unknown).unwrap_err();
+        assert!(e.to_string().contains("NVDAA") && !e.to_string().contains("ANT"));
+        assert!(e.downcast_ref::<ValidationError>().is_some());
+        assert!(reject_unknown(&[]).is_ok());
     }
 
     #[test]

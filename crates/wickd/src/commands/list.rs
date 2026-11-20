@@ -22,6 +22,8 @@ use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde_json::json;
 
+use wickd_core::equities::alpaca::{AlpacaClient, QuoteFeed};
+
 use crate::lists::{self, Fields};
 use crate::output::{exit, Out};
 
@@ -102,7 +104,7 @@ enum ListCmd {
 }
 
 pub async fn run(args: ListArgs, out: Out) -> ! {
-    match exec(args.cmd) {
+    match exec(args.cmd).await {
         Ok(v) => {
             out.ok(&v);
             std::process::exit(exit::OK);
@@ -118,7 +120,7 @@ pub async fn run(args: ListArgs, out: Out) -> ! {
     }
 }
 
-fn exec(cmd: ListCmd) -> Result<serde_json::Value> {
+async fn exec(cmd: ListCmd) -> Result<serde_json::Value> {
     let path = lists::lists_path()?;
     match cmd {
         ListCmd::Ls => {
@@ -146,7 +148,28 @@ fn exec(cmd: ListCmd) -> Result<serde_json::Value> {
             let name = lists::validate_name(&name)?;
             let symbols = normalized(&symbols);
             let known = crate::tui::store::known_symbols();
-            lists::check_known(&symbols, known.as_ref())?;
+            let missing = lists::not_in_cache(&symbols, known.as_ref());
+            let unknown = if missing.is_empty() {
+                missing
+            } else {
+                // The cache may predate a listing (an IPO): ask Alpaca live
+                // before rejecting. No keys = no live check.
+                let client = match crate::alpaca_creds::resolve() {
+                    Ok(Some((creds, _))) => Some(AlpacaClient::new(creds, QuoteFeed::Iex)),
+                    _ => None,
+                };
+                lists::still_unknown(missing, |s| {
+                    let client = client.as_ref();
+                    async move {
+                        match client {
+                            Some(c) => c.asset_detail(&s).await.is_ok(),
+                            None => false,
+                        }
+                    }
+                })
+                .await
+            };
+            lists::reject_unknown(&unknown)?;
             let plan = plan.into_fields()?;
             let (r, count, changed) = lists::update_at(&path, |f| {
                 let r = lists::add(f, &name, &symbols, &plan, Utc::now());
