@@ -385,6 +385,24 @@ Exit 1 means an Alpaca history failure or no bars, exit 2 missing or
 unreadable keys, exit 3 an OANDA failure, exit 4 a bad symbol, timeframe or
 bar count; every failure is the usual JSON error.
 
+## Chart reads from a Claude session in another terminal
+
+[`skills/wickd-chart/SKILL.md`](./skills/wickd-chart/SKILL.md) is a Claude
+Code skill that teaches any Claude session the read-only wickd commands
+(chart context, playbooks, quotes, lists, earnings, the economic calendar,
+the AI feed, the trading journal), how to read playbooks as loose guidance,
+and the boundary: no trade, approve, order, login or write commands. Install
+it as a user skill so Claude Code picks it up in every project:
+
+```sh
+mkdir -p ~/.claude/skills
+ln -s "$PWD/crates/wickd/skills/wickd-chart" ~/.claude/skills/wickd-chart   # from the repo root
+```
+
+Copy the directory instead of linking if the checkout moves. The session
+calls the `wickd` on `PATH`, so keep the installed binary current
+(`cargo install --path crates/wickd`) when the commands change.
+
 ## `wickd quote` — daily stock prices
 
 The numbers a plan needs ("buy above 268.60", not "above Friday's close"),
