@@ -22,6 +22,8 @@ use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde_json::json;
 
+use wickd_core::equities::alpaca::{AlpacaClient, AlpacaError, QuoteFeed};
+
 use crate::lists::{self, Fields};
 use crate::output::{exit, Out};
 
@@ -102,7 +104,7 @@ enum ListCmd {
 }
 
 pub async fn run(args: ListArgs, out: Out) -> ! {
-    match exec(args.cmd) {
+    match exec(args.cmd).await {
         Ok(v) => {
             out.ok(&v);
             std::process::exit(exit::OK);
@@ -118,7 +120,7 @@ pub async fn run(args: ListArgs, out: Out) -> ! {
     }
 }
 
-fn exec(cmd: ListCmd) -> Result<serde_json::Value> {
+async fn exec(cmd: ListCmd) -> Result<serde_json::Value> {
     let path = lists::lists_path()?;
     match cmd {
         ListCmd::Ls => {
@@ -146,7 +148,42 @@ fn exec(cmd: ListCmd) -> Result<serde_json::Value> {
             let name = lists::validate_name(&name)?;
             let symbols = normalized(&symbols);
             let known = crate::tui::store::known_symbols();
-            lists::check_known(&symbols, known.as_ref())?;
+            let missing = lists::not_in_cache(&symbols, known.as_ref());
+            let unknown = if missing.is_empty() {
+                (missing, false)
+            } else {
+                // The cache may predate a listing (an IPO): ask Alpaca live
+                // before rejecting. Pair names aren't Alpaca's to confirm.
+                let client = match crate::alpaca_creds::resolve() {
+                    Ok(Some((creds, _))) => Some(AlpacaClient::new(creds, QuoteFeed::Iex)),
+                    _ => None,
+                };
+                let unconfirmed = std::cell::Cell::new(false);
+                let unknown = lists::still_unknown(missing, |s| {
+                    let client = client.as_ref();
+                    let unconfirmed = &unconfirmed;
+                    async move {
+                        if crate::info::is_fx(&s) {
+                            return false;
+                        }
+                        let Some(c) = client else {
+                            unconfirmed.set(true);
+                            return false;
+                        };
+                        match c.asset_detail(&s).await {
+                            Ok(_) => true,
+                            Err(AlpacaError::Http { status: 404, .. }) => false,
+                            Err(_) => {
+                                unconfirmed.set(true);
+                                false
+                            }
+                        }
+                    }
+                })
+                .await;
+                (unknown, unconfirmed.get())
+            };
+            lists::reject_unknown(&unknown.0, unknown.1)?;
             let plan = plan.into_fields()?;
             let (r, count, changed) = lists::update_at(&path, |f| {
                 let r = lists::add(f, &name, &symbols, &plan, Utc::now());
