@@ -814,7 +814,7 @@ fn load_ask_history(arg: Option<&str>) -> Result<Vec<AskTurn>> {
 /// Resolve the claude binary: an explicit path wins; the bare default probes
 /// the conventional install locations first (GUI-spawned processes have a
 /// bare PATH that misses ~/.local/bin), then falls back to PATH lookup.
-fn resolve_claude(claude: &str) -> String {
+pub(crate) fn resolve_claude(claude: &str) -> String {
     if claude != "claude" {
         return claude.to_string();
     }
@@ -834,7 +834,7 @@ fn resolve_claude(claude: &str) -> String {
 /// The Claude Code account headless runs bill to: an explicit env var wins;
 /// otherwise the wickd config's `claude_config_dir` (how the desktop app's
 /// GUI-spawned asks pick the right subscription); otherwise claude's default.
-fn resolve_claude_config_dir() -> Option<String> {
+pub(crate) fn resolve_claude_config_dir() -> Option<String> {
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         if !dir.trim().is_empty() {
             return None; // already in the environment — inherit it

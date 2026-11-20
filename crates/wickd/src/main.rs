@@ -17,6 +17,7 @@
 //!   trade        account / positions / orders / place / close
 //!   stream       live prices → JSON-lines (coming next)
 
+mod agent_session;
 mod alert;
 mod alpaca_creds;
 /// Shim: the durable alert queue moved to wickd-core (AGT-652) so the desktop
@@ -64,6 +65,7 @@ mod watchlist;
 
 use clap::{Parser, Subcommand};
 
+use commands::agent::AgentArgs;
 use commands::alert::AlertArgs;
 use commands::alpaca::AlpacaArgs;
 use commands::approve::ApproveArgs;
@@ -166,6 +168,9 @@ enum Command {
     Alert(AlertArgs),
     /// Poll the durable alert queue, or promote a strategy-signal alert into a pending proposal.
     Queue(QueueArgs),
+    /// The saved, read-only agent session behind the chat: ask (JSON-lines
+    /// stream) | compact | clear | status.
+    Agent(AgentArgs),
 }
 
 #[tokio::main]
@@ -214,5 +219,6 @@ async fn main() {
         Command::Approve(args) => commands::approve::run(args, out).await,
         Command::Alert(args) => commands::alert::run(args, out).await,
         Command::Queue(args) => commands::queue::run(args, out).await,
+        Command::Agent(args) => commands::agent::run(args, out).await,
     }
 }

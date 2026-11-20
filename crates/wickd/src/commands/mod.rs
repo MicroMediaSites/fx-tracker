@@ -1,5 +1,6 @@
 //! CLI subcommands. One module per verb, plus a shared client resolver.
 
+pub mod agent;
 pub mod alert;
 pub mod alpaca;
 pub mod approve;
