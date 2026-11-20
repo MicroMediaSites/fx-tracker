@@ -4328,7 +4328,7 @@ mod tests {
         press(&mut app, KeyCode::Char('c'));
         app.set_earnings_fetch(Err("offline".into()));
         let all = screen(&app, 130, 30).join("\n");
-        assert!(all.contains("Your slate is empty. Press a to browse who reports and s to add a company"), "{all}");
+        assert!(all.contains("Your slate is empty. Press e to browse who reports and s to add a company"), "{all}");
         assert!(all.contains("Nothing you're watching."));
         assert!(all.contains("Earnings aren't stored for 5 of the coming weekdays"), "{all}");
         // A day file that isn't one: the error names it.
@@ -5260,8 +5260,8 @@ mod tests {
     /// The agent panel's screenshots (AGT-2549):
     /// `WICKD_TUI_SNAPSHOT_DIR=/some/dir cargo test -p wickd snapshot_agent_panel -- --ignored`
     /// writes HTML renders of the panel over the EUR_USD 1h chart (live
-    /// OANDA bars), over the calendar (the real stores under the wickd data
-    /// home, read only), its first-open state, and the calendar's keys.
+    /// OANDA bars), over the calendar (the fixture `calendar_app` builds),
+    /// its first-open state, and the calendar's keys.
     /// With `WICKD_SNAPSHOT_ASK=1` the chart's first answer is a real `wickd
     /// agent ask` through the panel's own code path (the debug wickd binary,
     /// with `WICKD_HOME` pointed at a scratch folder so the real session is
@@ -5361,18 +5361,10 @@ mod tests {
         }
         shoot(&app, "1-panel-over-eur_usd-1h-chart", w, h);
 
-        // 2. The calendar, real stores (read only).
-        let mut app = App::new(crate::tui::store::load_watchlist().unwrap_or_default(), "iex");
-        if let Ok(f) = crate::lists::lists_path().and_then(|p| crate::lists::load_at(&p)) {
-            app.set_lists(f);
-        }
-        press(&mut app, KeyCode::Char('g'));
-        press(&mut app, KeyCode::Char('c'));
-        app.set_earnings_fetch(Ok(vec![]));
-        app.set_headlines(Ok((0, 0, None)));
-        app.set_results(Ok(vec![]));
-        app.calendar.reactions_loading = false;
-        app.flash = None;
+        // 2. The calendar: the test fixture's stores, slate and lists.
+        let cal_tmp = tempfile::tempdir().unwrap();
+        let mut app = calendar_app(cal_tmp.path());
+        open_calendar(&mut app);
         // 4. The calendar's keys: the toggle on `e`, the agent on `a`.
         shoot(&app, "4a-calendar-key-bar", w, h);
         press(&mut app, KeyCode::Char('?'));

@@ -392,7 +392,7 @@ pub fn build(inp: &Inputs) -> Vec<Row> {
     let mut rows = Vec::new();
     if !inp.show_all && inp.slate.is_empty() {
         rows.push(Row::Note(
-            "Your slate is empty. Press a to browse who reports and s to add a company, or use `wickd earnings slate add`."
+            "Your slate is empty. Press e to browse who reports and s to add a company, or use `wickd earnings slate add`."
                 .into(),
         ));
         rows.push(Row::Blank);
@@ -1695,7 +1695,7 @@ mod tests {
         assert_eq!(
             got[..5],
             [
-                "~ Your slate is empty. Press a to browse who reports and s to add a company, or use `wickd earnings slate add`.",
+                "~ Your slate is empty. Press e to browse who reports and s to add a company, or use `wickd earnings slate add`.",
                 "",
                 "# Today · Wed Nov 18",
                 "12:00 PM high FOMC Meeting Minutes",
