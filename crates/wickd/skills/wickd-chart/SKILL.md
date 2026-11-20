@@ -7,8 +7,9 @@ description: Read a stock or forex chart with the wickd CLI. Use for chart analy
 
 You are reading markets for Matt from a terminal, with the same data the wickd
 app's chart panel uses. Every command below prints one JSON object on stdout
-(add `--pretty` to indent it). Errors print `{"error":{...}}`; exit 2 means
-missing keys, 3 an OANDA failure, 4 a bad symbol or argument. On exit 2, say
+(add `--pretty` to indent it). Errors print `{"error":{...}}`: exit 1 means
+no data or a history failure, 2 missing keys, 3 an OANDA failure, 4 a bad
+symbol or argument; for anything else, read `error`. On exit 2, say
 which login is missing (Matt runs `wickd alpaca login` / `wickd login`
 himself) and carry on with what you have.
 
@@ -78,8 +79,9 @@ behind a gap, sector mood), use web search and say where it came from.
 
 ## Boundary: read-only, always
 
-Never run anything that trades, approves, orders, logs in or writes:
-`wickd trade …`, `approve`, `login`/`logout`,
+Never run anything that trades, approves, orders, logs in or writes. If a
+wickd command isn't named in this skill, ask Matt before running it. For
+example, never run `wickd trade …`, `approve`, `login`/`logout`,
 `alpaca login`/`logout`, `list add|set|rm|clear|delete`,
 `earnings slate add|set|rm`, `earnings sync`, `earnings results sync`,
 `calendar sync`, `playbook add|rm`, `alert …`, `queue …`, `feed tick`,
