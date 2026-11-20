@@ -60,7 +60,8 @@ wickd tui --feed sip   # consolidated real-time quotes (paid Algo Trader Plus)
   rows; elsewhere the screen's name. The answer streams in (a quiet
   "thinking…" while it looks things up), `enter` sends, `↑`/`↓` and
   `pgup`/`pgdn` scroll, `esc` closes and leaves the screen as it was.
-  While it's open every key types into the panel. `/clear` and `/compact`
+  While it's open every key types into the panel. (In search, `a` types
+  into the query like any letter.) `/clear` and `/compact`
   do what they do in `wickd agent`. The conversation reappears when you
   reopen the panel, and after a restart (`~/.wickd/agent/transcript.json`;
   `/clear` empties it).

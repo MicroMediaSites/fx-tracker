@@ -356,6 +356,7 @@ impl Panel {
             }
             "notice" => self.push(Role::Notice, s("message")),
             "cleared" => {
+                self.streaming = None;
                 self.messages.clear();
                 self.finish_turn();
             }
@@ -456,10 +457,21 @@ pub fn save_transcript(dir: &Path, messages: &[Message]) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = transcript_path(dir);
     let tmp = dir.join(format!(".{TRANSCRIPT_FILE}.tmp"));
-    std::fs::write(&tmp, serde_json::to_string(messages)?)
+    write_private(&tmp, serde_json::to_string(messages)?.as_bytes())
         .with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
+}
+
+/// Write a file only its owner can read: it holds the trader's theses and
+/// plans.
+fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)?.write_all(body)
 }
 
 // ── the child process ───────────────────────────────────────────────────────
@@ -532,19 +544,14 @@ pub async fn run_ask(
         return Ok(());
     }
     let err = stderr_task.await.unwrap_or_default();
-    let tail: String = err
-        .trim()
-        .chars()
-        .rev()
-        .take(300)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let err = err.trim();
+    // The last 300 characters (the end of an error says the most).
+    let from = err.char_indices().rev().nth(299).map_or(0, |(b, _)| b);
+    let tail = &err[from..];
     Err(if tail.is_empty() {
         format!("wickd agent ask exited with {status}")
     } else {
-        tail
+        tail.to_string()
     })
 }
 
@@ -1060,6 +1067,15 @@ mod tests {
             ]
         );
         assert!(again.save_error.is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(d.join(TRANSCRIPT_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "only its owner reads it");
+        }
 
         let mut p = again;
         typed(&mut p, "/clear");

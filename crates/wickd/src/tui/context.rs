@@ -653,7 +653,7 @@ fn inplay_screen(app: &App) -> Value {
         })
         .collect();
     json!({
-        "screen": "in play today",
+        "screen": "in_play",
         "selected": app.inplay.selected_symbol(),
         "rows": rows,
     })
@@ -711,7 +711,7 @@ fn calendar_screen(app: &App) -> Value {
     }
     json!({
         "screen": "calendar",
-        "showing": if cal.show_all { "everything that reports" } else { "your watch" },
+        "showing": if cal.show_all { "everything" } else { "watch" },
         "selected": cal.selected_symbol(),
         "rows": rows,
     })

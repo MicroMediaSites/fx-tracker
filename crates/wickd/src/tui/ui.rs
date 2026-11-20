@@ -5211,7 +5211,7 @@ mod tests {
         open_calendar(&mut app);
         let ctx = crate::tui::context::screen(&app);
         assert_eq!(ctx["screen"], "calendar");
-        assert_eq!(ctx["showing"], "your watch");
+        assert_eq!(ctx["showing"], "watch");
         let rows = ctx["rows"].as_array().unwrap();
         let earn = rows.iter().find(|r| r["type"] == "earnings").expect("an earnings row");
         for k in ["symbol", "session", "day"] {
@@ -5223,7 +5223,7 @@ mod tests {
         // In play and search say what they are.
         press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Char('i'));
-        assert_eq!(crate::tui::context::screen(&app)["screen"], "in play today");
+        assert_eq!(crate::tui::context::screen(&app)["screen"], "in_play");
     }
 
     #[test]
