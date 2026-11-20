@@ -294,14 +294,8 @@ pub fn normalize_symbol(s: &str) -> String {
     s.trim().to_ascii_uppercase().replace('/', "_")
 }
 
-/// Check `symbols` against the known stock + pair symbols (`None` = no
-/// symbol cache yet: accept, the caller reports them as unverified).
-pub fn check_known(symbols: &[String], known: Option<&HashSet<String>>) -> Result<()> {
-    reject_unknown(&not_in_cache(symbols, known))
-}
-
-/// The `symbols` missing from the symbol cache (`None` = no cache yet: none
-/// are reported). The cache is only refreshed by the TUI, so a symbol that
+/// The `symbols` missing from the known stock + pair symbols (`None` = no
+/// symbol cache yet: none are reported; the caller marks them unverified). The cache is only refreshed by the TUI, so a symbol that
 /// started trading after it was saved (an IPO) is missing until then.
 pub fn not_in_cache(symbols: &[String], known: Option<&HashSet<String>>) -> Vec<String> {
     let Some(known) = known else {
@@ -326,15 +320,23 @@ where
     out
 }
 
-/// A validation error naming `unknown`, if there are any.
-pub fn reject_unknown(unknown: &[String]) -> Result<()> {
-    if !unknown.is_empty() {
-        return Err(invalid(format!(
-            "unknown symbol(s): {} (stocks use their ticker, pairs OANDA names like EUR_USD)",
-            unknown.join(", ")
-        )));
+/// A validation error naming `unknown`, if there are any. `unconfirmed`:
+/// the live check couldn't run or failed for some of them, so say so rather
+/// than pass a stale cache off as a verdict.
+pub fn reject_unknown(unknown: &[String], unconfirmed: bool) -> Result<()> {
+    if unknown.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let mut msg = format!(
+        "unknown symbol(s): {} (stocks use their ticker, pairs OANDA names like EUR_USD)",
+        unknown.join(", ")
+    );
+    if unconfirmed {
+        msg.push_str(
+            "; not in the symbol cache, and Alpaca couldn't confirm them live (no keys, or the check failed): run `wickd alpaca status`, or open `wickd tui` to refresh the cache",
+        );
+    }
+    Err(invalid(msg))
 }
 
 /// What an add changed: symbols that are new, and existing ones whose note
@@ -507,8 +509,9 @@ mod tests {
         assert_eq!(normalize_symbol(" eur/usd "), "EUR_USD");
         assert_eq!(normalize_symbol("brk.b"), "BRK.B");
         let known: HashSet<String> = ["NVDA", "EUR_USD"].iter().map(|s| s.to_string()).collect();
-        assert!(check_known(&["NVDA".into(), "EUR_USD".into()], Some(&known)).is_ok());
-        let e = check_known(&["NVDA".into(), "NVDAA".into()], Some(&known)).unwrap_err();
+        assert!(not_in_cache(&["NVDA".into(), "EUR_USD".into()], Some(&known)).is_empty());
+        let e = reject_unknown(&not_in_cache(&["NVDA".into(), "NVDAA".into()], Some(&known)), false)
+            .unwrap_err();
         assert!(e.to_string().contains("NVDAA"));
         assert!(e.downcast_ref::<ValidationError>().is_some());
         // A broken store is not a validation error.
@@ -516,7 +519,7 @@ mod tests {
         let path = dir.path().join("lists.json");
         std::fs::write(&path, "{ invalid json").unwrap();
         assert!(load_at(&path).unwrap_err().downcast_ref::<ValidationError>().is_none());
-        assert!(check_known(&["ANY".into()], None).is_ok());
+        assert!(not_in_cache(&["ANY".into()], None).is_empty());
     }
 
     #[tokio::test]
@@ -529,10 +532,14 @@ mod tests {
         // ANT listed after the cache was saved: the live check finds it.
         let unknown = still_unknown(missing, |s| async move { s == "ANT" }).await;
         assert_eq!(unknown, vec!["NVDAA".to_string()]);
-        let e = reject_unknown(&unknown).unwrap_err();
+        let e = reject_unknown(&unknown, false).unwrap_err();
         assert!(e.to_string().contains("NVDAA") && !e.to_string().contains("ANT"));
+        assert!(!e.to_string().contains("couldn't confirm"));
         assert!(e.downcast_ref::<ValidationError>().is_some());
-        assert!(reject_unknown(&[]).is_ok());
+        // A live check that couldn't run says so.
+        let e = reject_unknown(&unknown, true).unwrap_err();
+        assert!(e.to_string().contains("couldn't confirm them live"));
+        assert!(reject_unknown(&[], true).is_ok());
     }
 
     #[test]
