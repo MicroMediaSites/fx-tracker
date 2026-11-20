@@ -47,7 +47,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// A new conversation that just answered its first question.
+    /// A new conversation (the caller counts its turns).
     pub fn new(session_id: &str, now: &str) -> Self {
         Self {
             session_id: session_id.to_string(),

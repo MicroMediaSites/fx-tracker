@@ -419,6 +419,9 @@ wickd agent ask /clear            # or: wickd agent clear
 wickd agent status                # {"session": {...}} or {"session": null}
 ```
 
+`ask`, `compact` and `clear` print JSON-lines events (errors too, as an
+`error` event); `status` prints one JSON object with the usual error shape.
+
 - `ask` prints JSON lines: `session` (id, `resumed`), `text` (`delta`, the
   streamed answer), `tool` (a lookup it ran), `denied`, `status`,
   `compacted`, `notice`, then `done` (`answer` = the whole turn's text,
@@ -434,10 +437,11 @@ wickd agent status                # {"session": {...}} or {"session": null}
   Claude Code also compacts on its own when the conversation gets long. A
   saved id Claude Code no longer has starts a new conversation with a
   `notice`. Other `/` commands are refused.
-- Tools: every read-only wickd command (`agent::COMMANDS` classifies each
+- Tools: every read-only wickd data command (`agent::COMMANDS` classifies each
   command as Read, Write or Excluded; a test fails when a new command isn't
   classified), web search and fetch, and reads under `~/trading-journal`.
-  No trade, approve, order, login, list/slate/playbook edits, strategy
+  No trade family (including `audit`, the execution log), approve, order,
+  login, list/slate/playbook edits, strategy
   runs or file writes; `--store`, `--url` and `--follow` are denied on every
   command. `claude` runs with `--restricted --safe-mode --strict-mcp-config
   --permission-mode dontAsk`, so your own Claude settings, CLAUDE.md, hooks

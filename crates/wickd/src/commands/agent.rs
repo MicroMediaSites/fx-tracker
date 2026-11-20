@@ -67,6 +67,8 @@ const DENIED_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 /// Flags that turn a read command into a write or a hang: `books --store`
 /// appends to the books store, `--url` points a sync at an arbitrary source,
 /// `queue list --follow` never returns. Denied on every wickd command.
+/// The deny rules match the long names only, so these flags must never get
+/// a short form or alias (a test checks the clap tree).
 const DENIED_FLAGS: &[&str] = &["--store", "--url", "--follow"];
 
 /// The journal the agent may read (relative to the home directory).
@@ -174,7 +176,7 @@ pub(crate) const COMMANDS: &[(&str, Access)] = &[
     ("view ticket", LONG_RUNNING),
     ("view watcher", LONG_RUNNING),
     ("watch", LONG_RUNNING),
-    ("audit", Access::Read),
+    ("audit", TRADE),
     ("pending", Access::Read),
     ("approve", Access::Write),
     ("alert add", Access::Write),
@@ -356,7 +358,6 @@ async fn ask(args: AskArgs) -> ! {
         }));
         outcome = run_turn(&args.claude, &dir, &prompt, None).await;
     }
-    let fresh_start = outcome.as_ref().is_ok_and(|t| t.started_fresh);
     let turn = match outcome {
         Ok(t) => t,
         Err(e) => fail_event(exit::GENERIC, "agent_ask_failed", &e.to_string()),
@@ -364,7 +365,7 @@ async fn ask(args: AskArgs) -> ! {
 
     let now = now_utc();
     let mut session = match saved {
-        Some(s) if !fresh_start && s.session_id == turn.session_id => s,
+        Some(s) if !turn.started_fresh && s.session_id == turn.session_id => s,
         _ => Session::new(&turn.session_id, &now),
     };
     session.turns += 1;
@@ -393,7 +394,12 @@ async fn compact(opts: ClaudeOpts) -> ! {
         Err(e) => fail_event(exit::GENERIC, "agent_session_unreadable", &format!("{e:#}")),
     };
     let Some(mut session) = saved else {
-        emit(&json!({ "type": "done", "session_id": null, "compacted": false }));
+        emit(&json!({
+            "type": "done",
+            "session_id": null,
+            "compacted": false,
+            "compactions": 0,
+        }));
         std::process::exit(exit::OK);
     };
     let turn = match run_turn(&opts, &dir, "/compact", Some(&session)).await {
@@ -404,15 +410,22 @@ async fn compact(opts: ClaudeOpts) -> ! {
                 "type": "notice",
                 "message": "the saved conversation is gone; cleared it",
             }));
-            emit(&json!({ "type": "done", "session_id": null, "compacted": false }));
+            emit(&json!({
+                "type": "done",
+                "session_id": null,
+                "compacted": false,
+                "compactions": 0,
+            }));
             std::process::exit(exit::OK);
         }
         Err(e) => fail_event(exit::GENERIC, "agent_compact_failed", &e.to_string()),
     };
     let now = now_utc();
     session.session_id = turn.session_id;
-    session.compactions += 1;
-    session.last_compacted_at = Some(now.clone());
+    if turn.compacted {
+        session.compactions += 1;
+        session.last_compacted_at = Some(now.clone());
+    }
     session.updated_at = now;
     if let Err(e) = agent_session::save_at(&dir, &session) {
         fail_event(
@@ -943,6 +956,30 @@ mod tests {
         }
         assert!(denied.contains(&"Bash(wickd * --store*)".to_string()));
         assert!(denied.contains(&"Bash(wickd * --url*)".to_string()));
+    }
+
+    /// The deny rules match long flag names, so a short form or alias of a
+    /// denied flag would slip past them.
+    #[test]
+    fn denied_flags_have_no_short_form_or_alias() {
+        fn walk(cmd: &clap::Command) {
+            for arg in cmd.get_arguments() {
+                let Some(long) = arg.get_long() else { continue };
+                if DENIED_FLAGS.contains(&format!("--{long}").as_str()) {
+                    assert!(
+                        arg.get_short().is_none()
+                            && arg.get_all_short_aliases().is_none()
+                            && arg.get_all_aliases().is_none(),
+                        "--{long} on `{}` has a short form or alias the agent's deny rules miss",
+                        cmd.get_name()
+                    );
+                }
+            }
+            for s in cmd.get_subcommands() {
+                walk(s);
+            }
+        }
+        walk(&crate::Cli::command());
     }
 
     #[test]
